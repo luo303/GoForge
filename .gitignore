@@ -1,0 +1,30 @@
+# --- secrets / local config ---
+.env
+.env.local
+.env.*.local
+*.pem
+
+# --- build output ---
+/bin/
+/tmp/
+/dist/
+coverage.out
+coverage.html
+*.test
+
+# --- Go work files (local tooling only) ---
+go.work
+go.work.sum
+.vscode/
+.idea/
+
+# --- OS noise ---
+.DS_Store
+Thumbs.db
+
+# --- docker local volumes (if ever bind-mounted locally) ---
+deployments/.data/
+
+# --- local scratch (local postgres data, downloaded debs, logs) ---
+/.tmp/
+/server.out
