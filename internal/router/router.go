@@ -49,6 +49,6 @@ func Register(e *gin.Engine, deps Deps) {
 	})
 
 	// 业务路由统一挂在 /api/v1 下，方便以后做版本演进。
-	v1 := e.Group("/api/v1")
-	_ = v1
+	// 阶段三开始在这里注册：v1 := e.Group("/api/v1") 然后 v1.POST("/orders", ...)。
+	// 现在没有任何业务路由，就先不建分组 —— 建了再 `_ = v1` 只是制造一行死代码。
 }
