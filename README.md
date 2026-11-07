@@ -49,7 +49,6 @@ GoForge/
 │   └── consumer/        # 异步消费者（阶段五起）
 ├── deployments/         # docker-compose.yml
 ├── migrations/          # SQL 迁移（阶段三起）
-├── Makefile
 └── .env.example
 ```
 
@@ -64,16 +63,17 @@ cmd/server → router → handler → service → repository → model
 ## 快速开始
 
 ```bash
-# 1. 准备配置
+# 1. 准备配置（.env 已被 gitignore，不会进版本库）
 cp .env.example .env
 
-# 2. 启动 PostgreSQL / Redis / RabbitMQ（需要 Docker）
-make infra-up
+# 2. 启动 PostgreSQL / Redis / RabbitMQ（Docker 需已运行）
+docker compose -f deployments/docker-compose.yml up -d
 
-# 3. 运行服务
-make run
+# 3. 下载依赖并运行服务
+go mod download
+go run ./cmd/server
 
-# 4. 验证
+# 4. 另开一个终端验证
 curl -i http://localhost:8080/healthz
 curl -i http://localhost:8080/readyz
 ```
@@ -97,12 +97,20 @@ curl -i http://localhost:8080/readyz
 ## 常用命令
 
 ```bash
-make help        # 查看全部命令
-make test        # go test -race ./...
-make vet         # go vet ./...
-make build       # 编译到 bin/goforge
-make infra-down  # 停止基础设施（保留数据）
-make infra-reset # 停止并清空数据卷
+# ---- 应用 ----
+go run ./cmd/server                    # 开发期直接运行
+go build -o bin/goforge ./cmd/server   # 编译产物
+go test -race -count=1 ./...           # 单元测试
+go vet ./...                           # 静态检查
+go fmt ./...                           # 格式化
+go mod tidy                            # 整理依赖
+
+# ---- 基础设施（Docker Compose）----
+docker compose -f deployments/docker-compose.yml up -d       # 启动
+docker compose -f deployments/docker-compose.yml ps          # 状态
+docker compose -f deployments/docker-compose.yml logs -f     # 日志
+docker compose -f deployments/docker-compose.yml down        # 停止（保留数据）
+docker compose -f deployments/docker-compose.yml down -v     # 停止并清空数据
 ```
 
 ## 接口

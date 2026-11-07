@@ -34,8 +34,8 @@ wsl -d Ubuntu --cd /home/xhh/go/src/GoForge -- /usr/local/go/bin/go build ./...
 | `go build ./...` | 编译全部包 |
 | `go vet ./...` | 静态检查 |
 | `go test -race -count=1 ./...` | 单元测试（必须带 `-race`） |
-| `make run` | 本地启动（需 `.env`） |
-| `make infra-up` | 起 PostgreSQL / Redis / RabbitMQ |
+| `go run ./cmd/server` | 本地启动（需 `.env`） |
+| `go build -o bin/goforge ./cmd/server` | 编译可执行文件 |
 
 **环境归属：Docker 与数据库由项目所有者自行在 Windows 侧启动。** 不要代为安装 PostgreSQL / Docker，也不要在 WSL 里搭替代环境来"绕过"依赖缺失。
 
@@ -103,6 +103,7 @@ cmd/server  →  router  →  handler  →  service  →  repository  →  model
 
 **工程层面**
 - 不提交 `.env`、真实密码、JWT 密钥、访问令牌（Git 操作细则见 §9）。
+- **不引入 Makefile / 构建脚本 / 任务运行器**：启动与构建一律用 `go` 原生命令（`go run` / `go build` / `go test`），少一层封装就少一处需要同步维护的东西。
 - 不引入微服务拆分、Service Mesh、复杂部署平台——学习项目不解决这些问题。
 - 不为凑代码量增加功能；一个阶段只做一个主题。
 - 不在未经确认的情况下重构已完成阶段的结构。
@@ -141,7 +142,7 @@ cmd/server  →  router  →  handler  →  service  →  repository  →  model
 按顺序做，不要跳步：
 
 1. `internal/model/` 定义模型（显式 `TableName`、时间字段用 `time.Time`、金额用 `int64`）。
-2. `migrations/` 写 SQL 迁移（正向 + 回滚），并更新 `Makefile` 的 `migrate-*`。
+2. `migrations/` 写 SQL 迁移（正向 + 回滚），执行命令在阶段三确定后同步写入 README。
 3. `internal/repository/` 写数据访问（只收 `context.Context` + 查询参数，返回 model 或业务错误）。
 4. `internal/service/` 写业务规则与事务边界（不出现 gin 类型）。
 5. `internal/handler/` 写绑定与校验（`binding` tag），调 service，用 `httpx` 输出。
@@ -176,7 +177,7 @@ cmd/server  →  router  →  handler  →  service  →  repository  →  model
 | 位置 | 问题 | 处理时机 |
 |---|---|---|
 | `cmd/server/main.go:81` | 中间件顺序 `RequestID → Recovery → Logger` 导致 panic 请求无访问日志（已实测：仅 1 条 `panic recovered`） | 阶段二收尾修复 |
-| 仓库根 | 无 `.env`，`make run` 会因 `DB_PASSWORD is required` 直接退出 | 由环境所有者提供 |
+| 仓库根 | 无 `.env`，`go run ./cmd/server` 会因 `DB_PASSWORD is required` 直接退出 | 由环境所有者提供 |
 | `.env.example` | 有 `RABBITMQ_URL`，但 `config.Config` 无对应字段 | 阶段五 |
 | `config.validate` | `JWT_SECRET` 未校验，prod 下为空仍可启动 | 阶段三 |
 | `config.getEnvInt` | 非法值静默回退默认值，与 `getEnvBool` 的"行为可预测"理念不一致 | 阶段三 |

@@ -1,12 +1,12 @@
 # GoForge 本地基础设施。
 #
 # 只包含有状态依赖：PostgreSQL、Redis、RabbitMQ。
-# 开发期应用进程在宿主机用 `make run` 运行，阶段六再把它作为服务加进来。
+# 开发期应用进程在宿主机用 `go run ./cmd/server` 运行，阶段六再把它作为服务加进来。
 #
-#   make infra-up     启动
-#   make infra-ps     查看状态
-#   make infra-down   停止（保留数据卷）
-#   make infra-reset  停止并删除数据卷（清空数据）
+#   docker compose -f deployments/docker-compose.yml up -d     启动
+#   docker compose -f deployments/docker-compose.yml ps        状态
+#   docker compose -f deployments/docker-compose.yml down      停止（保留数据卷）
+#   docker compose -f deployments/docker-compose.yml down -v   停止并删除数据卷（清空数据）
 
 name: goforge
 
