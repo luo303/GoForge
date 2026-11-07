@@ -77,6 +77,22 @@ func run() error {
 
 	// *gin.Engine 内部有路由表和同步保护，可以由多个 goroutine 并发读取；
 	// 这里先建引擎、再交给 router 装配，避免 router 依赖太多构造细节。
+	//
+	// 【为什么不用官网的 gin.Default()】
+	// 官网示例的 gin.Default() 只是快捷方式，其源码就两行：
+	//
+	//	func Default() *Engine {
+	//	    engine := New()
+	//	    engine.Use(Logger(), Recovery()) // 挂 gin 内置的日志 + panic 恢复
+	//	    return engine
+	//	}
+	//
+	// 它内置的 Logger 只会往 stdout 打纯文本，Recovery 只返回 500，
+	// 都拿不到我们的 zap 实例和 request_id。所以这里照 Default() 的
+	// 标准姿势展开：New() + Use()，但换成自己的中间件。
+	// engine.Use(x) 表示"之后注册的所有路由，每个请求都先经过 x"，
+	// 类似 NestJS 的全局中间件管道，只是这里显式列出来、没有隐式注册。
+	// 顺序有意义：请求依次穿过 RequestID → Recovery → Logger（洋葱模型）。
 	engine := gin.New()
 	engine.Use(
 		middleware.RequestID(),
@@ -85,9 +101,15 @@ func run() error {
 	)
 	router.Register(engine, router.Deps{Health: health})
 
+	// 【为什么不用 router.Run()】
+	// router.Run() 的源码只有一行：return http.ListenAndServe(address, engine)，
+	// 它把 http.Server 藏起来了——没地方配超时，也没有 Shutdown 方法可用。
+	// 所以直接创建标准库的 http.Server，这是 gin 官方 README
+	// "Graceful shutdown or restart" 一节给出的写法。
 	srv := &http.Server{
-		Addr:              cfg.App.HTTPAddr,
-		Handler:           engine,
+		Addr:    cfg.App.HTTPAddr,
+		Handler: engine, // *gin.Engine 实现了标准库 http.Handler 接口（有 ServeHTTP 方法），
+		// 所以可以直接当处理器传进来——gin 在 Go 里就是一个普通的 HTTP 处理器，不是特殊运行时。
 		ReadHeaderTimeout: 5 * time.Second,  // 防止 Slowloris 类攻击
 		ReadTimeout:       15 * time.Second, // 包含读 body 的时间
 		WriteTimeout:      20 * time.Second,
@@ -98,6 +120,9 @@ func run() error {
 	serverErr := make(chan error, 1)
 	go func() {
 		log.Info("http server listening", zap.String("addr", srv.Addr))
+		// ListenAndServe 是阻塞的，正常情况下永不返回；
+		// 唯一让它返回的是 Shutdown（第 8 步），此时返回 http.ErrServerClosed——
+		// 这是"正常关闭"的信号，不是错误，所以用 errors.Is 排除它。
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 			return
