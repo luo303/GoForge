@@ -48,6 +48,7 @@ GoForge/
 │   ├── platform/        # PostgreSQL / Redis / RabbitMQ 连接与生命周期
 │   └── consumer/        # 异步消费者（阶段五起）
 ├── deployments/         # docker-compose.yml
+├── docs/guide/          # 逐行代码导读
 ├── migrations/          # SQL 迁移（阶段三起）
 └── .env.example
 ```
@@ -59,6 +60,10 @@ cmd/server → router → handler → service → repository → model
                        ↘         ↘
                         httpx     platform
 ```
+
+## 代码导读
+
+想逐行看懂代码，从 [`docs/guide/`](docs/guide/README.md) 开始：一个源文件一篇导读，按"依赖从叶子到根"的顺序排，每篇末尾带自测题。
 
 ## 快速开始
 
