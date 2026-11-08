@@ -34,7 +34,7 @@
 | 14 | `backend/internal/handler/health.go` | 94 | ⏳ 待写 | 函数类型当接口用、liveness 与 readiness 的分工 |
 | 15 | `backend/internal/router/router.go` | 54 | ⏳ 待写 | 依赖结构体、`NoRoute` / `NoMethod`、路由分组 |
 
-> Phase 1 起模块目录会按 `docs/design/overview.md` 的领域划分展开，新文件按"叶子包优先、装配最后"的顺序补导读。
+> Phase 2 起模块目录会按 `docs/design/overview.md` 的领域划分与 `docs/plan.md` 的细粒度阶段展开，新文件按"叶子包优先、装配最后"的顺序补导读。
 
 ## 与代码注释的分工
 

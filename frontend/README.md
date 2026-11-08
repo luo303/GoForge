@@ -1,6 +1,6 @@
 # MindOS Web 应用
 
-本目录存放 MindOS 的前端代码，技术选型在 **Phase 1** 落地（见 `../docs/plan.md`）。
+本目录存放 MindOS 的前端代码，技术选型在 **Phase 3** 落地（见 `../docs/plan.md`）。
 
 ## 技术栈
 

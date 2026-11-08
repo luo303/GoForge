@@ -16,12 +16,12 @@ MindOS 是一个单用户、本地优先的 AI 个人工作空间：文档、网
 
 | 模块 | 做什么 | 阶段 |
 |---|---|---|
-| Knowledge | 文档/网页/笔记入库、解析、切分、向量化、混合检索、带引用问答 | Phase 2 |
-| Memory | 四类长期记忆（画像/事实/经历/项目）的提炼、去重合并、召回 | Phase 3 |
-| Agent | Eino ADK 运行时、工具调用、预算闸门、checkpoint、人工审批、事件回放 | Phase 4 |
-| Action | 目标 → 计划 → 任务三级结构，依赖与进度，Agent 拆解 + 人工确认 | Phase 5 |
-| Context | 分段 token 预算、记忆与知识编排、历史摘要压缩 | Phase 6 |
-| Insights | 周期总结、学习进度、知识关联发现 | Phase 7 |
+| Knowledge | 文档/网页/笔记入库、解析、切分、向量化、混合检索、带引用问答 | Phase 4–9 |
+| Memory | 四类长期记忆（画像/事实/经历/项目）的提炼、去重合并、召回 | Phase 10–12 |
+| Agent | Eino ADK 运行时、工具调用、预算闸门、checkpoint、人工审批、事件回放 | Phase 13–16 |
+| Action | 目标 → 计划 → 任务三级结构，依赖与进度，Agent 拆解 + 人工确认 | Phase 17–18 |
+| Context | 分段 token 预算、记忆与知识编排、历史摘要压缩 | Phase 19 |
+| Insights | 周期总结、学习进度、知识关联发现 | Phase 20 |
 
 ## 技术栈
 
@@ -43,7 +43,7 @@ MindOS 是一个单用户、本地优先的 AI 个人工作空间：文档、网
 mindos/
 ├── backend/                 Go 服务（module: github.com/luo303/mindos/backend）
 │   ├── cmd/server/          进程入口：装配与启停
-│   ├── cmd/migrate/         SQL 迁移执行（Phase 1）
+│   ├── cmd/migrate/         SQL 迁移执行（Phase 2）
 │   ├── internal/
 │   │   ├── config/          配置加载与校验
 │   │   ├── logging/         zap 初始化
@@ -59,8 +59,8 @@ mindos/
 │   │   ├── insight/         周期总结与分析
 │   │   ├── job/ worker/     异步任务与消费
 │   │   ├── handler/ router/ 协议层与路由表
-│   └── migrations/          SQL 迁移（Phase 1 起）
-├── frontend/                React 应用（Phase 1 起）
+│   └── migrations/          SQL 迁移（Phase 2 起）
+├── frontend/                React 应用（Phase 3 起）
 ├── deployments/             PostgreSQL(pgvector) / RabbitMQ / Redis compose
 └── docs/                    设计、计划、代码导读
 ```
@@ -80,7 +80,7 @@ docker compose --env-file backend/.env -f deployments/docker-compose.yml up -d
 
 # 3. 执行迁移并启动服务
 cd backend
-go run ./cmd/migrate up          # Phase 1 起可用
+go run ./cmd/migrate up          # Phase 2 起可用
 go run ./cmd/server
 ```
 
@@ -119,7 +119,7 @@ docker compose --env-file backend/.env -f deployments/docker-compose.yml down -v
 |---|---|
 | [AGENTS.md](AGENTS.md) | 开发准入约定：模块边界、硬约束、禁止事项、Git 规范 |
 | [docs/design/overview.md](docs/design/overview.md) | 领域模型、检索与记忆机制、Agent 运行时、API 清单 |
-| [docs/plan.md](docs/plan.md) | Phase 1–8：交付物、提交拆分、验证方式、退出标准 |
+| [docs/plan.md](docs/plan.md) | Phase 1–21：范围、提交拆分、分层测试、故障验证、退出标准 |
 | [docs/guide/](docs/guide/) | 逐行代码导读 |
 
 ## 路线图
@@ -127,14 +127,16 @@ docker compose --env-file backend/.env -f deployments/docker-compose.yml down -v
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | Phase 0 | 服务骨架（配置、日志、中间件、健康检查、优雅关闭） | 已完成 |
-| Phase 1 | 工程与基础设施：迁移、pgvector、配置、前端脚手架 | 待开始 |
-| Phase 2 | Knowledge：入库、切分、向量化、混合检索、RAG | 待开始 |
-| Phase 3 | Memory：提炼、合并、召回、管理 | 待开始 |
-| Phase 4 | Agent：运行时、工具、预算、checkpoint、审批、SSE | 待开始 |
-| Phase 5 | Action：目标、计划、任务、人工确认 | 待开始 |
-| Phase 6 | Context：分段预算、摘要压缩 | 待开始 |
-| Phase 7 | Insights：周期总结与学习分析 | 待开始 |
-| Phase 8 | 产品完善：测试、监控、部署、文档 | 待开始 |
+| Phase 1–3 | 工程基线：缺陷纠偏、迁移与系统状态、前端工程骨架 | 待开始 |
+| Phase 4–9 | Knowledge：文本入库、多格式、异步任务、向量、混合检索、RAG | 待开始 |
+| Phase 10–12 | Memory：人工管理、提炼与冲突治理、召回质量 | 待开始 |
+| Phase 13–16 | Agent：最小对话、工具与预算、审批恢复、MQ 与后台执行 | 待开始 |
+| Phase 17–18 | Action：任务领域、AI 计划与审批闭环 | 待开始 |
+| Phase 19 | Context：分段预算、摘要压缩、长对话质量 | 待开始 |
+| Phase 20 | Insights：真实统计、周期总结与学习分析 | 待开始 |
+| Phase 21 | 产品化：全栈部署、端到端回归、备份恢复、长期运行 | 待开始 |
+
+> 不设置工期。每个 Phase 的专项测试、故障验证和文档全部完成后才进入下一阶段；详细范围见 [docs/plan.md](docs/plan.md)。
 
 ## 贡献
 

@@ -29,7 +29,7 @@
 ```text
 mindos/
 ├── backend/        Go 服务（独立 module：github.com/luo303/mindos/backend）
-├── frontend/       React 应用（Phase 1 起）
+├── frontend/       React 应用（Phase 3 起）
 ├── deployments/    基础设施 compose（PostgreSQL+pgvector / RabbitMQ / Redis）
 └── docs/           设计、计划、代码导读
 ```
@@ -45,7 +45,7 @@ Windows 侧经 `//wsl.localhost/Ubuntu/home/xhh/go/src/GoForge` 访问。
 | `go vet ./...` | 静态检查 |
 | `go test -race -count=1 ./...` | 单元测试（必须带 `-race`） |
 | `go run ./cmd/server` | 启动服务（读取 `backend/.env`） |
-| `go run ./cmd/migrate up` | 执行数据库迁移（Phase 1 起） |
+| `go run ./cmd/migrate up` | 执行数据库迁移（Phase 2 起） |
 | `go build -o bin/mindos ./cmd/server` | 编译可执行文件 |
 | `docker compose --env-file backend/.env -f deployments/docker-compose.yml up -d` | 启动基础设施（在仓库根执行） |
 
@@ -194,6 +194,6 @@ agent  → 各模块 service（受控读写）      worker → 各模块 service
 
 ## 11. 阶段路线
 
-Phase 1 工程与基础设施 ｜ Phase 2 Knowledge ｜ Phase 3 Memory ｜ Phase 4 Agent ｜ Phase 5 Action ｜ Phase 6 Context ｜ Phase 7 Insights ｜ Phase 8 产品完善
+Phase 1–3 工程基线 ｜ Phase 4–9 Knowledge ｜ Phase 10–12 Memory ｜ Phase 13–16 Agent ｜ Phase 17–18 Action ｜ Phase 19 Context ｜ Phase 20 Insights ｜ Phase 21 产品化
 
-**跨阶段铁律：每个阶段结束时项目必须可编译、可启动、可验证。宁可不做，不留半成品。**
+**跨阶段铁律：不设置工期，质量优先。每个阶段结束时可编译、可启动，且专项测试、故障验证、文档与验收记录全部完成；宁可暂停，不留半成品。**

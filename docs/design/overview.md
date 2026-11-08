@@ -83,6 +83,8 @@ MindOS 是一个**单用户、本地优先的 AI 个人知识与行动工作空�
 
 ### 4.1 知识入库
 
+下图是最终形态。实施按 Phase 4 同步导入、Phase 6 数据库任务与 worker、Phase 16 Outbox + MQ 唤醒逐步演进；jobs 始终是任务真相，后一步不推翻前一步的状态语义。
+
 ```text
 上传文件 / 粘贴笔记 / 输入网址
   → 计算内容 hash，命中已有文档则直接复用（幂等）
@@ -98,6 +100,8 @@ MindOS 是一个**单用户、本地优先的 AI 个人知识与行动工作空�
 取消：`documents` 置 `cancelling` 时，worker 通过 job 级 `context` 中断，已写入的分块回滚删除。
 
 ### 4.2 对话
+
+下图是完整形态。Phase 13 先实现无工具对话与事件流，Phase 14 接工具与自动记忆提炼，Phase 15 接审批恢复，Phase 19 才收口完整的上下文组装。
 
 ```text
 用户发消息（POST /conversations/:id/messages，SSE 响应）
@@ -319,7 +323,7 @@ Eino 的 `CheckPointStore` 接口就是 `Set/Get(ctx, key, []byte)`，状态用 
 | `profile` | 身份、背景、偏好 | 主力栈是 Node.js，正在转 Go | 对话 |
 | `semantic` | 长期有效的事实与结论 | 认为 GORM 链式 API 比泛型 API 更适合本项目 | 对话 / 文档 |
 | `episodic` | 带时间的历史事件 | 10 月完成过一次 PostgreSQL 迁移演练 | 对话 / 任务 |
-| `project` | 项目背景与进展 | MindOS 当前处于 Phase 2，知识库已能用 | 任务 / 文档 |
+| `project` | 项目背景与进展 | MindOS 当前处于 Phase 8，知识检索已能用 | 任务 / 文档 |
 
 ### 7.2 为什么必须"显式提炼"
 
@@ -394,7 +398,7 @@ recency = exp(-days_since_last_recall / 30)
 | `save_memory` | write | 写一条记忆（走合并逻辑，不直插） |
 | `create_goal` / `create_plan` / `create_task` | write | 建目标、建计划、拆任务 |
 | `update_task` | write | 改状态、优先级、截止时间 |
-| `summarize_period` | read | 生成周期统计原料（Phase 7） |
+| `summarize_period` | read | 生成周期统计原料（Phase 20） |
 
 规则：读工具必须带条数与字符上限（否则一次检索能把上下文塞爆）；写工具必须生成 `approval_request`；任何工具的入参都要在代码里再校验一次，不信任模型给的 JSON。
 
@@ -477,7 +481,7 @@ draft ──用户确认──> approved ──开始执行──> active ──
 - 阈值：历史原文超过预算 30% 时触发。
 - 方式：把最早的一半消息交给模型摘要，写 `conversation_summaries`，原文保留但不进上下文。
 - 摘要要保留：用户明确表达的目标、约束、否定项（"不要用 X"）。这些丢了，后面的回答就会反复踩坑。
-- Eino 自带 `Summarization` 中间件，Phase 6 会先评估直接复用，不够再自建。
+- Eino 自带 `Summarization` 中间件，Phase 19 会先评估直接复用，不够再自建。
 
 ### 10.3 Token 估算
 
@@ -501,65 +505,66 @@ draft ──用户确认──> approved ──开始执行──> active ──
 
 | 方法 | 路径 | 说明 | 阶段 |
 |---|---|---|---|
-| POST | `/documents` | 文件上传（multipart），202 返回 document 与 job_id | P2 |
-| POST | `/documents/note` | 新建笔记（JSON 正文） | P2 |
-| POST | `/documents/web` | 按 URL 抓取导入 | P2 |
-| GET | `/documents` | 列表，支持 `q` / `collection` / `tag` / `status` | P2 |
-| GET | `/documents/:id` | 详情，含分块数量与状态 | P2 |
-| DELETE | `/documents/:id` | 删除文档与分块 | P2 |
-| POST | `/documents/:id/reindex` | 重新解析与向量化 | P2 |
-| GET | `/documents/:id/chunks` | 分块列表（调试与引用展示） | P2 |
-| POST | `/search` | 混合检索，返回带引用的片段 | P2 |
+| POST | `/documents` | 文件上传（multipart）；P4 同步，P6 起 202 返回 document 与 job_id | P4 / P6 |
+| POST | `/documents/note` | 新建笔记（JSON 正文） | P4 |
+| POST | `/documents/web` | 按 URL 抓取导入 | P5 |
+| GET | `/documents` | 列表，支持 `q` / `collection` / `tag` / `status` | P4 |
+| GET | `/documents/:id` | 详情，含分块数量与状态 | P4 |
+| DELETE | `/documents/:id` | 删除文档与分块 | P5 |
+| POST | `/documents/:id/reindex` | 重建解析结果，P7 起同时重建向量 | P5 / P7 |
+| GET | `/documents/:id/chunks` | 分块列表（调试与引用展示） | P4 |
+| POST | `/search` | 混合检索，返回带引用的片段 | P8 |
+| POST | `/knowledge/ask` | 基于知识库回答并返回经校验的引用 | P9 |
 
 **Memory**
 
 | 方法 | 路径 | 说明 | 阶段 |
 |---|---|---|---|
-| GET | `/memories` | 列表，支持 `kind` / `q` / `status` | P3 |
-| POST | `/memories` | 手动新增 | P3 |
-| PATCH | `/memories/:id` | 修改内容（写版本） | P3 |
-| DELETE | `/memories/:id` | 归档（软删） | P3 |
-| GET | `/memories/:id/versions` | 修订历史 | P3 |
-| POST | `/memories/recall` | 调试召回打分 | P3 |
+| GET | `/memories` | 列表，支持 `kind` / `q` / `status` | P10 |
+| POST | `/memories` | 手动新增 | P10 |
+| PATCH | `/memories/:id` | 修改内容（写版本） | P10 |
+| DELETE | `/memories/:id` | 归档（软删） | P10 |
+| GET | `/memories/:id/versions` | 修订历史 | P10 |
+| POST | `/memories/recall` | 调试召回打分与各分项 | P12 |
 
 **Chat / Agent**
 
 | 方法 | 路径 | 说明 | 阶段 |
 |---|---|---|---|
-| POST | `/conversations` | 新建会话 | P4 |
-| GET | `/conversations` | 会话列表 | P4 |
-| GET | `/conversations/:id/messages` | 消息列表 | P4 |
-| POST | `/conversations/:id/messages` | 发消息，SSE 流式回答 | P4 |
-| GET | `/runs/:id` | 运行状态与用量 | P4 |
-| POST | `/runs/:id/cancel` | 取消 | P4 |
-| GET | `/runs/:id/events` | 事件回放，支持 `since_seq` | P4 |
-| POST | `/runs/:id/approvals/:approvalId` | 批准/拒绝 | P4 |
+| POST | `/conversations` | 新建会话 | P13 |
+| GET | `/conversations` | 会话列表 | P13 |
+| GET | `/conversations/:id/messages` | 消息列表 | P13 |
+| POST | `/conversations/:id/messages` | 发消息，SSE 流式回答 | P13 |
+| GET | `/runs/:id` | 运行状态与用量 | P13 |
+| POST | `/runs/:id/cancel` | 主动取消运行 | P14 |
+| GET | `/runs/:id/events` | 事件回放，支持 `since_seq` | P13 / P15 |
+| POST | `/runs/:id/approvals/:approvalId` | 批准/拒绝 | P15 |
 
 **Action**
 
 | 方法 | 路径 | 说明 | 阶段 |
 |---|---|---|---|
-| GET/POST | `/goals` | 目标列表 / 新建 | P5 |
-| PATCH/DELETE | `/goals/:id` | 修改 / 归档 | P5 |
-| POST | `/goals/:id/plans` | 生成计划草案（Agent） | P5 |
-| POST | `/plans/:id/approve` | 确认计划并落库任务 | P5 |
-| GET/POST | `/tasks` | 任务列表（`today` / `status`）/ 新建 | P5 |
-| PATCH | `/tasks/:id` | 改状态、优先级、截止时间 | P5 |
-| GET | `/task-board` | 按目标/计划聚合的任务板 | P5 |
+| GET/POST | `/goals` | 目标列表 / 新建 | P17 |
+| PATCH/DELETE | `/goals/:id` | 修改 / 归档 | P17 |
+| POST | `/goals/:id/plans` | 生成计划草案（Agent） | P18 |
+| POST | `/plans/:id/approve` | 确认计划并落库任务 | P18 |
+| GET/POST | `/tasks` | 任务列表（`today` / `status`）/ 新建 | P17 |
+| PATCH | `/tasks/:id` | 改状态、优先级、截止时间 | P17 |
+| GET | `/task-board` | 按目标/计划聚合的任务板 | P17 |
 
 **Insight / 系统**
 
 | 方法 | 路径 | 说明 | 阶段 |
 |---|---|---|---|
-| GET | `/dashboard` | 首页聚合：今日待办、目标进度、最近知识、重要记忆 | P2 起逐步补齐 |
-| GET | `/insights` | 周期洞察列表 | P7 |
-| POST | `/insights/generate` | 手动触发生成 | P7 |
-| GET | `/settings` | 读取配置（密钥脱敏） | P1 |
-| PUT | `/settings/llm` | LLM 配置 | P1 |
-| PUT | `/settings/embedding` | Embedding 配置 | P2 |
-| POST | `/settings/models/test` | 连通性测试 | P1 |
-| GET | `/settings/tools` | 工具开关与审批策略 | P4 |
-| GET | `/system/status` | 依赖健康、队列积压、模型可用性 | P1 |
+| GET | `/dashboard` | 首页聚合：今日待办、目标进度、最近知识、重要记忆 | P9 起逐步补齐 |
+| GET | `/insights` | 周期洞察列表 | P20 |
+| POST | `/insights/generate` | 手动触发生成 | P20 |
+| GET | `/settings` | 读取配置（密钥脱敏） | P2 |
+| PUT | `/settings/llm` | LLM 配置 | P9 |
+| PUT | `/settings/embedding` | Embedding 配置 | P7 |
+| POST | `/settings/models/test` | 模型连通性测试 | P7 / P9 |
+| GET | `/settings/tools` | 工具开关与审批策略 | P14 |
+| GET | `/system/status` | 依赖健康与迁移版本，P16 增加队列状态 | P2 / P16 |
 | GET | `/healthz` `/readyz` | 探针 | 已有 |
 
 ## 13. 前端信息架构
