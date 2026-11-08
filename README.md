@@ -62,7 +62,7 @@ mindos/
 │   └── migrations/          SQL 迁移（Phase 2 起）
 ├── frontend/                React 应用（Phase 3 起）
 ├── deployments/             PostgreSQL(pgvector) / RabbitMQ / Redis compose
-└── docs/                    设计、计划、代码导读
+└── docs/                    设计、计划
 ```
 
 依赖单向：`router → <module>/handler → <module>/service → <module>/repository → <module>/model`；`agent` 与 `worker` 复用模块 service，不经过 HTTP 层。当前代码只到 Phase 0 骨架，模块目录随阶段落地。
@@ -143,7 +143,6 @@ docker compose --env-file backend/.env -f deployments/docker-compose.yml down -v
 | [AGENTS.md](AGENTS.md) | 开发准入约定：模块边界、硬约束、禁止事项、Git 规范 |
 | [docs/design/overview.md](docs/design/overview.md) | 领域模型、检索与记忆机制、Agent 运行时、API 清单 |
 | [docs/plan.md](docs/plan.md) | Phase 1–21：范围、提交拆分、分层测试、故障验证、退出标准 |
-| [docs/guide/](docs/guide/) | 逐行代码导读 |
 
 ## 路线图
 

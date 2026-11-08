@@ -31,7 +31,7 @@ mindos/
 ├── backend/        Go 服务（独立 module：github.com/luo303/mindos/backend）
 ├── frontend/       React 应用（Phase 3 起）
 ├── deployments/    基础设施 compose（PostgreSQL+pgvector / RabbitMQ / Redis）
-└── docs/           设计、计划、代码导读
+└── docs/           设计、计划
 ```
 
 代码实际位于 WSL：`/home/xhh/go/src/GoForge`（物理目录名保留，不代表产品名）。
@@ -137,6 +137,7 @@ agent  → 各模块 service（受控读写）      worker → 各模块 service
 - 不保留注释掉的代码；包名短小全小写无下划线；多单词文件名用下划线；错误信息小写开头、不带结尾标点。
 - 中间件一律返回 `gin.HandlerFunc` 的闭包形式。
 - 数据库错误统一走 `TranslateError` 翻译后的 `gorm.ErrDuplicatedKey` 等，不解析 PG 错误码字符串。
+- **不维护逐行代码导读文档**：讲机制、讲取舍写进代码注释与 `docs/design/`，不另建 `docs/guide` 这类逐行讲解文件。
 
 ## 7. 响应与错误约定
 
@@ -186,7 +187,7 @@ agent  → 各模块 service（受控读写）      worker → 各模块 service
 
 ## 10. 当前已知问题（待修，勿遗忘）
 
-当前无登记未修问题。Phase 1 已关闭：panic 请求访问日志丢失、配置类型错误静默回退、`cmd-server-main` 导读行号失准。新问题按“位置 / 影响 / 处理时机”追加到本节。
+当前无登记未修问题。Phase 1 已关闭：panic 请求访问日志丢失、配置类型错误静默回退。新问题按“位置 / 影响 / 处理时机”追加到本节。
 
 ## 11. 阶段路线
 
