@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -20,10 +21,14 @@ import (
 // MindOS 是单用户本地应用：没有账号体系，因此这里不存在 JWT / 认证相关配置。
 // 需要新增配置时，必须同时满足两点——代码真的读了它，且 .env.example 里有对应项。
 type Config struct {
-	App   AppConfig
-	Log   LogConfig
-	DB    DBConfig
-	Redis RedisConfig
+	App       AppConfig
+	Log       LogConfig
+	DB        DBConfig
+	Redis     RedisConfig
+	Storage   StorageConfig
+	LLM       LLMConfig
+	Embedding EmbeddingConfig
+	Agent     AgentConfig
 }
 
 // AppConfig 控制 HTTP 服务本身。
@@ -73,6 +78,44 @@ type RedisConfig struct {
 	PoolSize int
 }
 
+// IsLLMConfigured 报告 LLM 是否已配置到"可用"程度。
+// Phase 9 才会真正调用模型；这里只回答"配了没有"，供 /settings 与 /system/status 展示，
+// 未配置是合法状态（用户可能还没填 Key），不算启动错误。
+func (c *Config) IsLLMConfigured() bool {
+	return c.LLM.APIBase != "" && c.LLM.APIKey != "" && c.LLM.Model != ""
+}
+
+// StorageConfig 描述本地文件存储（上传的原始文档保存在这里）。
+// 单用户本地部署用文件系统即可；对象存储对单机是多余的运维负担（见 overview 取舍表）。
+type StorageConfig struct {
+	Dir string
+}
+
+// LLMConfig 描述对话模型接入参数（OpenAI 兼容接口）。
+// 三个字段要么全配、要么全空；本阶段只做读取与校验，调用在 Phase 9 接入。
+type LLMConfig struct {
+	APIBase string // 例如 https://api.openai.com/v1
+	APIKey  string // 只从环境变量读，禁止入库、禁止进日志
+	Model   string // 例如 gpt-4o-mini
+}
+
+// EmbeddingConfig 描述向量模型接入参数。维度在 overview 中固定为 1536，
+// 换模型要走"新增列 → 回填 → 切换"的迁移流程，不是改配置。
+type EmbeddingConfig struct {
+	APIBase string
+	APIKey  string
+	Model   string
+}
+
+// AgentConfig 是 Agent 运行的三重预算（AGENTS.md 硬性约束 #10）。
+// 预算配在启动配置里而不是数据库：预算是"护栏"不是"业务数据"，
+// 改它需要重启服务，正好强制人停下来想清楚。
+type AgentConfig struct {
+	MaxSteps    int           // 单次运行最大工具调用步数
+	TokenBudget int64         // 单次运行最大 token 消耗（记账用整数）
+	RunTimeout  time.Duration // 单次运行整体超时
+}
+
 // IsDev 用于在开发环境输出更详细的错误信息。
 func (c *Config) IsDev() bool { return c.App.Env == "dev" }
 
@@ -115,6 +158,24 @@ func Load() (*Config, error) {
 			Password: reader.text("REDIS_PASSWORD", ""),
 			DB:       reader.integer("REDIS_DB", 0),
 			PoolSize: reader.integer("REDIS_POOL_SIZE", 20),
+		},
+		Storage: StorageConfig{
+			Dir: reader.text("STORAGE_DIR", "./storage"),
+		},
+		LLM: LLMConfig{
+			APIBase: strings.TrimRight(reader.text("LLM_API_BASE", ""), "/"),
+			APIKey:  reader.text("LLM_API_KEY", ""),
+			Model:   reader.text("LLM_MODEL", ""),
+		},
+		Embedding: EmbeddingConfig{
+			APIBase: strings.TrimRight(reader.text("EMBEDDING_API_BASE", ""), "/"),
+			APIKey:  reader.text("EMBEDDING_API_KEY", ""),
+			Model:   reader.text("EMBEDDING_MODEL", ""),
+		},
+		Agent: AgentConfig{
+			MaxSteps:    reader.integer("AGENT_MAX_STEPS", 30),
+			TokenBudget: reader.integer64("AGENT_TOKEN_BUDGET", 200000),
+			RunTimeout:  reader.duration("AGENT_RUN_TIMEOUT", 5*time.Minute),
 		},
 	}
 
@@ -166,8 +227,54 @@ func (c *Config) validate() error {
 	if c.DB.PingTimeout <= 0 {
 		errs = append(errs, errors.New("DB_PING_TIMEOUT must be greater than 0"))
 	}
+	if strings.TrimSpace(c.Storage.Dir) == "" {
+		errs = append(errs, errors.New("STORAGE_DIR must not be empty"))
+	}
+	errs = append(errs, validateModelConfig("LLM", c.LLM.APIBase, c.LLM.APIKey, c.LLM.Model)...)
+	errs = append(errs, validateModelConfig("EMBEDDING", c.Embedding.APIBase, c.Embedding.APIKey, c.Embedding.Model)...)
+	if c.Agent.MaxSteps < 1 {
+		errs = append(errs, fmt.Errorf("AGENT_MAX_STEPS must be at least 1, got %d", c.Agent.MaxSteps))
+	}
+	if c.Agent.TokenBudget < 1 {
+		errs = append(errs, fmt.Errorf("AGENT_TOKEN_BUDGET must be at least 1, got %d", c.Agent.TokenBudget))
+	}
+	if c.Agent.RunTimeout <= 0 {
+		errs = append(errs, errors.New("AGENT_RUN_TIMEOUT must be greater than 0"))
+	}
 	// errors.Join 是 Go 1.20 加入的：把多个错误合成一个，报错时一次看全。
 	return errors.Join(errs...)
+}
+
+// validateModelConfig 检查模型配置的"全配或全空"规则。
+//
+// 三个字段配了一半（例如只填了 Key 没填 Model）说明配置过程被中断，
+// 调用模型时才会暴露——那是 Phase 1 确立的"填错了带病启动"的同类问题，
+// 所以在启动时就拒绝。全部为空是合法的：用户可能还没准备模型。
+func validateModelConfig(prefix, apiBase, apiKey, model string) []error {
+	set := map[string]bool{
+		prefix + "_API_BASE": apiBase != "",
+		prefix + "_API_KEY":  apiKey != "",
+		prefix + "_MODEL":    model != "",
+	}
+	count := 0
+	for _, v := range set {
+		if v {
+			count++
+		}
+	}
+	if count == 0 || count == 3 {
+		return nil
+	}
+	var missing []string
+	for name, v := range set {
+		if !v {
+			missing = append(missing, name)
+		}
+	}
+	sort.Strings(missing)
+	return []error{fmt.Errorf(
+		"%s model config must be all set or all empty, missing: %s",
+		prefix, strings.Join(missing, ", "))}
 }
 
 // loadDotEnv 解析一个极简的 KEY=VALUE 文件。
@@ -254,12 +361,18 @@ func (r *envReader) text(key, fallback string) string {
 
 // integer 读取整数。只有"没填"才回退；填了但不合法会记录错误，阻止服务启动。
 func (r *envReader) integer(key string, fallback int) int {
+	return int(r.integer64(key, int64(fallback)))
+}
+
+// integer64 与 integer 相同，但用于必须按 int64 记账的字段（如 token 预算）。
+// 单独成方法而不是各处 int64(x)：转换集中在解析层，业务层拿到的类型就是最终类型。
+func (r *envReader) integer64(key string, fallback int64) int64 {
 	v, ok := os.LookupEnv(key)
 	if !ok || strings.TrimSpace(v) == "" {
 		return fallback
 	}
 	v = strings.TrimSpace(v)
-	n, err := strconv.Atoi(v)
+	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil {
 		r.errs = append(r.errs, fmt.Errorf("invalid %s: must be an integer, got %q", key, v))
 		return fallback

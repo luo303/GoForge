@@ -195,6 +195,77 @@ func TestLoadUsesDefaultsForBlankValues(t *testing.T) {
 	}
 }
 
+// TestLoadNewPhase2Defaults 确认 Phase 2 新增配置的默认值与"全空即未配置"语义。
+func TestLoadNewPhase2Defaults(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("DB_PASSWORD", "test-password")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Storage.Dir != "./storage" {
+		t.Fatalf("Storage.Dir = %q, want ./storage", cfg.Storage.Dir)
+	}
+	if cfg.IsLLMConfigured() {
+		t.Fatal("LLM should be unconfigured by default")
+	}
+	if cfg.Embedding.APIBase != "" || cfg.Embedding.APIKey != "" || cfg.Embedding.Model != "" {
+		t.Fatalf("Embedding should be empty by default, got %+v", cfg.Embedding)
+	}
+	if cfg.Agent.MaxSteps != 30 || cfg.Agent.TokenBudget != 200000 || cfg.Agent.RunTimeout != 5*time.Minute {
+		t.Fatalf("Agent defaults wrong: %+v", cfg.Agent)
+	}
+}
+
+// TestLoadReadsModelAndBudgetConfig 确认模型与预算配置按填写值生效。
+func TestLoadReadsModelAndBudgetConfig(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("DB_PASSWORD", "test-password")
+	t.Setenv("STORAGE_DIR", "/data/mindos")
+	t.Setenv("LLM_API_BASE", "https://api.example.com/v1/")
+	t.Setenv("LLM_API_KEY", "sk-1234567890abcdef")
+	t.Setenv("LLM_MODEL", "gpt-4o-mini")
+	t.Setenv("AGENT_MAX_STEPS", "15")
+	t.Setenv("AGENT_TOKEN_BUDGET", "50000")
+	t.Setenv("AGENT_RUN_TIMEOUT", "2m")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// 结尾斜杠被归一化掉，避免拼 URL 时出现双斜杠。
+	if cfg.LLM.APIBase != "https://api.example.com/v1" {
+		t.Fatalf("LLM.APIBase = %q, want trailing slash trimmed", cfg.LLM.APIBase)
+	}
+	if !cfg.IsLLMConfigured() {
+		t.Fatal("LLM should be configured when all three fields are set")
+	}
+	if cfg.Storage.Dir != "/data/mindos" {
+		t.Fatalf("Storage.Dir = %q", cfg.Storage.Dir)
+	}
+	if cfg.Agent.MaxSteps != 15 || cfg.Agent.TokenBudget != 50000 || cfg.Agent.RunTimeout != 2*time.Minute {
+		t.Fatalf("Agent = %+v", cfg.Agent)
+	}
+}
+
+// TestLoadRejectsPartialModelConfig 确认模型配置只配一半时启动报错并指出缺哪几项。
+func TestLoadRejectsPartialModelConfig(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("DB_PASSWORD", "test-password")
+	t.Setenv("LLM_API_KEY", "sk-only-key")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected Load to reject partial LLM config")
+	}
+	for _, key := range []string{"LLM_API_BASE", "LLM_MODEL"} {
+		if !strings.Contains(err.Error(), key) {
+			t.Errorf("error %q does not include missing key %s", err, key)
+		}
+	}
+}
+
 // TestValidate 覆盖必然阻止服务启动的语义错误。
 func TestValidate(t *testing.T) {
 	valid := func() *Config {
@@ -227,6 +298,17 @@ func TestValidate(t *testing.T) {
 		{name: "max open conns", mutate: func(c *Config) { c.DB.MaxOpenConns = 0 }, want: "DB_MAX_OPEN_CONNS"},
 		{name: "max idle conns", mutate: func(c *Config) { c.DB.MaxIdleConns = -1 }, want: "DB_MAX_IDLE_CONNS"},
 		{name: "ping timeout", mutate: func(c *Config) { c.DB.PingTimeout = 0 }, want: "DB_PING_TIMEOUT"},
+		{name: "storage dir empty", mutate: func(c *Config) { c.Storage.Dir = "  " }, want: "STORAGE_DIR"},
+		{name: "agent max steps", mutate: func(c *Config) { c.Agent.MaxSteps = 0 }, want: "AGENT_MAX_STEPS"},
+		{name: "agent token budget", mutate: func(c *Config) { c.Agent.TokenBudget = 0 }, want: "AGENT_TOKEN_BUDGET"},
+		{name: "agent run timeout", mutate: func(c *Config) { c.Agent.RunTimeout = 0 }, want: "AGENT_RUN_TIMEOUT"},
+		{name: "llm partial", mutate: func(c *Config) {
+			c.LLM.APIKey = "sk-test"
+		}, want: "LLM_API_BASE"},
+		{name: "embedding partial", mutate: func(c *Config) {
+			c.Embedding.APIBase = "https://x"
+			c.Embedding.APIKey = "k"
+		}, want: "EMBEDDING_MODEL"},
 	}
 
 	for _, tc := range tests {
