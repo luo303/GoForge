@@ -16,12 +16,12 @@ import (
 // Deps 收集构建路由需要的依赖。
 // 用结构体而不是一长串参数：以后新增 handler 时调用方不必修改函数签名。
 type Deps struct {
-	Health *handler.HealthHandler
+	Health   *handler.HealthHandler
+	System   *handler.SystemHandler
+	Settings *handler.SettingsHandler
 
-	// 阶段三起在这里扩展：
-	//   Auth   *handler.AuthHandler
-	//   Order  *handler.OrderHandler
-	//   Rider  *handler.RiderHandler
+	// 后续阶段在这里扩展：
+	//   Knowledge *handler.KnowledgeHandler（Phase 4 起按模块拆分）
 }
 
 // Register 把路由注册到已经挂好全局中间件的 engine 上。
@@ -49,6 +49,7 @@ func Register(e *gin.Engine, deps Deps) {
 	})
 
 	// 业务路由统一挂在 /api/v1 下，方便以后做版本演进。
-	// 阶段三开始在这里注册：v1 := e.Group("/api/v1") 然后 v1.POST("/orders", ...)。
-	// 现在没有任何业务路由，就先不建分组 —— 建了再 `_ = v1` 只是制造一行死代码。
+	v1 := e.Group("/api/v1")
+	v1.GET("/system/status", deps.System.Status)
+	v1.GET("/settings", deps.Settings.Get)
 }

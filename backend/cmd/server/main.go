@@ -21,8 +21,10 @@ import (
 	"github.com/luo303/mindos/backend/internal/handler"
 	"github.com/luo303/mindos/backend/internal/logging"
 	"github.com/luo303/mindos/backend/internal/middleware"
+	"github.com/luo303/mindos/backend/internal/migrate"
 	"github.com/luo303/mindos/backend/internal/platform"
 	"github.com/luo303/mindos/backend/internal/router"
+	"github.com/luo303/mindos/backend/migrations"
 )
 
 // version 可以在编译时注入：go build -ldflags "-X main.version=v0.1.0"
@@ -101,8 +103,53 @@ func run() error {
 	// 5. HTTP 组件装配。
 	health := handler.NewHealthHandler(db, cfg.DB.PingTimeout, version)
 
+	// 迁移诊断依赖底层 *sql.DB（不是 GORM 会话）：migrate 包面向 database/sql
+	// 设计，与具体 ORM 解耦。server 自己不执行迁移，只读取版本做诊断。
+	sqlDB, err := db.DB()
+	if err != nil {
+		return fmt.Errorf("get sql.DB: %w", err)
+	}
+	runner := migrate.New(sqlDB, migrations.FS)
+	if st, err := runner.Version(context.Background()); err != nil {
+		log.Warn("query migration version", zap.Error(err))
+	} else {
+		log.Info("migration status",
+			zap.Int("version", st.Version),
+			zap.Bool("dirty", st.Dirty))
+	}
+
+	system := handler.NewSystemHandler(
+		version,
+		func(ctx context.Context) error {
+			return platform.DBPing(ctx, cfg.DB.PingTimeout, db)
+		},
+		func(ctx context.Context) (bool, error) {
+			return platform.VectorExtensionPresent(ctx, db)
+		},
+		func(ctx context.Context) (handler.MigrationInfo, error) {
+			st, err := runner.Version(ctx)
+			if err != nil {
+				return handler.MigrationInfo{}, err
+			}
+			latest, err := runner.Latest()
+			if err != nil {
+				return handler.MigrationInfo{}, err
+			}
+			return handler.MigrationInfo{
+				Current: st.Version,
+				Latest:  latest,
+				Dirty:   st.Dirty,
+			}, nil
+		},
+	)
+	settings := handler.NewSettingsHandler(cfg)
+
 	engine := newEngine(log, cfg.IsDev())
-	router.Register(engine, router.Deps{Health: health})
+	router.Register(engine, router.Deps{
+		Health:   health,
+		System:   system,
+		Settings: settings,
+	})
 
 	// 【为什么不用 router.Run()】
 	// router.Run() 的源码只有一行：return http.ListenAndServe(address, engine)，
