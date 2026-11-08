@@ -1,4 +1,6 @@
-# `cmd/server/main.go` 逐行导读
+# `backend/cmd/server/main.go` 逐行导读
+
+> 行号说明：本文行号基于 `b00467e` 版本。其后 `65bb6a8` 补充了 gin 与 `http.Server` 的讲解注释，行号整体下移；**以代码块内容为准**，行号仅用于定位大致小节。
 
 > 读法：左边打开代码，右边对照本文。行号对应当前版本（131 行）。
 > 本文只讲这一个文件；`config` / `platform` / `handler` 的内部实现见各自导读。
@@ -37,18 +39,18 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/luo303/GoForge/internal/config"
+	"github.com/luo303/noema/backend/internal/config"
 	...
 )
 ```
 
 | 行 | 内容 | 说明 |
 |---|---|---|
-| 1-4 | `// GoForge 服务入口。...` | 紧贴 `package` 上方的注释会成为**包文档**（`go doc` 能看到）。Go 注释就是文档，没有单独的 doc 文件 |
+| 1-4 | `// Noema 服务入口。...` | 紧贴 `package` 上方的注释会成为**包文档**（`go doc` 能看到）。Go 注释就是文档，没有单独的 doc 文件 |
 | 5 | `package main` | 只有 `package main` 加 `func main()` 才能编译成可执行文件。其它包名只能编译成库 |
 | 7-15 | 标准库 8 个包 | `context` 传取消信号；`errors` 判错误类型；`fmt` 格式化；`net/http` HTTP 服务端；`os` 环境与退出；`os/signal` 收信号；`syscall` 信号常量；`time` 超时 |
 | 17-18 | 第三方 2 个包 | `gin` Web 框架；`zap` 结构化日志 |
-| 20-25 | 本项目 6 个包 | 注意路径以模块名 `github.com/luo303/GoForge` 开头，这就是 `go.mod` 里 `module` 声明的作用 |
+| 20-25 | 本项目 6 个包 | 注意路径以模块名 `github.com/luo303/noema/backend` 开头，这就是 `go.mod` 里 `module` 声明的作用；`backend` 这一段来自 Go module 所在的子目录 |
 | 分组空行 | 标准库 / 第三方 / 本项目 | 这是 Go 社区惯例（`goimports` 自动这么排）。**不是语法要求**，纯约定，但几乎所有人都这么写 |
 
 **为什么 import 了就必须用？** Go 编译器强制：导入了不用 → 编译错误。所以你不会看到 Node 里那种 `import` 一堆只用了两个的写法。反过来，想只用副作用（如注册驱动）要写成 `import _ "xxx"`。
@@ -300,4 +302,4 @@ func run() error {
 2. `serverErr` 的缓冲如果改成 0，什么情况下会泄漏一个 goroutine？
 3. 为什么 `Shutdown` 要用新的 context？用根 `ctx` 会怎样？
 
-答不上来的条目，回上面对应小节再读一遍。三题都能答，这个文件就算过关，可以进 `internal/config/config.go`。
+答不上来的条目，回上面对应小节再读一遍。三题都能答，这个文件就算过关，可以进 `backend/internal/config/config.go`。
