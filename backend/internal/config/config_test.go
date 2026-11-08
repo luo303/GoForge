@@ -131,6 +131,42 @@ func TestLoadRejectsInvalidTypedConfig(t *testing.T) {
 	}
 }
 
+// TestLoadReadsValidTypedConfig 确认严格解析没有误伤合法值。
+func TestLoadReadsValidTypedConfig(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("DB_PASSWORD", "test-password")
+	t.Setenv("DB_PORT", "6543")
+	t.Setenv("DB_MAX_OPEN_CONNS", "12")
+	t.Setenv("DB_MAX_IDLE_CONNS", "4")
+	t.Setenv("SHUTDOWN_TIMEOUT", "5s")
+	t.Setenv("DB_PING_TIMEOUT", "500ms")
+	t.Setenv("DB_LOG_SQL", "false")
+	t.Setenv("LOG_LEVEL", "INFO")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DB.Port != 6543 {
+		t.Fatalf("DB.Port = %d, want 6543", cfg.DB.Port)
+	}
+	if cfg.DB.MaxOpenConns != 12 || cfg.DB.MaxIdleConns != 4 {
+		t.Fatalf("pool = (%d, %d), want (12, 4)", cfg.DB.MaxOpenConns, cfg.DB.MaxIdleConns)
+	}
+	if cfg.App.ShutdownTimeout != 5*time.Second {
+		t.Fatalf("ShutdownTimeout = %v, want 5s", cfg.App.ShutdownTimeout)
+	}
+	if cfg.DB.PingTimeout != 500*time.Millisecond {
+		t.Fatalf("PingTimeout = %v, want 500ms", cfg.DB.PingTimeout)
+	}
+	if cfg.DB.LogSQL {
+		t.Fatal("DB.LogSQL = true, want false")
+	}
+	if cfg.Log.Level != "info" {
+		t.Fatalf("Log.Level = %q, want normalized info", cfg.Log.Level)
+	}
+}
+
 // TestLoadUsesDefaultsForBlankValues 确认空字符串仍按"未配置"处理，不误伤本地默认配置。
 func TestLoadUsesDefaultsForBlankValues(t *testing.T) {
 	t.Chdir(t.TempDir())
