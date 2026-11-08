@@ -1,6 +1,6 @@
-# Noema 代码导读
+# MindOS 代码导读
 
-这套文档是给"想逐行看懂代码"的人准备的：**一个源文件对应一篇导读**，按行号或代码块解释每一行在做什么、用了什么语法、用了哪个第三方库的哪个 API。
+这套文档是给"想逐行看懂代码"的人准备的：**一个源文件对应一篇导读**，解释每一行在做什么、用了什么语法、用了哪个第三方库的哪个 API。
 
 代码里的注释解释"为什么这么写"，导读解释"这行到底在干嘛"——两者互补，不重复。
 
@@ -19,7 +19,7 @@
 | # | 文件 | 行数 | 状态 | 这个文件真正要学的东西 |
 |---|---|---|---|---|
 | 1 | `backend/cmd/server/main.go` | 156 | ✅ 已完成 | `defer` 与 `os.Exit` 的冲突、goroutine + channel 启停、`http.Server` 超时、context 取消 |
-| 2 | `backend/internal/config/config.go` | 253 | ⏳ 待写 | 多返回值、`os.LookupEnv`、`bufio.Scanner`、`errors.Join`、值/指针接收者 |
+| 2 | `backend/internal/config/config.go` | 246 | ⏳ 待写 | 多返回值、`os.LookupEnv`、`bufio.Scanner`、`errors.Join`、值/指针接收者 |
 | 3 | `backend/internal/logging/logging.go` | 43 | ⏳ 待写 | 接口组合（`zapcore.Encoder` / `Core`）、工厂函数返回 `(*T, error)` |
 | 4 | `backend/internal/platform/gorm_writer.go` | 35 | ⏳ 待写 | **隐式接口**：只实现一个 `Printf` 就满足 GORM 的 `Writer` |
 | 5 | `backend/internal/platform/gorm_level.go` | 19 | ⏳ 待写 | 枚举型返回、根据配置切换日志级别 |
@@ -33,6 +33,8 @@
 | 13 | `backend/internal/middleware/recovery.go` | 55 | ⏳ 待写 | `defer` + `recover`、panic 不跨 goroutine |
 | 14 | `backend/internal/handler/health.go` | 94 | ⏳ 待写 | 函数类型当接口用、liveness 与 readiness 的分工 |
 | 15 | `backend/internal/router/router.go` | 54 | ⏳ 待写 | 依赖结构体、`NoRoute` / `NoMethod`、路由分组 |
+
+> Phase 1 起模块目录会按 `docs/design/overview.md` 的领域划分展开，新文件按"叶子包优先、装配最后"的顺序补导读。
 
 ## 与代码注释的分工
 

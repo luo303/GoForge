@@ -39,18 +39,18 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/luo303/noema/backend/internal/config"
+	"github.com/luo303/mindos/backend/internal/config"
 	...
 )
 ```
 
 | 行 | 内容 | 说明 |
 |---|---|---|
-| 1-4 | `// Noema 服务入口。...` | 紧贴 `package` 上方的注释会成为**包文档**（`go doc` 能看到）。Go 注释就是文档，没有单独的 doc 文件 |
+| 1-4 | `// MindOS 服务入口。...` | 紧贴 `package` 上方的注释会成为**包文档**（`go doc` 能看到）。Go 注释就是文档，没有单独的 doc 文件 |
 | 5 | `package main` | 只有 `package main` 加 `func main()` 才能编译成可执行文件。其它包名只能编译成库 |
 | 7-15 | 标准库 8 个包 | `context` 传取消信号；`errors` 判错误类型；`fmt` 格式化；`net/http` HTTP 服务端；`os` 环境与退出；`os/signal` 收信号；`syscall` 信号常量；`time` 超时 |
 | 17-18 | 第三方 2 个包 | `gin` Web 框架；`zap` 结构化日志 |
-| 20-25 | 本项目 6 个包 | 注意路径以模块名 `github.com/luo303/noema/backend` 开头，这就是 `go.mod` 里 `module` 声明的作用；`backend` 这一段来自 Go module 所在的子目录 |
+| 20-25 | 本项目 6 个包 | 注意路径以模块名 `github.com/luo303/mindos/backend` 开头，这就是 `go.mod` 里 `module` 声明的作用；`backend` 这一段来自 Go module 所在的子目录 |
 | 分组空行 | 标准库 / 第三方 / 本项目 | 这是 Go 社区惯例（`goimports` 自动这么排）。**不是语法要求**，纯约定，但几乎所有人都这么写 |
 
 **为什么 import 了就必须用？** Go 编译器强制：导入了不用 → 编译错误。所以你不会看到 Node 里那种 `import` 一堆只用了两个的写法。反过来，想只用副作用（如注册驱动）要写成 `import _ "xxx"`。
@@ -79,7 +79,7 @@ var version = "dev"
 ```go
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "goforge: %v\n", err)
+		fmt.Fprintf(os.Stderr, "mindos: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -112,7 +112,7 @@ func run() error {
 	}
 	defer func() { _ = log.Sync() }()
 
-	log.Info("starting goforge",
+	log.Info("starting mindos",
 		zap.String("version", version),
 		zap.String("env", cfg.App.Env),
 		zap.String("addr", cfg.App.HTTPAddr),
@@ -128,7 +128,7 @@ func run() error {
 | 52 | `defer func(){ _ = log.Sync() }()`：函数返回前把日志刷出去。终端输出无缓冲，现在几乎空转，但换成写文件后必需 |
 | 54-58 | `log.Info(消息, 字段...)`：zap 的**结构化日志**。`zap.String(k, v)` 返回一个 `zap.Field`（结构体），不是拼字符串 |
 
-**为什么用 `zap.String` 而不是 `fmt.Sprintf` 拼字符串**：结构化日志输出的是 `{"version":"dev","env":"dev"}`，日志系统（Loki/ELK）能按字段检索；拼字符串得到的是 `starting goforge version=dev env=dev`，只能全文搜索。
+**为什么用 `zap.String` 而不是 `fmt.Sprintf` 拼字符串**：结构化日志输出的是 `{"version":"dev","env":"dev"}`，日志系统（Loki/ELK）能按字段检索；拼字符串得到的是 `starting mindos version=dev env=dev`，只能全文搜索。
 
 ---
 
@@ -268,7 +268,7 @@ func run() error {
 		return fmt.Errorf("graceful shutdown: %w", err)
 	}
 
-	log.Info("goforge stopped")
+	log.Info("mindos stopped")
 	return nil
 ```
 

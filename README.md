@@ -1,56 +1,75 @@
-# Noema
+# MindOS
 
-在线个人知识库：上传文档，经 Agent 流水线加工为结构化笔记，支持全文检索、标签筛选与 Markdown 导出。
+**AI-Powered Personal Knowledge & Action Workspace**
 
-加工过程是**可观察、可取消、可重试、可计费**的长任务，而不是一次不可见的同步调用。
+> 让知识拥有记忆，让记忆驱动行动。
 
-## 核心特性
+MindOS 是一个单用户、本地优先的 AI 个人工作空间：文档、网页、笔记进来变成可检索的知识；对话与活动中提炼出可修订的长期记忆；Agent 拿着知识与记忆回答问题、拆解目标、调用工具执行任务。
 
-- **文档接入**：Markdown / 纯文本上传，按内容 SHA-256 去重，重复提交不产生重复任务
-- **流水线加工**：切分 → 抽取 → 汇总 → 打标，每步产出可追溯
-- **任务治理**：并发抢占、租约接管、取消中断、失败重试、死信兜底
-- **成本核算**：逐步记录 token 与费用，支持单任务预算上限
-- **知识检索**：PostgreSQL 全文检索 + 标签筛选，一键导出 Markdown
-- **进度可见**：状态查询与 SSE 实时推送
+它不是聊天工具的壳，区别在于三件事必须成立：
+
+- **知识可追溯**：每句回答都能落到具体文档片段，点开就是原文位置。
+- **记忆可修订**：记忆有版本、有来源、能合并、能作废，不是只增不改的碎碎念。
+- **行动可确认**：Agent 的写操作先出审批单，人点了才落库，每次工具调用都有审计。
+
+## 能力概览
+
+| 模块 | 做什么 | 阶段 |
+|---|---|---|
+| Knowledge | 文档/网页/笔记入库、解析、切分、向量化、混合检索、带引用问答 | Phase 2 |
+| Memory | 四类长期记忆（画像/事实/经历/项目）的提炼、去重合并、召回 | Phase 3 |
+| Agent | Eino ADK 运行时、工具调用、预算闸门、checkpoint、人工审批、事件回放 | Phase 4 |
+| Action | 目标 → 计划 → 任务三级结构，依赖与进度，Agent 拆解 + 人工确认 | Phase 5 |
+| Context | 分段 token 预算、记忆与知识编排、历史摘要压缩 | Phase 6 |
+| Insights | 周期总结、学习进度、知识关联发现 | Phase 7 |
 
 ## 技术栈
 
 | 层 | 选型 |
 |---|---|
-| 语言 | Go 1.27 |
-| HTTP | Gin |
+| 后端 | Go 1.27 + Gin |
 | 数据访问 | GORM（链式 API）+ pgx |
-| 主库 | PostgreSQL 16（含全文检索） |
-| 缓存与协调 | Redis 7 |
-| 消息 | RabbitMQ 3 |
-| 日志 | zap |
-| 前端 | 原生 HTML / JS（M8 交付控制台） |
+| 主库 | PostgreSQL 16 + pgvector（业务数据、向量、全文检索同库） |
+| 异步 | RabbitMQ（派发）+ `jobs` 表（状态真相） |
+| Agent | Eino / Eino ADK（ReAct、checkpoint、interrupt/resume） |
+| 实时 | SSE（流式回答与执行轨迹） |
+| 模型 | OpenAI 兼容 API，LLM 与 Embedding 均可替换 |
+| 前端 | React + TypeScript + Vite + Tailwind CSS + shadcn/ui |
+| 部署 | Docker + Docker Compose（本地单机） |
 
 ## 仓库结构
 
 ```text
-noema/
-├── backend/                 Go 服务（module: github.com/luo303/noema/backend）
+mindos/
+├── backend/                 Go 服务（module: github.com/luo303/mindos/backend）
 │   ├── cmd/server/          进程入口：装配与启停
+│   ├── cmd/migrate/         SQL 迁移执行（Phase 1）
 │   ├── internal/
 │   │   ├── config/          配置加载与校验
+│   │   ├── logging/         zap 初始化
 │   │   ├── httpx/           统一响应与错误（零依赖叶子包）
 │   │   ├── middleware/      RequestID / Logger / Recovery
-│   │   ├── platform/        PostgreSQL 等基础设施连接
-│   │   ├── handler/         协议层
-│   │   ├── router/          路由表
-│   │   └── logging/         日志初始化
-│   └── .env.example         配置模板
-├── frontend/                Web 控制台（M8 实现）
-├── deployments/             PostgreSQL / Redis / RabbitMQ compose
+│   │   ├── platform/        PostgreSQL、文件存储、MQ、模型客户端
+│   │   ├── knowledge/       文档、解析、切分、检索
+│   │   ├── memory/          记忆提炼、合并、召回
+│   │   ├── agent/           Eino 封装、工具、预算、审批、审计
+│   │   ├── chat/            会话、消息、SSE
+│   │   ├── action/          目标、计划、任务
+│   │   ├── ctxbuild/        上下文组装与 token 预算
+│   │   ├── insight/         周期总结与分析
+│   │   ├── job/ worker/     异步任务与消费
+│   │   ├── handler/ router/ 协议层与路由表
+│   └── migrations/          SQL 迁移（Phase 1 起）
+├── frontend/                React 应用（Phase 1 起）
+├── deployments/             PostgreSQL(pgvector) / RabbitMQ / Redis compose
 └── docs/                    设计、计划、代码导读
 ```
 
-依赖方向单向向下：`cmd/server → router → handler → service → repository → model`，`httpx` 与 `platform` 横向支撑；worker 复用 service，不经过 HTTP 层。
+依赖单向：`router → <module>/handler → <module>/service → <module>/repository → <module>/model`；`agent` 与 `worker` 复用模块 service，不经过 HTTP 层。当前代码只到 Phase 0 骨架，模块目录随阶段落地。
 
 ## 快速开始
 
-前置：Go 1.27+、Docker。
+前置：Go 1.27+、Node 20+、Docker。
 
 ```bash
 # 1. 准备配置（只需一次；.env 已被 gitignore）
@@ -59,19 +78,20 @@ cp backend/.env.example backend/.env
 # 2. 启动基础设施（在仓库根目录执行）
 docker compose --env-file backend/.env -f deployments/docker-compose.yml up -d
 
-# 3. 启动服务
+# 3. 执行迁移并启动服务
 cd backend
+go run ./cmd/migrate up          # Phase 1 起可用
 go run ./cmd/server
 ```
 
 验证：
 
 ```bash
-curl -i http://localhost:8080/healthz   # 存活探针，不检查依赖
-curl -i http://localhost:8080/readyz    # 就绪探针，检查 PostgreSQL，不可用返回 503
+curl -i http://localhost:8080/healthz     # 存活探针，不检查依赖
+curl -i http://localhost:8080/readyz      # 就绪探针，检查 PostgreSQL，不可用返回 503
 ```
 
-常用命令（工作目录均为 `backend/`）：
+常用命令（工作目录 `backend/`）：
 
 ```bash
 go build ./...                  # 编译
@@ -79,7 +99,6 @@ go vet ./...                    # 静态检查
 go test -race -count=1 ./...    # 测试
 go fmt ./...                    # 格式化
 go mod tidy                     # 整理依赖
-go build -o bin/noema ./cmd/server
 ```
 
 基础设施（在仓库根目录执行）：
@@ -92,28 +111,30 @@ docker compose --env-file backend/.env -f deployments/docker-compose.yml down   
 docker compose --env-file backend/.env -f deployments/docker-compose.yml down -v   # 清空数据
 ```
 
+> PostgreSQL 镜像为 `pgvector/pgvector:pg16`。从旧版本切过来时数据卷不兼容，需要 `down -v` 后重建（当前阶段库内无业务数据）。
+
 ## 文档导航
 
 | 文档 | 内容 |
 |---|---|
-| [AGENTS.md](AGENTS.md) | 开发准入约定：架构边界、硬约束、禁止事项、Git 规范 |
-| [docs/design/overview.md](docs/design/overview.md) | 领域模型、状态机、API 清单、技术选型依据 |
-| [docs/plan.md](docs/plan.md) | 里程碑计划：交付物、提交拆分、验证方式、退出标准 |
+| [AGENTS.md](AGENTS.md) | 开发准入约定：模块边界、硬约束、禁止事项、Git 规范 |
+| [docs/design/overview.md](docs/design/overview.md) | 领域模型、检索与记忆机制、Agent 运行时、API 清单 |
+| [docs/plan.md](docs/plan.md) | Phase 1–8：交付物、提交拆分、验证方式、退出标准 |
 | [docs/guide/](docs/guide/) | 逐行代码导读 |
 
 ## 路线图
 
-| 里程碑 | 内容 | 状态 |
+| 阶段 | 内容 | 状态 |
 |---|---|---|
-| M0 | 服务骨架与基础设施连通 | 已完成 |
-| M1 | 领域模型与数据库迁移 | 进行中 |
-| M2 | 文档上传与任务创建 | 待开始 |
-| M3 | 加工流水线（FakeRunner） | 待开始 |
-| M4 | 真实模型接入与成本核算 | 待开始 |
-| M5 | 笔记检索与导出 | 待开始 |
-| M6 | Redis 缓存、限流与租约 | 待开始 |
-| M7 | RabbitMQ 与事件推送 | 待开始 |
-| M8 | Web 控制台与工程完善 | 待开始 |
+| Phase 0 | 服务骨架（配置、日志、中间件、健康检查、优雅关闭） | 已完成 |
+| Phase 1 | 工程与基础设施：迁移、pgvector、配置、前端脚手架 | 待开始 |
+| Phase 2 | Knowledge：入库、切分、向量化、混合检索、RAG | 待开始 |
+| Phase 3 | Memory：提炼、合并、召回、管理 | 待开始 |
+| Phase 4 | Agent：运行时、工具、预算、checkpoint、审批、SSE | 待开始 |
+| Phase 5 | Action：目标、计划、任务、人工确认 | 待开始 |
+| Phase 6 | Context：分段预算、摘要压缩 | 待开始 |
+| Phase 7 | Insights：周期总结与学习分析 | 待开始 |
+| Phase 8 | 产品完善：测试、监控、部署、文档 | 待开始 |
 
 ## 贡献
 
