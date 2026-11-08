@@ -1,6 +1,8 @@
-# Noema 本地基础设施。
+# MindOS 本地基础设施。
 #
-# 只包含有状态依赖：PostgreSQL、Redis、RabbitMQ。
+# PostgreSQL 使用 pgvector 镜像：向量检索与业务数据同库，不额外引入向量数据库。
+# Redis 为按需组件（当前未接入应用），保留服务但不影响启动。
+#
 # 开发期应用进程在宿主机运行：`cd backend && go run ./cmd/server`。
 #
 # 注意显式指定 env 文件：compose 默认只在自身所在目录找 .env，
@@ -11,17 +13,18 @@
 #   docker compose --env-file backend/.env -f deployments/docker-compose.yml down      停止（保留数据卷）
 #   docker compose --env-file backend/.env -f deployments/docker-compose.yml down -v   停止并删除数据卷
 
-name: noema
+name: mindos
 
 services:
   postgres:
-    image: postgres:16.4-alpine
-    container_name: noema-postgres
+    # pgvector 官方镜像 = PostgreSQL 16 + vector 扩展，兼容官方 postgres 镜像的用法。
+    image: pgvector/pgvector:pg16
+    container_name: mindos-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${DB_USER:-noema}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-noema_dev_password}
-      POSTGRES_DB: ${DB_NAME:-noema}
+      POSTGRES_USER: ${DB_USER:-mindos}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-mindos_dev_password}
+      POSTGRES_DB: ${DB_NAME:-mindos}
       # 固定编码与排序规则，保证不同机器上的索引/排序行为一致
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     ports:
@@ -29,7 +32,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-noema} -d ${DB_NAME:-noema}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-mindos} -d ${DB_NAME:-mindos}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -37,7 +40,7 @@ services:
 
   redis:
     image: redis:7.4-alpine
-    container_name: noema-redis
+    container_name: mindos-redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
     ports:
@@ -52,11 +55,11 @@ services:
 
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
-    container_name: noema-rabbitmq
+    container_name: mindos-rabbitmq
     restart: unless-stopped
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-noema}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-noema_dev_password}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-mindos}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-mindos_dev_password}
     ports:
       - "${RABBITMQ_PORT:-5672}:5672"      # AMQP
       - "${RABBITMQ_UI_PORT:-15672}:15672" # 管理界面 http://localhost:15672
