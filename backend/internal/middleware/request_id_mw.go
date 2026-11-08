@@ -6,7 +6,7 @@ package middleware
 import (
 	"github.com/gin-gonic/gin"
 
-	"github.com/luo303/noema/backend/internal/httpx"
+	"github.com/luo303/mindos/backend/internal/httpx"
 )
 
 // RequestID 为每个请求生成（或透传）request id，写入 gin.Context、标准库 context 与响应头。

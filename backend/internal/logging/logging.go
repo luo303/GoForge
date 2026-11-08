@@ -11,7 +11,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/luo303/noema/backend/internal/config"
+	"github.com/luo303/mindos/backend/internal/config"
 )
 
 // New 根据配置构造 logger，调用方负责在退出前 Sync()。

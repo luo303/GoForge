@@ -1,4 +1,4 @@
-module github.com/luo303/noema/backend
+module github.com/luo303/mindos/backend
 
 go 1.27.0
 

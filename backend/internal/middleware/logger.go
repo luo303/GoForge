@@ -6,7 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/luo303/noema/backend/internal/httpx"
+	"github.com/luo303/mindos/backend/internal/httpx"
 )
 
 // Logger 记录每个请求的关键信息：方法、路径、状态码、耗时、request id。

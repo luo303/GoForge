@@ -16,12 +16,14 @@ import (
 )
 
 // Config 是应用的全部配置，字段分组与 .env 中的区块一一对应。
+//
+// MindOS 是单用户本地应用：没有账号体系，因此这里不存在 JWT / 认证相关配置。
+// 需要新增配置时，必须同时满足两点——代码真的读了它，且 .env.example 里有对应项。
 type Config struct {
 	App   AppConfig
 	Log   LogConfig
 	DB    DBConfig
 	Redis RedisConfig
-	JWT   JWTConfig
 }
 
 // AppConfig 控制 HTTP 服务本身。
@@ -62,18 +64,13 @@ func (c DBConfig) DSN() string {
 	)
 }
 
-// RedisConfig 描述 Redis 连接（阶段四开始使用）。
+// RedisConfig 描述 Redis 连接。单用户本地场景暂不依赖 Redis，
+// 只有缓存/限流成为真实瓶颈时才接线（见 docs/plan.md 的顺序约束）。
 type RedisConfig struct {
 	Addr     string
 	Password string
 	DB       int
 	PoolSize int
-}
-
-// JWTConfig 描述令牌签发参数（阶段三开始使用）。
-type JWTConfig struct {
-	Secret    string
-	AccessTTL time.Duration
 }
 
 // IsDev 用于在开发环境输出更详细的错误信息。
@@ -100,9 +97,9 @@ func Load() (*Config, error) {
 		DB: DBConfig{
 			Host:            getEnv("DB_HOST", "localhost"),
 			Port:            getEnvInt("DB_PORT", 5432),
-			User:            getEnv("DB_USER", "goforge"),
+			User:            getEnv("DB_USER", "mindos"),
 			Password:        getEnv("DB_PASSWORD", ""),
-			Name:            getEnv("DB_NAME", "goforge"),
+			Name:            getEnv("DB_NAME", "mindos"),
 			SSLMode:         getEnv("DB_SSLMODE", "disable"),
 			MaxOpenConns:    getEnvInt("DB_MAX_OPEN_CONNS", 25),
 			MaxIdleConns:    getEnvInt("DB_MAX_IDLE_CONNS", 10),
@@ -115,10 +112,6 @@ func Load() (*Config, error) {
 			Password: getEnv("REDIS_PASSWORD", ""),
 			DB:       getEnvInt("REDIS_DB", 0),
 			PoolSize: getEnvInt("REDIS_POOL_SIZE", 20),
-		},
-		JWT: JWTConfig{
-			Secret:    getEnv("JWT_SECRET", ""),
-			AccessTTL: getEnvDuration("JWT_ACCESS_TTL", 24*time.Hour),
 		},
 	}
 

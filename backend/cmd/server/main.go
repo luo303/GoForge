@@ -1,4 +1,4 @@
-// GoForge 服务入口。
+// MindOS 服务入口。
 //
 // 这里的职责只有"组装"：读配置 → 建依赖 → 建 router → 启 server → 等退出信号 → 按序关闭。
 // 业务代码不在这里出现，这样 entry 永远保持短小、容易阅读。
@@ -17,12 +17,12 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/luo303/noema/backend/internal/config"
-	"github.com/luo303/noema/backend/internal/handler"
-	"github.com/luo303/noema/backend/internal/logging"
-	"github.com/luo303/noema/backend/internal/middleware"
-	"github.com/luo303/noema/backend/internal/platform"
-	"github.com/luo303/noema/backend/internal/router"
+	"github.com/luo303/mindos/backend/internal/config"
+	"github.com/luo303/mindos/backend/internal/handler"
+	"github.com/luo303/mindos/backend/internal/logging"
+	"github.com/luo303/mindos/backend/internal/middleware"
+	"github.com/luo303/mindos/backend/internal/platform"
+	"github.com/luo303/mindos/backend/internal/router"
 )
 
 // version 可以在编译时注入：go build -ldflags "-X main.version=v0.1.0"
@@ -32,7 +32,7 @@ func main() {
 	// run 返回 error，main 只负责打印和退出码。
 	// 这样所有资源清理都能用 defer 完成，而不需要在多处 os.Exit（os.Exit 不会执行 defer）。
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "goforge: %v\n", err)
+		fmt.Fprintf(os.Stderr, "mindos: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -51,7 +51,7 @@ func run() error {
 	}
 	defer func() { _ = log.Sync() }()
 
-	log.Info("starting goforge",
+	log.Info("starting mindos",
 		zap.String("version", version),
 		zap.String("env", cfg.App.Env),
 		zap.String("addr", cfg.App.HTTPAddr),
@@ -151,6 +151,6 @@ func run() error {
 		return fmt.Errorf("graceful shutdown: %w", err)
 	}
 
-	log.Info("goforge stopped")
+	log.Info("mindos stopped")
 	return nil
 }
