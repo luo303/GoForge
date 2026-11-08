@@ -83,38 +83,44 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("load .env: %w", err)
 	}
 
-	env := getEnv("APP_ENV", "dev")
+	// reader 在解析阶段收集所有类型错误，最后一次性返回。
+	// 这样 DB_PORT 和 SHUTDOWN_TIMEOUT 同时写错时，不用改一个、重启、再发现下一个。
+	reader := &envReader{}
+	env := reader.text("APP_ENV", "dev")
 	cfg := &Config{
 		App: AppConfig{
 			Env:             env,
-			HTTPAddr:        getEnv("HTTP_ADDR", ":8080"),
-			ShutdownTimeout: getEnvDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
+			HTTPAddr:        reader.text("HTTP_ADDR", ":8080"),
+			ShutdownTimeout: reader.duration("SHUTDOWN_TIMEOUT", 10*time.Second),
 		},
 		Log: LogConfig{
-			Level:  getEnv("LOG_LEVEL", "debug"),
-			Format: getEnv("LOG_FORMAT", "console"),
+			Level:  strings.ToLower(reader.text("LOG_LEVEL", "debug")),
+			Format: reader.text("LOG_FORMAT", "console"),
 		},
 		DB: DBConfig{
-			Host:            getEnv("DB_HOST", "localhost"),
-			Port:            getEnvInt("DB_PORT", 5432),
-			User:            getEnv("DB_USER", "mindos"),
-			Password:        getEnv("DB_PASSWORD", ""),
-			Name:            getEnv("DB_NAME", "mindos"),
-			SSLMode:         getEnv("DB_SSLMODE", "disable"),
-			MaxOpenConns:    getEnvInt("DB_MAX_OPEN_CONNS", 25),
-			MaxIdleConns:    getEnvInt("DB_MAX_IDLE_CONNS", 10),
-			ConnMaxLifetime: getEnvDuration("DB_CONN_MAX_LIFETIME", 30*time.Minute),
-			PingTimeout:     getEnvDuration("DB_PING_TIMEOUT", 3*time.Second),
-			LogSQL:          getEnvBool("DB_LOG_SQL", env == "dev"),
+			Host:            reader.text("DB_HOST", "localhost"),
+			Port:            reader.integer("DB_PORT", 5432),
+			User:            reader.text("DB_USER", "mindos"),
+			Password:        reader.text("DB_PASSWORD", ""),
+			Name:            reader.text("DB_NAME", "mindos"),
+			SSLMode:         reader.text("DB_SSLMODE", "disable"),
+			MaxOpenConns:    reader.integer("DB_MAX_OPEN_CONNS", 25),
+			MaxIdleConns:    reader.integer("DB_MAX_IDLE_CONNS", 10),
+			ConnMaxLifetime: reader.duration("DB_CONN_MAX_LIFETIME", 30*time.Minute),
+			PingTimeout:     reader.duration("DB_PING_TIMEOUT", 3*time.Second),
+			LogSQL:          reader.boolean("DB_LOG_SQL", env == "dev"),
 		},
 		Redis: RedisConfig{
-			Addr:     getEnv("REDIS_ADDR", "localhost:6379"),
-			Password: getEnv("REDIS_PASSWORD", ""),
-			DB:       getEnvInt("REDIS_DB", 0),
-			PoolSize: getEnvInt("REDIS_POOL_SIZE", 20),
+			Addr:     reader.text("REDIS_ADDR", "localhost:6379"),
+			Password: reader.text("REDIS_PASSWORD", ""),
+			DB:       reader.integer("REDIS_DB", 0),
+			PoolSize: reader.integer("REDIS_POOL_SIZE", 20),
 		},
 	}
 
+	if err := reader.err(); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -129,16 +135,36 @@ func (c *Config) validate() error {
 	default:
 		errs = append(errs, fmt.Errorf("APP_ENV must be dev or prod, got %q", c.App.Env))
 	}
+	switch c.Log.Level {
+	case "debug", "info", "warn", "error":
+	default:
+		errs = append(errs, fmt.Errorf("LOG_LEVEL must be debug, info, warn or error, got %q", c.Log.Level))
+	}
 	switch c.Log.Format {
 	case "console", "json":
 	default:
 		errs = append(errs, fmt.Errorf("LOG_FORMAT must be console or json, got %q", c.Log.Format))
 	}
+	if c.App.ShutdownTimeout <= 0 {
+		errs = append(errs, errors.New("SHUTDOWN_TIMEOUT must be greater than 0"))
+	}
 	if c.DB.Host == "" {
 		errs = append(errs, errors.New("DB_HOST is required"))
 	}
+	if c.DB.Port < 1 || c.DB.Port > 65535 {
+		errs = append(errs, fmt.Errorf("DB_PORT must be between 1 and 65535, got %d", c.DB.Port))
+	}
 	if c.DB.Password == "" {
 		errs = append(errs, errors.New("DB_PASSWORD is required"))
+	}
+	if c.DB.MaxOpenConns < 1 {
+		errs = append(errs, fmt.Errorf("DB_MAX_OPEN_CONNS must be greater than 0, got %d", c.DB.MaxOpenConns))
+	}
+	if c.DB.MaxIdleConns < 0 {
+		errs = append(errs, fmt.Errorf("DB_MAX_IDLE_CONNS must not be negative, got %d", c.DB.MaxIdleConns))
+	}
+	if c.DB.PingTimeout <= 0 {
+		errs = append(errs, errors.New("DB_PING_TIMEOUT must be greater than 0"))
 	}
 	// errors.Join 是 Go 1.20 加入的：把多个错误合成一个，报错时一次看全。
 	return errors.Join(errs...)
@@ -203,44 +229,85 @@ func cutQuoted(v string) (string, bool) {
 	return "", false
 }
 
-func getEnv(key, fallback string) string {
-	if v, ok := os.LookupEnv(key); ok && v != "" {
+// envReader 读取环境变量，并记录类型解析错误。
+//
+// 为什么不让每个 getEnvXxx 直接返回 error：Load 里有十多个配置项，逐项写
+// `if err != nil { return ... }` 会让主流程被错误处理切碎，而且第一个错误就返回，
+// 用户要改一次、重启一次才能发现下一个。这里把错误暂存在局部 reader 中，最后用
+// errors.Join 一次报全。
+//
+// 注意：envReader 只在 Load 内部创建，不保存配置值，也不被并发共享。
+// 它收集的是"用户把配置写错了"，不是业务错误，所以错误信息可以包含配置项名和
+// 非敏感的原值；密码等敏感项只用 text 读取，不进入这些解析错误。
+type envReader struct {
+	errs []error
+}
+
+// text 返回字符串配置。未设置、空串或只有空白时使用默认值。
+// 密码等值保留原始内容，不做 TrimSpace，避免改变用户真实密码。
+func (r *envReader) text(key, fallback string) string {
+	if v, ok := os.LookupEnv(key); ok && strings.TrimSpace(v) != "" {
 		return v
 	}
 	return fallback
 }
 
-func getEnvInt(key string, fallback int) int {
-	if v, ok := os.LookupEnv(key); ok && v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return fallback
-}
-
-// getEnvBool 只接受标准写法：1/0、true/false、yes/no、on/off（不区分大小写）。
-// 其它值一律回退到默认值，而不是静默当成 true —— 配置写错时行为要可预测。
-func getEnvBool(key string, fallback bool) bool {
+// integer 读取整数。只有"没填"才回退；填了但不合法会记录错误，阻止服务启动。
+func (r *envReader) integer(key string, fallback int) int {
 	v, ok := os.LookupEnv(key)
-	if !ok || v == "" {
+	if !ok || strings.TrimSpace(v) == "" {
 		return fallback
 	}
-	switch strings.ToLower(strings.TrimSpace(v)) {
+	v = strings.TrimSpace(v)
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		r.errs = append(r.errs, fmt.Errorf("invalid %s: must be an integer, got %q", key, v))
+		return fallback
+	}
+	return n
+}
+
+// boolean 只接受常见标准写法，不把 "maybe" 之类静默当成 false。
+func (r *envReader) boolean(key string, fallback bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	v = strings.TrimSpace(v)
+	switch strings.ToLower(v) {
 	case "1", "true", "yes", "on":
 		return true
 	case "0", "false", "no", "off":
 		return false
 	default:
+		r.errs = append(r.errs, fmt.Errorf(
+			"invalid %s: must be one of 1/0, true/false, yes/no, on/off, got %q",
+			key, v,
+		))
 		return fallback
 	}
 }
 
-func getEnvDuration(key string, fallback time.Duration) time.Duration {
-	if v, ok := os.LookupEnv(key); ok && v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
+// duration 读取 duration 字符串，必须带单位（如 10s、500ms、2h）。
+// 只写 "10" 会被拒绝，因为 10 纳秒显然不是用户想表达的值。
+func (r *envReader) duration(key string, fallback time.Duration) time.Duration {
+	v, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return fallback
 	}
-	return fallback
+	v = strings.TrimSpace(v)
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		r.errs = append(r.errs, fmt.Errorf(
+			"invalid %s: must be a duration such as 10s or 500ms, got %q",
+			key, v,
+		))
+		return fallback
+	}
+	return d
+}
+
+// err 把解析阶段记录的所有错误合并成一个错误；没有错误时返回 nil。
+func (r *envReader) err() error {
+	return errors.Join(r.errs...)
 }
