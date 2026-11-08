@@ -3,7 +3,7 @@ package platform
 import (
 	gormlogger "gorm.io/gorm/logger"
 
-	"github.com/luo303/GoForge/internal/config"
+	"github.com/luo303/noema/backend/internal/config"
 )
 
 // gormLoggerLevel 决定 GORM 记录日志的详细程度。

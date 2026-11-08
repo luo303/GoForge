@@ -7,7 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/luo303/GoForge/internal/httpx"
+	"github.com/luo303/noema/backend/internal/httpx"
 )
 
 // Recovery 捕获 handler 中的 panic，记录堆栈并返回 500。

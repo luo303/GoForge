@@ -1,4 +1,4 @@
-module github.com/luo303/GoForge
+module github.com/luo303/noema/backend
 
 go 1.27.0
 

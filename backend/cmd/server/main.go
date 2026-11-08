@@ -17,12 +17,12 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
-	"github.com/luo303/GoForge/internal/config"
-	"github.com/luo303/GoForge/internal/handler"
-	"github.com/luo303/GoForge/internal/logging"
-	"github.com/luo303/GoForge/internal/middleware"
-	"github.com/luo303/GoForge/internal/platform"
-	"github.com/luo303/GoForge/internal/router"
+	"github.com/luo303/noema/backend/internal/config"
+	"github.com/luo303/noema/backend/internal/handler"
+	"github.com/luo303/noema/backend/internal/logging"
+	"github.com/luo303/noema/backend/internal/middleware"
+	"github.com/luo303/noema/backend/internal/platform"
+	"github.com/luo303/noema/backend/internal/router"
 )
 
 // version 可以在编译时注入：go build -ldflags "-X main.version=v0.1.0"

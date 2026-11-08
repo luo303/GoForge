@@ -13,7 +13,7 @@ import (
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
-	"github.com/luo303/GoForge/internal/config"
+	"github.com/luo303/noema/backend/internal/config"
 )
 
 // SlowQueryThreshold 超过它的 SQL 会被记录为 warn，便于早期发现缺失的索引。

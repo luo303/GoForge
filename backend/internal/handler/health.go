@@ -12,8 +12,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
-	"github.com/luo303/GoForge/internal/httpx"
-	"github.com/luo303/GoForge/internal/platform"
+	"github.com/luo303/noema/backend/internal/httpx"
+	"github.com/luo303/noema/backend/internal/platform"
 )
 
 // PingFunc 描述一次依赖健康检查。定义在消费方（handler），

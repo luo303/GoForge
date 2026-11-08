@@ -1,16 +1,20 @@
 # --- secrets / local config ---
+# 任意层级的 .env 与变体都不入库，只保留模板
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 *.pem
 
 # --- build output ---
-/bin/
-/tmp/
-/dist/
+/backend/bin/
+/backend/tmp/
+/frontend/dist/
 coverage.out
 coverage.html
 *.test
+
+# --- frontend（启用构建链后生效） ---
+/frontend/node_modules/
 
 # --- Go work files (local tooling only) ---
 go.work

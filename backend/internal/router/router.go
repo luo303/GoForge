@@ -9,8 +9,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/luo303/GoForge/internal/handler"
-	"github.com/luo303/GoForge/internal/httpx"
+	"github.com/luo303/noema/backend/internal/handler"
+	"github.com/luo303/noema/backend/internal/httpx"
 )
 
 // Deps 收集构建路由需要的依赖。
