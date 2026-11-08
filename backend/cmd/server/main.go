@@ -28,6 +28,32 @@ import (
 // version 可以在编译时注入：go build -ldflags "-X main.version=v0.1.0"
 var version = "dev"
 
+// newEngine 装配全局中间件并返回 HTTP 引擎。
+//
+// 单独成函数不是为了抽象，而是为了让 main_test.go 能验证真实装配顺序：
+// 如果测试自己再写一遍 Use(...)，即使 main.go 的顺序被改坏，测试也发现不了。
+//
+// 【为什么不用 gin.Default()】
+// 它的源码就是 New() + Use(Logger(), Recovery())；内置 Logger 只往 stdout
+// 打纯文本，Recovery 也不使用我们的 zap 日志与统一响应。这里照同样的标准姿势
+// 展开，但换成项目自己的实现。
+//
+// 【中间件顺序：Logger 必须在 Recovery 外层】
+// 请求表现为洋葱模型：外层中间件的前置代码先执行，内层 Handler 结束后再反向
+// 执行后置代码。Logger 的访问日志写在 c.Next() 之后，必须等内层执行完才能读到
+// 最终状态码与耗时。若 Recovery 在外层，Handler panic 会沿着调用栈直接跳过
+// Logger 的后续代码，导致这次失败请求没有访问日志；把 Recovery 放进 Logger
+// 内层，它先接住 panic 并写完 500，Logger 的 c.Next() 就能正常返回并记录日志。
+func newEngine(log *zap.Logger, isDev bool) *gin.Engine {
+	engine := gin.New()
+	engine.Use(
+		middleware.RequestID(),
+		middleware.Logger(log),
+		middleware.Recovery(log, isDev),
+	)
+	return engine
+}
+
 func main() {
 	// run 返回 error，main 只负责打印和退出码。
 	// 这样所有资源清理都能用 defer 完成，而不需要在多处 os.Exit（os.Exit 不会执行 defer）。
@@ -75,30 +101,7 @@ func run() error {
 	// 5. HTTP 组件装配。
 	health := handler.NewHealthHandler(db, cfg.DB.PingTimeout, version)
 
-	// *gin.Engine 内部有路由表和同步保护，可以由多个 goroutine 并发读取；
-	// 这里先建引擎、再交给 router 装配，避免 router 依赖太多构造细节。
-	//
-	// 【为什么不用官网的 gin.Default()】
-	// 官网示例的 gin.Default() 只是快捷方式，其源码就两行：
-	//
-	//	func Default() *Engine {
-	//	    engine := New()
-	//	    engine.Use(Logger(), Recovery()) // 挂 gin 内置的日志 + panic 恢复
-	//	    return engine
-	//	}
-	//
-	// 它内置的 Logger 只会往 stdout 打纯文本，Recovery 只返回 500，
-	// 都拿不到我们的 zap 实例和 request_id。所以这里照 Default() 的
-	// 标准姿势展开：New() + Use()，但换成自己的中间件。
-	// engine.Use(x) 表示"之后注册的所有路由，每个请求都先经过 x"，
-	// 类似 NestJS 的全局中间件管道，只是这里显式列出来、没有隐式注册。
-	// 顺序有意义：请求依次穿过 RequestID → Recovery → Logger（洋葱模型）。
-	engine := gin.New()
-	engine.Use(
-		middleware.RequestID(),
-		middleware.Recovery(log, cfg.IsDev()),
-		middleware.Logger(log),
-	)
+	engine := newEngine(log, cfg.IsDev())
 	router.Register(engine, router.Deps{Health: health})
 
 	// 【为什么不用 router.Run()】
