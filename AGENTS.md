@@ -22,7 +22,7 @@
 
 技术主线：Go + Gin + GORM + PostgreSQL 16（pgvector）+ RabbitMQ + Redis（按需）+ Eino ADK；前端 React + TypeScript + Vite + Tailwind + shadcn/ui。
 
-**当前进度：Phase 1 未开始**，现有代码是 Phase 0 骨架（配置、日志、中间件、健康检查、优雅关闭、DB 连通）。阶段见 `docs/plan.md`，设计见 `docs/design/overview.md`。
+**当前进度：Phase 1 已完成（2026-11-08），Phase 2 未开始。** 现有代码是 Phase 0 骨架加 Phase 1 的工程基线修复（中间件顺序、配置严格解析与回归测试）。阶段见 `docs/plan.md`，设计见 `docs/design/overview.md`。
 
 ## 2. 仓库结构与命令
 
@@ -186,11 +186,7 @@ agent  → 各模块 service（受控读写）      worker → 各模块 service
 
 ## 10. 当前已知问题（待修，勿遗忘）
 
-| 位置 | 问题 | 处理时机 |
-|---|---|---|
-| `backend/cmd/server/main.go` | 中间件顺序 `RequestID → Recovery → Logger` 导致 panic 请求无访问日志（已实测） | Phase 1 首个 fix 提交 |
-| `backend/internal/config` | `getEnvInt` 非法值静默回退默认值，行为不可预测 | Phase 1 |
-| `docs/guide/cmd-server-main.md` | 行号基于早期版本，后续以代码块为准 | 随导读更新 |
+当前无登记未修问题。Phase 1 已关闭：panic 请求访问日志丢失、配置类型错误静默回退、`cmd-server-main` 导读行号失准。新问题按“位置 / 影响 / 处理时机”追加到本节。
 
 ## 11. 阶段路线
 

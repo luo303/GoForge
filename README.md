@@ -91,6 +91,29 @@ curl -i http://localhost:8080/healthz     # 存活探针，不检查依赖
 curl -i http://localhost:8080/readyz      # 就绪探针，检查 PostgreSQL，不可用返回 503
 ```
 
+### 常见启动问题
+
+**配置值写错时服务不会带病启动。** 例如：
+
+```text
+mindos: load config: parse config: invalid DB_PORT: must be an integer, got "not-a-number"
+```
+
+整数、布尔值和 duration 都按严格规则解析；只有未设置或空白值才使用默认值。多个配置同时写错会一次列出，按报错中的配置项名修正 `.env` 或进程环境变量即可。
+
+- 布尔值接受 `1/0`、`true/false`、`yes/no`、`on/off`，不接受 `maybe`。
+- duration 必须带单位，例如 `10s`、`500ms`、`30m`。
+- 进程环境变量优先于 `.env`，修改 `.env` 前先确认没有同名环境变量覆盖。
+
+**请求 panic 时仍应有完整访问日志。** 日志中会同时出现：
+
+```text
+panic recovered   # 含 request_id、panic 值和堆栈
+http request      # 含同一个 request_id、method、path、status=500、latency_ms
+```
+
+若只有 `panic recovered` 而没有对应 `http request`，说明中间件顺序被改坏了，应保持 `RequestID → Logger → Recovery`。前端返回统一 `INTERNAL` 信封，不暴露 panic 细节。
+
 常用命令（工作目录 `backend/`）：
 
 ```bash
@@ -127,7 +150,7 @@ docker compose --env-file backend/.env -f deployments/docker-compose.yml down -v
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | Phase 0 | 服务骨架（配置、日志、中间件、健康检查、优雅关闭） | 已完成 |
-| Phase 1–3 | 工程基线：缺陷纠偏、迁移与系统状态、前端工程骨架 | 待开始 |
+| Phase 1–3 | 工程基线：缺陷纠偏、迁移与系统状态、前端工程骨架 | Phase 1 已完成；P2–3 待开始 |
 | Phase 4–9 | Knowledge：文本入库、多格式、异步任务、向量、混合检索、RAG | 待开始 |
 | Phase 10–12 | Memory：人工管理、提炼与冲突治理、召回质量 | 待开始 |
 | Phase 13–16 | Agent：最小对话、工具与预算、审批恢复、MQ 与后台执行 | 待开始 |

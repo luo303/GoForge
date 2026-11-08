@@ -18,8 +18,8 @@
 
 | # | 文件 | 行数 | 状态 | 这个文件真正要学的东西 |
 |---|---|---|---|---|
-| 1 | `backend/cmd/server/main.go` | 156 | ✅ 已完成 | `defer` 与 `os.Exit` 的冲突、goroutine + channel 启停、`http.Server` 超时、context 取消 |
-| 2 | `backend/internal/config/config.go` | 246 | ⏳ 待写 | 多返回值、`os.LookupEnv`、`bufio.Scanner`、`errors.Join`、值/指针接收者 |
+| 1 | `backend/cmd/server/main.go` | 159 | ✅ 已完成 | `defer` 与 `os.Exit` 的冲突、goroutine + channel 启停、`http.Server` 超时、context 取消 |
+| 2 | `backend/internal/config/config.go` | 313 | ⏳ 待写 | 多返回值、`os.LookupEnv`、`bufio.Scanner`、`errors.Join`、值/指针接收者 |
 | 3 | `backend/internal/logging/logging.go` | 43 | ⏳ 待写 | 接口组合（`zapcore.Encoder` / `Core`）、工厂函数返回 `(*T, error)` |
 | 4 | `backend/internal/platform/gorm_writer.go` | 35 | ⏳ 待写 | **隐式接口**：只实现一个 `Printf` 就满足 GORM 的 `Writer` |
 | 5 | `backend/internal/platform/gorm_level.go` | 19 | ⏳ 待写 | 枚举型返回、根据配置切换日志级别 |
