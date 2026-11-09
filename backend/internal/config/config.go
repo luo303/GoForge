@@ -89,6 +89,10 @@ func (c *Config) IsLLMConfigured() bool {
 // 单用户本地部署用文件系统即可；对象存储对单机是多余的运维负担（见 overview 取舍表）。
 type StorageConfig struct {
 	Dir string
+	// MaxUploadBytes 是单次导入允许的最大字节数。
+	// 放在配置里而不是代码常量：它取决于机器内存与使用习惯，不是业务规则；
+	// 但必须在服务端强制，不能只靠前端 accept 与 input 限制。
+	MaxUploadBytes int64
 }
 
 // LLMConfig 描述对话模型接入参数（OpenAI 兼容接口）。
@@ -160,7 +164,8 @@ func Load() (*Config, error) {
 			PoolSize: reader.integer("REDIS_POOL_SIZE", 20),
 		},
 		Storage: StorageConfig{
-			Dir: reader.text("STORAGE_DIR", "./storage"),
+			Dir:            reader.text("STORAGE_DIR", "./storage"),
+			MaxUploadBytes: reader.integer64("STORAGE_MAX_UPLOAD_BYTES", 10<<20),
 		},
 		LLM: LLMConfig{
 			APIBase: strings.TrimRight(reader.text("LLM_API_BASE", ""), "/"),
@@ -229,6 +234,10 @@ func (c *Config) validate() error {
 	}
 	if strings.TrimSpace(c.Storage.Dir) == "" {
 		errs = append(errs, errors.New("STORAGE_DIR must not be empty"))
+	}
+	if c.Storage.MaxUploadBytes < 1 {
+		errs = append(errs, fmt.Errorf(
+			"STORAGE_MAX_UPLOAD_BYTES must be greater than 0, got %d", c.Storage.MaxUploadBytes))
 	}
 	errs = append(errs, validateModelConfig("LLM", c.LLM.APIBase, c.LLM.APIKey, c.LLM.Model)...)
 	errs = append(errs, validateModelConfig("EMBEDDING", c.Embedding.APIBase, c.Embedding.APIKey, c.Embedding.Model)...)
