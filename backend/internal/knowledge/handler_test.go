@@ -29,6 +29,7 @@ func newTestEngine(t *testing.T, maxUploadBytes int64) (*gin.Engine, *fakeRepo) 
 	v1.GET("/documents", h.List)
 	v1.GET("/documents/:id", h.Get)
 	v1.GET("/documents/:id/chunks", h.ListChunks)
+	v1.PATCH("/documents/:id", h.Update)
 	v1.DELETE("/documents/:id", h.Delete)
 	v1.POST("/documents/:id/reindex", h.Reindex)
 	return e, repo
@@ -398,5 +399,94 @@ func TestMapErrorSourceMissing(t *testing.T) {
 	err := mapError(fmt.Errorf("reindex: %w", ErrSourceMissing))
 	if !httpx.IsCode(err, "CONFLICT") {
 		t.Fatalf("code = %v, want CONFLICT", err)
+	}
+}
+
+func TestCreateNoteWithMetadataAndFilterList(t *testing.T) {
+	e, _ := newTestEngine(t, 1<<20)
+
+	rec, env := doJSON(t, e, http.MethodPost, "/api/v1/documents/note", map[string]any{
+		"content":    "# 带标签\n\n正文。\n",
+		"collection": "工作",
+		"tags":       []string{"go", "检索"},
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var created documentView
+	if err := json.Unmarshal(env.Data, &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if created.Collection != "工作" || len(created.Tags) != 2 {
+		t.Fatalf("view = %+v", created)
+	}
+
+	// 按标签筛选要能命中；总数也要跟着变，否则前端翻页会错。
+	rec, env = doJSON(t, e, http.MethodGet, "/api/v1/documents?tag=go", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("filter status = %d", rec.Code)
+	}
+	var list documentListView
+	if err := json.Unmarshal(env.Data, &list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if list.Total != 1 || len(list.Items) != 1 {
+		t.Fatalf("filtered list = %+v", list)
+	}
+
+	// 不存在的标签返回空列表，而不是 404：筛选没有命中和"资源不存在"是两件事。
+	rec, env = doJSON(t, e, http.MethodGet, "/api/v1/documents?tag=不存在", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("empty filter status = %d", rec.Code)
+	}
+	list = documentListView{}
+	if err := json.Unmarshal(env.Data, &list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if list.Total != 0 || len(list.Items) != 0 {
+		t.Fatalf("unexpected items for unknown tag: %+v", list)
+	}
+}
+
+func TestListRejectsUnknownStatus(t *testing.T) {
+	e, _ := newTestEngine(t, 1<<20)
+	rec, env := doJSON(t, e, http.MethodGet, "/api/v1/documents?status=whatever", nil)
+	if rec.Code != http.StatusBadRequest || env.Code != "INVALID_ARGUMENT" {
+		t.Fatalf("status = %d code = %q", rec.Code, env.Code)
+	}
+}
+
+func TestUpdateEndpoint(t *testing.T) {
+	e, _ := newTestEngine(t, 1<<20)
+	if rec, _ := doJSON(t, e, http.MethodPost, "/api/v1/documents/note",
+		map[string]string{"content": "# 标题\n\n正文。\n"}); rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d", rec.Code)
+	}
+
+	rec, env := doJSON(t, e, http.MethodPatch, "/api/v1/documents/1", map[string]any{
+		"title":      "改过的标题",
+		"collection": "归档",
+		"tags":       []string{"a", "b"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var updated documentView
+	if err := json.Unmarshal(env.Data, &updated); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if updated.Title != "改过的标题" || updated.Collection != "归档" || len(updated.Tags) != 2 {
+		t.Fatalf("unexpected view: %+v", updated)
+	}
+
+	// 一个字段都不传：这是调用方写错了，明确 400 而不是静默成功。
+	rec, _ = doJSON(t, e, http.MethodPatch, "/api/v1/documents/1", map[string]any{})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("empty patch status = %d", rec.Code)
+	}
+
+	rec, _ = doJSON(t, e, http.MethodPatch, "/api/v1/documents/999", map[string]any{"title": "x"})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing document status = %d", rec.Code)
 	}
 }

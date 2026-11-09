@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -27,11 +28,13 @@ func NewRepository(db *gorm.DB) *Repository {
 
 // documentColumns 是列表与详情读取的列。
 //
-// 故意不含 source_url / collection / tags / error_*：它们要到 Phase 5/6 才有读写方，
-// 现在读出来只会得到零值。列名集中在这里，避免两个方法各自写一份字符串。
+// 故意不含 source_url 与 error_*：前者属于已移出主线的网页抓取，
+// 后者要到 Phase 6 才有写入方；现在读出来只会得到零值。
+// 列名集中在这里，避免多个方法各自写一份字符串。
 var documentColumns = []string{
 	"id", "title", "source_type", "mime", "size_bytes", "content_hash",
-	"storage_path", "content", "status", "chunk_count", "created_at", "updated_at",
+	"storage_path", "content", "collection", "tags", "status", "chunk_count",
+	"created_at", "updated_at",
 }
 
 // chunkColumns 跳过 embedding 与 tsv：前者 6KB/行且本阶段不用，
@@ -97,10 +100,36 @@ func (r *Repository) GetByContentHash(ctx context.Context, hash string) (*Docume
 	return &doc, nil
 }
 
+// DocumentFilter 是列表的筛选条件，零值表示不过滤。
+//
+// 用指针区分"没传"与"传了空串"：`?collection=` 在 HTTP 语义上等于没传，
+// 而 PATCH 里 collection 为空串是"取消分类"。两者在这里都不能混为一谈。
+type DocumentFilter struct {
+	Collection *string
+	Tag        *string
+	Status     *string
+}
+
+// apply 把筛选条件挂到查询上。列表与计数必须共用它，
+// 否则很容易出现"列表 3 条、总数 10"这种翻页错乱的 bug。
+func (f DocumentFilter) apply(db *gorm.DB) *gorm.DB {
+	if f.Collection != nil {
+		db = db.Where("collection = ?", *f.Collection)
+	}
+	if f.Tag != nil {
+		// ANY(tags) 走 documents_tags_idx（GIN），不需要额外的关联查询。
+		db = db.Where("? = ANY(tags)", *f.Tag)
+	}
+	if f.Status != nil {
+		db = db.Where("status = ?", *f.Status)
+	}
+	return db
+}
+
 // List 按创建时间倒序分页。
-func (r *Repository) List(ctx context.Context, limit, offset int) ([]Document, error) {
+func (r *Repository) List(ctx context.Context, filter DocumentFilter, limit, offset int) ([]Document, error) {
 	docs := make([]Document, 0, limit)
-	err := r.db.WithContext(ctx).
+	err := filter.apply(r.db.WithContext(ctx)).
 		Select(documentColumns).
 		Order("created_at DESC, id DESC").
 		Limit(limit).
@@ -112,13 +141,55 @@ func (r *Repository) List(ctx context.Context, limit, offset int) ([]Document, e
 	return docs, nil
 }
 
-// Count 返回文档总数，供分页使用。
-func (r *Repository) Count(ctx context.Context) (int64, error) {
+// Count 返回满足条件的文档总数，供分页使用。
+func (r *Repository) Count(ctx context.Context, filter DocumentFilter) (int64, error) {
 	var total int64
-	if err := r.db.WithContext(ctx).Model(&Document{}).Count(&total).Error; err != nil {
+	if err := filter.apply(r.db.WithContext(ctx).Model(&Document{})).Count(&total).Error; err != nil {
 		return 0, translateError("count documents", err)
 	}
 	return total, nil
+}
+
+// DocumentPatch 是局部更新的字段集合，nil 表示"这次不改这一项"。
+//
+// 这是 PATCH 与 PUT 的区别落地处：PATCH 只改传了的字段，
+// 所以不能用结构体的零值表达"清空"——空串与 nil 必须是两种意思。
+type DocumentPatch struct {
+	Title      *string
+	Collection *string
+	Tags       *StringArray
+}
+
+// Update 局部更新文档元信息。
+//
+// updated_at 显式写入：用 map 更新时 GORM 不会自动维护时间戳
+// （结构体更新才会），漏了它会出现"改了标签但排序没变"。
+func (r *Repository) Update(ctx context.Context, id int64, patch DocumentPatch) error {
+	updates := map[string]any{"updated_at": time.Now().UTC()}
+	if patch.Title != nil {
+		updates["title"] = *patch.Title
+	}
+	if patch.Collection != nil {
+		// 空串写 NULL 而不是空串：读取时"未分类"只应该有一种表示，
+		// 否则筛选未分类要写 (collection IS NULL OR collection = '')。
+		if strings.TrimSpace(*patch.Collection) == "" {
+			updates["collection"] = nil
+		} else {
+			updates["collection"] = strings.TrimSpace(*patch.Collection)
+		}
+	}
+	if patch.Tags != nil {
+		updates["tags"] = *patch.Tags
+	}
+
+	res := r.db.WithContext(ctx).Model(&Document{}).Where("id = ?", id).Updates(updates)
+	if res.Error != nil {
+		return translateError("update document", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // ListChunks 按 seq 升序返回某个文档的分块。

@@ -36,6 +36,8 @@ var (
 	// ErrSourceMissing 表示文档的原文已不可得（文件被删、笔记没有正文），
 	// 重索引无法进行。这不是"参数错"，而是数据状态已经不可解释。
 	ErrSourceMissing = errors.New("document source is missing")
+	// ErrInvalidMetadata 表示分类或标签不合法（超长、含分隔符、数量过多）。
+	ErrInvalidMetadata = errors.New("invalid document metadata")
 )
 
 // 分页边界。上限 100 是"防止一次拉全库"的护栏，不是性能优化。
@@ -53,10 +55,11 @@ type documentRepository interface {
 	CreateWithChunks(ctx context.Context, doc *Document, chunks []Chunk) error
 	Get(ctx context.Context, id int64) (*Document, error)
 	GetByContentHash(ctx context.Context, hash string) (*Document, error)
-	List(ctx context.Context, limit, offset int) ([]Document, error)
-	Count(ctx context.Context) (int64, error)
+	List(ctx context.Context, filter DocumentFilter, limit, offset int) ([]Document, error)
+	Count(ctx context.Context, filter DocumentFilter) (int64, error)
 	ListChunks(ctx context.Context, documentID int64, limit, offset int) ([]Chunk, error)
 	CountChunks(ctx context.Context, documentID int64) (int64, error)
+	Update(ctx context.Context, id int64, patch DocumentPatch) error
 	Delete(ctx context.Context, id int64) error
 	ReplaceChunks(ctx context.Context, documentID int64, chunks []Chunk) error
 }
@@ -96,15 +99,30 @@ func NewService(repo documentRepository, store fileStore, maxUploadBytes int64, 
 }
 
 // FileInput 是一次文件导入请求。
+//
+// Collection / Tags 属于"元信息"，与正文分开传：正文来自文件流，
+// 元信息来自表单字段或查询参数，混在一起会让调用方以为标签是文件内容的一部分。
 type FileInput struct {
-	Filename string
-	Content  io.Reader
+	Filename   string
+	Content    io.Reader
+	Collection string
+	Tags       []string
 }
 
 // NoteInput 是一次笔记导入请求。
 type NoteInput struct {
-	Title   string
-	Content string
+	Title      string
+	Content    string
+	Collection string
+	Tags       []string
+}
+
+// UpdateInput 是一次局部更新请求。nil 表示"这次不改这一项"，
+// 传空串/空切片则表示"清空它"——这两种意图不能合并。
+type UpdateInput struct {
+	Title      *string
+	Collection *string
+	Tags       *[]string
 }
 
 // ImportFile 同步导入一个文本文件。
@@ -135,6 +153,11 @@ func (s *Service) ImportFile(ctx context.Context, in FileInput) (*Document, bool
 	if err != nil {
 		return nil, false, err
 	}
+	// 元信息在落盘之前校验：参数不合法时不该先往磁盘写一份文件再删掉。
+	collection, tags, err := normalizeMetadata(in.Collection, in.Tags)
+	if err != nil {
+		return nil, false, err
+	}
 
 	// 先落盘再落库：文件系统不在数据库事务里，顺序反过来会出现
 	// "事务已提交但文件写失败"——那才是真正不可修复的坏状态。
@@ -150,6 +173,8 @@ func (s *Service) ImportFile(ctx context.Context, in FileInput) (*Document, bool
 		ContentHash: saved.Hash,
 		SourceType:  SourceFile,
 		StoragePath: &saved.RelPath,
+		Collection:  collection,
+		Tags:        tags,
 		Status:      StatusReady,
 		// ChunkCount 由 repository 按实际写入的分块数赋值，这里不重复计算。
 	}
@@ -175,6 +200,10 @@ func (s *Service) ImportNote(ctx context.Context, in NoteInput) (*Document, bool
 	if err != nil {
 		return nil, false, err
 	}
+	collection, tags, err := normalizeMetadata(in.Collection, in.Tags)
+	if err != nil {
+		return nil, false, err
+	}
 
 	doc := &Document{
 		Title:       titleForNote(in.Title, text),
@@ -183,6 +212,8 @@ func (s *Service) ImportNote(ctx context.Context, in NoteInput) (*Document, bool
 		ContentHash: platform.ContentHash(data),
 		SourceType:  SourceNote,
 		Content:     &text,
+		Collection:  collection,
+		Tags:        tags,
 		Status:      StatusReady,
 	}
 	return s.persist(ctx, doc, chunks, nil)
@@ -228,17 +259,62 @@ func (s *Service) Get(ctx context.Context, id int64) (*Document, error) {
 }
 
 // List 分页返回文档，同时给出总数供前端翻页。
-func (s *Service) List(ctx context.Context, limit, offset int) ([]Document, int64, error) {
+//
+// 总数与列表用同一个 filter，否则会出现"筛出 3 条、总数却写 10"，
+// 前端按总数算出来的页数完全对不上。
+func (s *Service) List(ctx context.Context, filter DocumentFilter, limit, offset int) ([]Document, int64, error) {
 	limit, offset = ClampPaging(limit, offset)
-	docs, err := s.repo.List(ctx, limit, offset)
+	docs, err := s.repo.List(ctx, filter, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
-	total, err := s.repo.Count(ctx)
+	total, err := s.repo.Count(ctx, filter)
 	if err != nil {
 		return nil, 0, err
 	}
 	return docs, total, nil
+}
+
+// Update 修改文档的元信息（标题、分类、标签），不涉及正文与分块。
+//
+// 正文与它的分块、哈希是绑在一起的：改正文等于换一份文档，
+// 那应该重新导入，而不是在这里悄悄改掉 content_hash 让幂等判定失效。
+func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (*Document, error) {
+	patch := DocumentPatch{}
+	if in.Title != nil {
+		title := strings.TrimSpace(*in.Title)
+		if title == "" {
+			return nil, fmt.Errorf("%w: title must not be blank", ErrInvalidMetadata)
+		}
+		title = truncateRunes(title, 200)
+		patch.Title = &title
+	}
+	if in.Collection != nil {
+		collection := strings.TrimSpace(*in.Collection)
+		if utf8.RuneCountInString(collection) > maxCollectionRunes {
+			return nil, fmt.Errorf("%w: collection must be at most %d characters",
+				ErrInvalidMetadata, maxCollectionRunes)
+		}
+		patch.Collection = &collection
+	}
+	if in.Tags != nil {
+		tags, err := normalizeTags(*in.Tags)
+		if err != nil {
+			return nil, err
+		}
+		patch.Tags = &tags
+	}
+	if patch.Title == nil && patch.Collection == nil && patch.Tags == nil {
+		return nil, fmt.Errorf("%w: at least one of title, collection or tags is required",
+			ErrInvalidMetadata)
+	}
+
+	if err := s.repo.Update(ctx, id, patch); err != nil {
+		return nil, err
+	}
+	// 回读而不是在内存里拼一个：updated_at 由数据库写入，
+	// 直接返回旧结构体会让前端看到"改成功了但时间没变"。
+	return s.repo.Get(ctx, id)
 }
 
 // ListChunks 返回某个文档的分块。
@@ -339,6 +415,67 @@ func (s *Service) sourceText(ctx context.Context, doc *Document) (string, error)
 		return text, err
 	}
 	return "", ErrSourceMissing
+}
+
+// 元信息边界。这些上限不是性能考虑，而是"让筛选有意义"：
+// 几百个标签的分类法在界面上无法使用，也会让 ANY(tags) 的过滤结果失去区分度。
+const (
+	maxTagsPerDocument = 20
+	maxTagRunes        = 32
+	maxCollectionRunes = 64
+)
+
+// normalizeMetadata 校验并规整分类与标签，返回可直接入库的形态。
+//
+// 返回 *string 而不是 string：数据库里"未分类"是 NULL，
+// 空字符串会让"未分类"出现两种表示，筛选时还要额外兼容。
+func normalizeMetadata(collection string, tags []string) (*string, StringArray, error) {
+	trimmed := strings.TrimSpace(collection)
+	var collectionPtr *string
+	if trimmed != "" {
+		if utf8.RuneCountInString(trimmed) > maxCollectionRunes {
+			return nil, nil, fmt.Errorf("%w: collection must be at most %d characters",
+				ErrInvalidMetadata, maxCollectionRunes)
+		}
+		collectionPtr = &trimmed
+	}
+	normalized, err := normalizeTags(tags)
+	if err != nil {
+		return nil, nil, err
+	}
+	return collectionPtr, normalized, nil
+}
+
+// normalizeTags 去空白、丢空项、去重（保持输入顺序），并检查长度与数量。
+//
+// 不允许逗号：文件导入的标签是 `tags=a,b` 这种逗号分隔写法，
+// 允许标签里带逗号就没有任何办法把它和分隔符区分开。
+// 与其在解析上发明一套转义规则，不如直接拒绝——分类标签带逗号本来也很少见。
+func normalizeTags(tags []string) (StringArray, error) {
+	out := make(StringArray, 0, len(tags))
+	seen := make(map[string]struct{}, len(tags))
+	for _, raw := range tags {
+		tag := strings.TrimSpace(raw)
+		if tag == "" {
+			continue
+		}
+		if strings.ContainsRune(tag, ',') {
+			return nil, fmt.Errorf("%w: tag %q must not contain a comma", ErrInvalidMetadata, tag)
+		}
+		if utf8.RuneCountInString(tag) > maxTagRunes {
+			return nil, fmt.Errorf("%w: tag %q is longer than %d characters",
+				ErrInvalidMetadata, tag, maxTagRunes)
+		}
+		if _, dup := seen[tag]; dup {
+			continue
+		}
+		seen[tag] = struct{}{}
+		out = append(out, tag)
+	}
+	if len(out) > maxTagsPerDocument {
+		return nil, fmt.Errorf("%w: at most %d tags are allowed", ErrInvalidMetadata, maxTagsPerDocument)
+	}
+	return out, nil
 }
 
 // utf8BOM 是文件开头的字节序标记。Windows 记事本保存的 UTF-8 文件常带它。

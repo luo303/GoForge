@@ -7,6 +7,7 @@ package knowledge
 import (
 	"errors"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -36,6 +37,8 @@ type documentView struct {
 	MIME        string    `json:"mime"`
 	SizeBytes   int64     `json:"size_bytes"`
 	ContentHash string    `json:"content_hash"`
+	Collection  string    `json:"collection"`
+	Tags        []string  `json:"tags"`
 	Status      string    `json:"status"`
 	ChunkCount  int       `json:"chunk_count"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -83,8 +86,20 @@ type chunkListView struct {
 }
 
 type createNoteRequest struct {
-	Title   string `json:"title"`
-	Content string `json:"content"`
+	Title      string   `json:"title"`
+	Content    string   `json:"content"`
+	Collection string   `json:"collection"`
+	Tags       []string `json:"tags"`
+}
+
+// updateDocumentRequest 是 PATCH 的入参。
+//
+// 三个字段都是指针：JSON 里没出现的键留 nil（不改），出现但为空串/空数组
+// 表示"清空"。用值类型就没法表达"没传 tags"，只能靠额外的字段名列表。
+type updateDocumentRequest struct {
+	Title      *string   `json:"title"`
+	Collection *string   `json:"collection"`
+	Tags       *[]string `json:"tags"`
 }
 
 // CreateFile 处理 multipart 上传：POST /documents，字段名 file。
@@ -105,8 +120,12 @@ func (h *Handler) CreateFile(c *gin.Context) {
 	defer func() { _ = f.Close() }()
 
 	doc, existed, err := h.svc.ImportFile(c.Request.Context(), FileInput{
-		Filename: fileHeader.Filename,
-		Content:  f,
+		Filename:   fileHeader.Filename,
+		Content:    f,
+		Collection: c.PostForm("collection"),
+		// 表单里的标签是逗号分隔的一串（`tags=工作,Go`）：
+		// multipart 没有数组语义，前端传多值字段反而要自己拼 index。
+		Tags: splitCSV(c.PostForm("tags")),
 	})
 	if err != nil {
 		httpx.Fail(c, mapError(err))
@@ -125,8 +144,10 @@ func (h *Handler) CreateNote(c *gin.Context) {
 	}
 
 	doc, existed, err := h.svc.ImportNote(c.Request.Context(), NoteInput{
-		Title:   req.Title,
-		Content: req.Content,
+		Title:      req.Title,
+		Content:    req.Content,
+		Collection: req.Collection,
+		Tags:       req.Tags,
 	})
 	if err != nil {
 		httpx.Fail(c, mapError(err))
@@ -135,14 +156,19 @@ func (h *Handler) CreateNote(c *gin.Context) {
 	respondImported(c, doc, existed)
 }
 
-// List 返回分页后的文档列表：GET /documents?limit=&offset=。
+// List 返回分页后的文档列表：GET /documents?limit=&offset=&collection=&tag=&status=。
 func (h *Handler) List(c *gin.Context) {
 	limit, offset, err := parsePaging(c)
 	if err != nil {
 		httpx.Fail(c, err)
 		return
 	}
-	docs, total, err := h.svc.List(c.Request.Context(), limit, offset)
+	filter, err := parseFilter(c)
+	if err != nil {
+		httpx.Fail(c, err)
+		return
+	}
+	docs, total, err := h.svc.List(c.Request.Context(), filter, limit, offset)
 	if err != nil {
 		httpx.Fail(c, mapError(err))
 		return
@@ -153,6 +179,32 @@ func (h *Handler) List(c *gin.Context) {
 		items = append(items, newDocumentView(&docs[i]))
 	}
 	httpx.OK(c, documentListView{Items: items, Total: total, Limit: limit, Offset: offset})
+}
+
+// Update 局部更新文档元信息：PATCH /documents/:id。
+func (h *Handler) Update(c *gin.Context) {
+	id, err := parseID(c.Param("id"))
+	if err != nil {
+		httpx.Fail(c, err)
+		return
+	}
+	var req updateDocumentRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.Fail(c, httpx.ErrInvalidArgument.WithMessage(
+			`request body must be JSON with any of "title", "collection", "tags"`))
+		return
+	}
+
+	doc, err := h.svc.Update(c.Request.Context(), id, UpdateInput{
+		Title:      req.Title,
+		Collection: req.Collection,
+		Tags:       req.Tags,
+	})
+	if err != nil {
+		httpx.Fail(c, mapError(err))
+		return
+	}
+	httpx.OK(c, newDocumentView(doc))
 }
 
 // Get 返回文档详情：GET /documents/:id。
@@ -245,18 +297,29 @@ func respondImported(c *gin.Context, doc *Document, existed bool) {
 }
 
 func newDocumentView(doc *Document) documentView {
-	return documentView{
+	tags := []string(doc.Tags)
+	if tags == nil {
+		// 空切片而不是 null：前端少写一次 `tags ?? []`，
+		// 也让"没有标签"在 JSON 里只有一种形状。
+		tags = []string{}
+	}
+	view := documentView{
 		ID:          doc.ID,
 		Title:       doc.Title,
 		SourceType:  doc.SourceType,
 		MIME:        doc.MIME,
 		SizeBytes:   doc.SizeBytes,
 		ContentHash: doc.ContentHash,
+		Tags:        tags,
 		Status:      doc.Status,
 		ChunkCount:  doc.ChunkCount,
 		CreatedAt:   doc.CreatedAt,
 		UpdatedAt:   doc.UpdatedAt,
 	}
+	if doc.Collection != nil {
+		view.Collection = *doc.Collection
+	}
+	return view
 }
 
 func newChunkView(c *Chunk) chunkView {
@@ -312,6 +375,48 @@ func parseIntQuery(c *gin.Context, key string) (int, error) {
 	return v, nil
 }
 
+// parseFilter 解析列表筛选条件。空参数一律当作"不过滤"，
+// 而不是"筛出空串的那一类"——前端清空下拉框时不会专门删掉这个键。
+func parseFilter(c *gin.Context) (DocumentFilter, error) {
+	var filter DocumentFilter
+	if v := strings.TrimSpace(c.Query("collection")); v != "" {
+		filter.Collection = &v
+	}
+	if v := strings.TrimSpace(c.Query("tag")); v != "" {
+		filter.Tag = &v
+	}
+	if v := strings.TrimSpace(c.Query("status")); v != "" {
+		if !isKnownStatus(v) {
+			return DocumentFilter{}, httpx.ErrInvalidArgument.WithMessage(
+				"status must be one of pending, parsing, indexing, ready, failed, cancelling; got %q", v)
+		}
+		filter.Status = &v
+	}
+	return filter, nil
+}
+
+// isKnownStatus 与 documents.status 的 CHECK 约束保持一致。
+//
+// 在 handler 拦一道而不是全靠数据库：非法状态会让查询返回空列表，
+// 用户看到的是"筛选后什么都没有"，而不是"你传错了参数"。
+func isKnownStatus(status string) bool {
+	switch status {
+	case StatusPending, StatusParsing, StatusIndexing, StatusReady, StatusFailed, StatusCancelling:
+		return true
+	default:
+		return false
+	}
+}
+
+// splitCSV 把 `tags=a, b` 拆成 []string。空项交给 service 的 normalizeTags 丢弃，
+// 这里不做过滤：拆分与校验是两件事，混在一起以后不好单独测。
+func splitCSV(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	return strings.Split(raw, ",")
+}
+
 // mapError 把模块哨兵错误翻译成对外错误码。
 //
 // 默认分支原样返回：不是本模块认识的错误，说明是数据库/IO 故障，
@@ -334,6 +439,9 @@ func mapError(err error) error {
 		return httpx.ErrInvalidArgument.WithMessage("document content must not be empty")
 	case errors.Is(err, ErrNotUTF8):
 		return httpx.ErrInvalidArgument.WithMessage("document must be UTF-8 encoded text")
+	case errors.Is(err, ErrInvalidMetadata):
+		// 原始 err 里带着具体是哪个字段、哪个值不合法，这里只保留那份说明。
+		return httpx.ErrInvalidArgument.WithMessage("%s", err.Error())
 	default:
 		return err
 	}

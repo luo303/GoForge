@@ -38,8 +38,8 @@ const (
 
 // Document 对应 documents 表。
 //
-// 只声明本阶段真正读写的列。表里还有 source_url / collection / tags /
-// error_code / error_message，它们分别在 Phase 5、Phase 6 才有写入方，
+// 只声明本阶段真正读写的列。表里还有 source_url / error_code / error_message，
+// 它们分别属于网页抓取（已移出主线）与 Phase 6 的异步任务失败信息，
 // 现在加到结构体里只会得到"永远是零值"的字段，读代码的人还要多判断一次
 // "这个字段到底从哪来"。需要时再加，加字段不需要改表。
 type Document struct {
@@ -52,12 +52,18 @@ type Document struct {
 	SourceType  string `gorm:"column:source_type"`
 	// StoragePath 是相对 STORAGE_DIR 的路径，null 表示没有原始文件（笔记）。
 	StoragePath *string `gorm:"column:storage_path"`
-	// Content 只对笔记（以及 Phase 5 的网页）有值；文件的正文不重复入库。
-	Content    *string   `gorm:"column:content"`
-	Status     string    `gorm:"column:status"`
-	ChunkCount int       `gorm:"column:chunk_count"`
-	CreatedAt  time.Time `gorm:"column:created_at"`
-	UpdatedAt  time.Time `gorm:"column:updated_at"`
+	// Content 只对笔记有值；文件的正文不重复入库，需要时从 StoragePath 读。
+	Content *string `gorm:"column:content"`
+	// Collection 是单值分类，nil 表示未分类。不做成外键表：单用户场景下
+	// 分类只是一层筛选标签，独立建表换来的只有一次 JOIN。
+	Collection *string `gorm:"column:collection"`
+	// Tags 对应 text[]。必须写下 type:text[]，否则 GORM 无法推断列类型
+	// （见 string_array.go 顶部的实测记录）。
+	Tags       StringArray `gorm:"column:tags;type:text[]"`
+	Status     string      `gorm:"column:status"`
+	ChunkCount int         `gorm:"column:chunk_count"`
+	CreatedAt  time.Time   `gorm:"column:created_at"`
+	UpdatedAt  time.Time   `gorm:"column:updated_at"`
 }
 
 // TableName 显式声明表名。GORM 的默认复数化对 document 恰好正确，

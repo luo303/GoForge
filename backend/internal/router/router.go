@@ -64,6 +64,7 @@ func Register(e *gin.Engine, deps Deps) {
 	v1.GET("/documents", deps.Knowledge.List)
 	v1.GET("/documents/:id", deps.Knowledge.Get)
 	v1.GET("/documents/:id/chunks", deps.Knowledge.ListChunks)
+	v1.PATCH("/documents/:id", deps.Knowledge.Update)
 	v1.DELETE("/documents/:id", deps.Knowledge.Delete)
 	v1.POST("/documents/:id/reindex", deps.Knowledge.Reindex)
 }
