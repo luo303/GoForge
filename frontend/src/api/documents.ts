@@ -41,12 +41,43 @@ function buildListQuery(query: DocumentQuery): string {
   return params.toString()
 }
 
-export function fetchDocuments(query: DocumentQuery, signal?: AbortSignal): Promise<DocumentList> {
-  return apiRequest<DocumentList>(`/documents?${buildListQuery(query)}`, { signal })
+/**
+ * 接口边界上的字段兜底。
+ *
+ * 后端按契约总是带 collection / tags，但前端保证不了"对面一定是当前版本"：
+ * 开发时后端还跑着旧进程、升级期间新旧混跑，都会让这两个键整个缺失。
+ * 缺了就把它们当成"未分类 / 无标签"，页面其余部分照常可用——
+ * 否则 `doc.tags.slice(...)` 会抛错，React 直接把整页替换成错误界面。
+ *
+ * 兜底放在这一层而不是每个组件里，是因为页面只该关心 `DocumentView` 这一种形状。
+ */
+type WireDocumentView = Omit<DocumentView, 'collection' | 'tags'> & {
+  collection?: string | null
+  tags?: string[] | null
 }
 
-export function fetchDocument(id: number, signal?: AbortSignal): Promise<DocumentView> {
-  return apiRequest<DocumentView>(`/documents/${id}`, { signal })
+function normalizeDocument(raw: WireDocumentView): DocumentView {
+  return { ...raw, collection: raw.collection ?? '', tags: raw.tags ?? [] }
+}
+
+/** 导入响应多一个 existed；旧后端没有这个字段时按"新建"处理。 */
+function normalizeImported(raw: WireDocumentView & { existed?: boolean }): ImportedDocumentView {
+  return { ...normalizeDocument(raw), existed: raw.existed ?? false }
+}
+
+export async function fetchDocuments(
+  query: DocumentQuery,
+  signal?: AbortSignal,
+): Promise<DocumentList> {
+  const page = await apiRequest<Omit<DocumentList, 'items'> & { items: WireDocumentView[] }>(
+    `/documents?${buildListQuery(query)}`,
+    { signal },
+  )
+  return { ...page, items: page.items.map(normalizeDocument) }
+}
+
+export async function fetchDocument(id: number, signal?: AbortSignal): Promise<DocumentView> {
+  return normalizeDocument(await apiRequest<WireDocumentView>(`/documents/${id}`, { signal }))
 }
 
 export function fetchChunks(id: number, signal?: AbortSignal): Promise<ChunkList> {
@@ -59,7 +90,7 @@ export function fetchChunks(id: number, signal?: AbortSignal): Promise<ChunkList
  * 上传文件。collection / tags 走 multipart 的普通字段：
  * 后端按 `tags=a,b` 逗号分隔解析，前端不需要拼多值字段。
  */
-export function uploadDocument(
+export async function uploadDocument(
   file: File,
   meta: { collection?: string; tags?: string[] } = {},
 ): Promise<ImportedDocumentView> {
@@ -71,15 +102,17 @@ export function uploadDocument(
   if (meta.tags && meta.tags.length > 0) {
     body.append('tags', meta.tags.join(','))
   }
-  return apiRequest<ImportedDocumentView>('/documents', {
-    method: 'POST',
-    body,
-    // 上传比普通请求慢：解析与切分在同一个请求里完成，10s 默认值不够稳。
-    timeoutMs: 60_000,
-  })
+  return normalizeImported(
+    await apiRequest<WireDocumentView & { existed?: boolean }>('/documents', {
+      method: 'POST',
+      body,
+      // 上传比普通请求慢：解析与切分在同一个请求里完成，10s 默认值不够稳。
+      timeoutMs: 60_000,
+    }),
+  )
 }
 
-export function createNote(input: {
+export async function createNote(input: {
   content: string
   title?: string
   collection?: string
@@ -97,18 +130,30 @@ export function createNote(input: {
   if (input.tags && input.tags.length > 0) {
     body.tags = input.tags
   }
-  return apiRequest<ImportedDocumentView>('/documents/note', { method: 'POST', body })
+  return normalizeImported(
+    await apiRequest<WireDocumentView & { existed?: boolean }>('/documents/note', {
+      method: 'POST',
+      body,
+    }),
+  )
 }
 
-export function updateDocument(id: number, patch: DocumentPatch): Promise<DocumentView> {
-  return apiRequest<DocumentView>(`/documents/${id}`, { method: 'PATCH', body: patch })
+export async function updateDocument(id: number, patch: DocumentPatch): Promise<DocumentView> {
+  return normalizeDocument(
+    await apiRequest<WireDocumentView>(`/documents/${id}`, { method: 'PATCH', body: patch }),
+  )
 }
 
 export function deleteDocument(id: number): Promise<{ id: number }> {
   return apiRequest<{ id: number }>(`/documents/${id}`, { method: 'DELETE' })
 }
 
-export function reindexDocument(id: number): Promise<DocumentView> {
+export async function reindexDocument(id: number): Promise<DocumentView> {
   // 重索引要在服务端重新解析整篇原文，比普通请求慢，给到 60s。
-  return apiRequest<DocumentView>(`/documents/${id}/reindex`, { method: 'POST', timeoutMs: 60_000 })
+  return normalizeDocument(
+    await apiRequest<WireDocumentView>(`/documents/${id}/reindex`, {
+      method: 'POST',
+      timeoutMs: 60_000,
+    }),
+  )
 }

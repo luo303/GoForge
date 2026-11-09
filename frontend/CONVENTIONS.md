@@ -52,6 +52,7 @@
 - 必填却没用到的字段要删掉或改可选；`tsconfig` 已开 `noUnusedLocals` / `noUnusedParameters`，不要用下划线绕过。
 - `verbatimModuleSyntax` 打开，**类型导入必须写 `import type`**。
 - 接口类型是手写镜像后端 JSON（`src/api/types.ts`），保持 snake_case，不引入 camelCase 转换层；后端改字段时同步这里。
+- 类型镜像描述的是**当前契约**；对"对面不是当前版本"的容忍集中在 API 层（如 `src/api/documents.ts` 的 `normalizeDocument`），页面只面对契约形状，不写 `doc.tags ?? []` 这类防御分支——同一处兜底只写一次，新增页面不用重写。
 
 ## 5. 命名与变量
 
