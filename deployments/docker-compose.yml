@@ -1,7 +1,8 @@
 # MindOS 本地基础设施。
 #
 # PostgreSQL 使用 pgvector 镜像：向量检索与业务数据同库，不额外引入向量数据库。
-# MinIO 存放上传的原始文档（STORAGE_DRIVER=minio 时必需），数据在 minio_data 卷里。
+# MinIO 存放上传的原始文档，是应用的必需依赖（不是可选项），数据在 minio_data 卷里。
+# 它没起来时后端会拒绝启动，而不是退回本地目录。
 # Redis 为按需组件（当前未接入应用），保留服务但不影响启动。
 #
 # 开发期应用进程在宿主机运行：`cd backend && go run ./cmd/server`。
