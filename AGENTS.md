@@ -37,6 +37,9 @@ mindos/
 代码实际位于 WSL：`/home/xhh/go/src/GoForge`（物理目录名保留，不代表产品名）。
 Windows 侧经 `//wsl.localhost/Ubuntu/home/xhh/go/src/GoForge` 访问。
 
+`go` / `gofmt` / `gopls` 已全局可用（`/etc/profile.d/go.sh` 与 `/usr/local/bin` 软链），命令里不写绝对路径。
+Windows 侧编辑器经 UNC 读取会有延迟，**以 WSL 内 `go build` 输出为准**；怀疑缓存陈旧时先 Reload 再判断。
+
 **所有 Go 命令的工作目录都是 `backend/`**：
 
 | 命令 | 用途 |
