@@ -52,7 +52,7 @@ Windows 侧编辑器经 UNC 读取会有延迟，**以 WSL 内 `go build` 输出
 | `go build -o bin/mindos ./cmd/server` | 编译可执行文件 |
 | `docker compose --env-file backend/.env -f deployments/docker-compose.yml up -d` | 启动基础设施（在仓库根执行） |
 
-前端命令（工作目录 `frontend/`）：`npm run dev` / `build` / `lint` / `test`，约定见 `frontend/README.md`。**环境归属：Docker 与数据库由项目所有者自行在 Windows 侧启动**，不代为安装，不在 WSL 内搭替代环境绕过依赖。
+前端命令（工作目录 `frontend/`）：`npm run dev` / `build` / `lint` / `test`，编码规范见 `frontend/CONVENTIONS.md`，项目约定见 `frontend/README.md`。**环境归属：Docker 与数据库由项目所有者自行在 Windows 侧启动**，不代为安装，不在 WSL 内搭替代环境绕过依赖。
 
 Go 版本：`go.mod` 声明 1.27.0，工具链 go1.27.1。不为用新特性抬高 go directive。
 

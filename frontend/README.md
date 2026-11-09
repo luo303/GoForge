@@ -50,6 +50,8 @@ npm run build        # tsc --noEmit && vite build，产物在 dist/
 
 ## 开发约定
 
+**编码规范（导出、渲染纪律、类型、命名、提交前自查）见 [CONVENTIONS.md](CONVENTIONS.md)。** 下面只写本项目特有的约定：数据怎么取、错误怎么表达、页面怎么加。
+
 **数据**
 
 - 服务端状态只走 TanStack Query；查询键集中在 `src/api/system.ts` 的 `queryKeys`，不散写。
