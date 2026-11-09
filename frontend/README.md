@@ -26,12 +26,15 @@ export PATH=$HOME/.nvm/versions/node/v24.22.1/bin:$PATH
 frontend/
 ├── src/
 │   ├── api/            统一客户端、错误模型、接口类型镜像
+│   │   └── test/       对应模块的测试（约定：测试只放 test/ 子目录）
 │   ├── app/            App 组合根、路由表、应用外壳、模块元数据
+│   │   └── test/
 │   ├── components/     业务无关组件（空态、错误态、状态标签）
 │   │   └── ui/         shadcn/ui 基础组件
 │   ├── lib/            cn() 等纯工具
 │   ├── pages/          六个页面 + 404
-│   └── test/           setup、fixtures、renderApp
+│   │   └── test/
+│   └── test/           共享测试设施：setup、fixtures、renderApp、位置约定自检
 └── vite.config.ts      Tailwind 插件、@ 别名、/api 代理、Vitest 配置
 ```
 
@@ -75,10 +78,11 @@ npm run build        # tsc --noEmit && vite build，产物在 dist/
 ## 测试
 
 ```bash
-npm run test                          # 全部
-npx vitest run src/pages/settings.test.tsx   # 单个文件
+npm run test                                  # 全部
+npx vitest run src/pages/test/settings.test.tsx   # 单个文件
 ```
 
+- **测试只放对应目录的 `test/` 子目录**，不与业务文件混放（规则见 `CONVENTIONS.md` 第 9 节，由 `src/test/placement.test.ts` 强制执行）。
 - `src/test/render-app.tsx` 用真实路由表 + 独立 QueryClient 渲染整页，路径由参数指定。
 - `src/test/fixtures.ts` 提供信封、状态与配置的固定数据，避免每个用例手写一大坨 JSON。
 - 请求用 `vi.stubGlobal('fetch', ...)` 替换，不启真实后端；`afterEach` 里 `vi.unstubAllGlobals()`。
