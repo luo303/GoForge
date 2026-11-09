@@ -507,10 +507,11 @@ draft ──用户确认──> approved ──开始执行──> active ──
 |---|---|---|---|
 | POST | `/documents` | 文件上传（multipart）；P4 同步，P6 起 202 返回 document 与 job_id | P4 / P6 |
 | POST | `/documents/note` | 新建笔记（JSON 正文） | P4 |
-| POST | `/documents/web` | 按 URL 抓取导入 | P5 |
-| GET | `/documents` | 列表，分页 `limit` / `offset`；`q` / `collection` / `tag` / `status` 筛选随能力接入 | P4 |
+| POST | `/documents/web` | 按 URL 抓取导入（已移出主线，见 `docs/plan.md` 后置增强） | 后置 |
+| GET | `/documents` | 列表，分页 `limit` / `offset`；P5 起按 `collection` / `tag` / `status` 筛选，`q` 全文搜索随 P8 接入 | P4 / P5 |
 | GET | `/documents/:id` | 详情，含分块数量与状态 | P4 |
-| DELETE | `/documents/:id` | 删除文档与分块 | P5 |
+| PATCH | `/documents/:id` | 更新 `collection` / `tags` 等元数据，不触发重切 | P5 |
+| DELETE | `/documents/:id` | 删除文档与分块；重复删除返回 404 | P5 |
 | POST | `/documents/:id/reindex` | 重建解析结果，P7 起同时重建向量 | P5 / P7 |
 | GET | `/documents/:id/chunks` | 分块列表（调试与引用展示） | P4 |
 | POST | `/search` | 混合检索，返回带引用的片段 | P8 |
