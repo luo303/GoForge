@@ -30,8 +30,6 @@ export function settingsFixture(overrides: Partial<SettingsView> = {}): Settings
     db: { host: '127.0.0.1', port: 5432, name: 'mindos', sslmode: 'disable', user: 'mindos' },
     redis: { addr: '127.0.0.1:6379', db: 0, pool_size: 10, password_configured: false },
     storage: {
-      driver: 'minio',
-      dir: './storage',
       endpoint: 'localhost:9000',
       bucket: 'mindos',
       max_upload_bytes: 10485760,

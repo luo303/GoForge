@@ -154,17 +154,9 @@ function SettingsCard({ settings }: { settings: SettingsView }) {
           <Field label="日志" value={`${settings.log.level} · ${settings.log.format}`} />
           <Field label="数据库" value={`${settings.db.host}:${settings.db.port}/${settings.db.name}`} />
           <Field label="数据库用户" value={settings.db.user} />
-          <Field label="存储驱动" value={settings.storage.driver} />
-          {/* 两种驱动显示的定位信息不同：本地是目录，对象存储是 endpoint/bucket。
-              只看一个 "存储目录" 会让人以为对象存储也落在磁盘上。 */}
-          {settings.storage.driver === 'minio' ? (
-            <>
-              <Field label="对象存储端点" value={settings.storage.endpoint} />
-              <Field label="Bucket" value={settings.storage.bucket} />
-            </>
-          ) : (
-            <Field label="存储目录" value={settings.storage.dir} />
-          )}
+          {/* 原文只存对象存储，所以只有端点与 bucket；显示"存储目录"会误导成落磁盘 */}
+          <Field label="对象存储端点" value={settings.storage.endpoint} />
+          <Field label="Bucket" value={settings.storage.bucket} />
           <Field
             label="单次导入上限"
             value={`${(settings.storage.max_upload_bytes / 1024 / 1024).toFixed(0)} MiB`}

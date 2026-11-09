@@ -47,12 +47,8 @@ export type SettingsView = {
   log: { level: string; format: string }
   db: { host: string; port: number; name: string; sslmode: string; user: string }
   redis: { addr: string; db: number; pool_size: number; password_configured: boolean }
+  /** 原文只存 MinIO，所以这里没有 driver/dir：位置信息就是端点与 bucket */
   storage: {
-    /** local | minio；决定下面几项里哪些有意义 */
-    driver: 'local' | 'minio'
-    /** driver=local 时的目录 */
-    dir: string
-    /** driver=minio 时的端点与 bucket */
     endpoint: string
     bucket: string
     max_upload_bytes: number
