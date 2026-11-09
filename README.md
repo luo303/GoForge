@@ -190,7 +190,7 @@ docker compose --env-file backend/.env -f deployments/docker-compose.yml down -v
 |---|---|---|
 | Phase 0 | 服务骨架（配置、日志、中间件、健康检查、优雅关闭） | 已完成 |
 | Phase 1–3 | 工程基线：缺陷纠偏、迁移与系统状态、前端工程骨架 | 已完成 |
-| Phase 4–9 | Knowledge：文本入库、多格式、异步任务、向量、混合检索、RAG | 待开始 |
+| Phase 4–9 | Knowledge：文本入库、多格式、异步任务、向量、混合检索、RAG | Phase 4 已完成；P5–9 待开始 |
 | Phase 10–12 | Memory：人工管理、提炼与冲突治理、召回质量 | 待开始 |
 | Phase 13–16 | Agent：最小对话、工具与预算、审批恢复、MQ 与后台执行 | 待开始 |
 | Phase 17–18 | Action：任务领域、AI 计划与审批闭环 | 待开始 |

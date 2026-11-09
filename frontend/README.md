@@ -68,6 +68,7 @@ npm run build        # tsc --noEmit && vite build，产物在 dist/
 - 模块的路径、标题、阶段只在 `src/app/modules.ts` 定义一份，导航与页面共用。
 - 新增页面：`modules.ts` 加一条 → `src/pages/` 建组件 → `router.tsx` 挂到 `AppShell` 的 children → 在 `app.test.tsx` 里补一条可见性用例。
 - 窄屏导航收进抽屉（`< md`），主内容区不被侧边栏挤压。
+- 知识页是第一个真实业务页：上传走 `FormData`（客户端只在 `apiRequest` 一处判断，不手写 `Content-Type`），分块偏移是**码点**而不是 UTF-16 下标；需要高亮原文时用 `Array.from(text).slice(start, end)`，不要用 `String.slice`。
 
 ## 测试
 
@@ -84,5 +85,6 @@ npx vitest run src/pages/settings.test.tsx   # 单个文件
 ## 当前限制
 
 - 设置页只读：改配置要改 `backend/.env` 并重启，前端不提供写接口。
+- 知识页只做导入与预览：没有删除、重命名、重新索引，也没有检索框（Phase 5–8 逐步接入）；分块一次最多显示 100 条。
 - 未做主题切换；`.dark` 变量已备好，等有真实需求再接。
 - 生产构建产物尚未由后端托管，Phase 21 处理。

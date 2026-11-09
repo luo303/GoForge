@@ -177,7 +177,7 @@ MindOS 是一个**单用户、本地优先的 AI 个人知识与行动工作空�
 | seq | int | 文档内序号，**(document_id, seq) 唯一**，重跑幂等的落点 |
 | content | text | 分块正文 |
 | heading | text | 所在章节标题，检索结果展示用 |
-| start_offset / end_offset | int | 原始正文字符偏移，**引用的定位依据** |
+| start_offset / end_offset | int | 原始正文的**码点偏移**（Unicode code point，不是字节），**引用的定位依据** |
 | token_count | int | 供上下文预算计算 |
 | embedding | vector(1536) | HNSW 索引，`vector_cosine_ops` |
 | tsv | tsvector | 生成列，GIN 索引 |
@@ -508,7 +508,7 @@ draft ──用户确认──> approved ──开始执行──> active ──
 | POST | `/documents` | 文件上传（multipart）；P4 同步，P6 起 202 返回 document 与 job_id | P4 / P6 |
 | POST | `/documents/note` | 新建笔记（JSON 正文） | P4 |
 | POST | `/documents/web` | 按 URL 抓取导入 | P5 |
-| GET | `/documents` | 列表，支持 `q` / `collection` / `tag` / `status` | P4 |
+| GET | `/documents` | 列表，分页 `limit` / `offset`；`q` / `collection` / `tag` / `status` 筛选随能力接入 | P4 |
 | GET | `/documents/:id` | 详情，含分块数量与状态 | P4 |
 | DELETE | `/documents/:id` | 删除文档与分块 | P5 |
 | POST | `/documents/:id/reindex` | 重建解析结果，P7 起同时重建向量 | P5 / P7 |

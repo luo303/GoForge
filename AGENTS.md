@@ -22,7 +22,7 @@
 
 技术主线：Go + Gin + GORM + PostgreSQL 16（pgvector）+ RabbitMQ + Redis（按需）+ Eino ADK；前端 React + TypeScript + Vite + Tailwind + shadcn/ui。
 
-**当前进度：Phase 3 已完成（2026-11-09），下一步 Phase 4 文本文档入库。** 已有迁移机制、系统状态与只读设置接口，以及六页前端骨架（真实读取状态，其余页面空态）。阶段见 `docs/plan.md`，设计见 `docs/design/overview.md`。
+**当前进度：Phase 4 已完成（2026-11-09），下一步 Phase 5 多格式与导入可靠性。** 已有迁移机制、系统状态与只读设置接口、六页前端骨架，以及 Knowledge 最小切片（Markdown/TXT 与笔记同步导入、保留码点偏移的分块、文档列表与分块预览；无向量与检索）。阶段见 `docs/plan.md`，设计见 `docs/design/overview.md`。
 
 ## 2. 仓库结构与命令
 

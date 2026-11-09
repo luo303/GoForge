@@ -8,6 +8,8 @@
 # --- build output ---
 /backend/bin/
 /backend/tmp/
+# 上传的原始文档（内容寻址落盘，不入库）
+/backend/storage/
 # go build ./cmd/server 不带 -o 时会把二进制写到当前目录
 /backend/server
 /frontend/dist/
