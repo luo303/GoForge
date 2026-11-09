@@ -1,0 +1,17 @@
+# 本仓库只在 WSL / Linux 侧开发与运行，统一使用 LF。
+#
+# 背景：系统级 gitconfig 里 core.autocrlf=true（PortableGit 默认），
+# 一旦从 Windows 侧执行 checkout，工作区会被写成 CRLF，
+# 之后 WSL 侧的 git 就会把每个文件都视为已修改。这里把行为钉死。
+* text=auto eol=lf
+
+# 二进制文件不做换行符转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.woff binary
+*.woff2 binary
+*.pdf  binary
+*.zip  binary
