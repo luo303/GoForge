@@ -58,7 +58,11 @@ type settingsView struct {
 		PasswordConfigured bool   `json:"password_configured"`
 	} `json:"redis"`
 	Storage struct {
+		Driver string `json:"driver"`
+		// Dir 只在 driver=local 时有意义；minio 时为配置里的原值，前端按 driver 决定显示哪个。
 		Dir            string `json:"dir"`
+		Endpoint       string `json:"endpoint"`
+		Bucket         string `json:"bucket"`
 		MaxUploadBytes int64  `json:"max_upload_bytes"`
 	} `json:"storage"`
 	LLM       modelSettingsView `json:"llm"`
@@ -88,7 +92,10 @@ func (h *SettingsHandler) Get(c *gin.Context) {
 	view.Redis.DB = cfg.Redis.DB
 	view.Redis.PoolSize = cfg.Redis.PoolSize
 	view.Redis.PasswordConfigured = cfg.Redis.Password != ""
+	view.Storage.Driver = cfg.Storage.Driver
 	view.Storage.Dir = cfg.Storage.Dir
+	view.Storage.Endpoint = cfg.Storage.MinIO.Endpoint
+	view.Storage.Bucket = cfg.Storage.MinIO.Bucket
 	view.Storage.MaxUploadBytes = cfg.Storage.MaxUploadBytes
 	view.LLM = modelView(cfg.LLM.APIBase, cfg.LLM.APIKey, cfg.LLM.Model)
 	view.Embedding = modelView(cfg.Embedding.APIBase, cfg.Embedding.APIKey, cfg.Embedding.Model)
