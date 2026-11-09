@@ -88,7 +88,7 @@ MindOS 是一个**单用户、本地优先的 AI 个人知识与行动工作空�
 ```text
 上传文件 / 粘贴笔记 / 输入网址
   → 计算内容 hash，命中已有文档则直接复用（幂等）
-  → 落盘原始文件（本地文件系统），创建 documents(status=pending)
+  → 原始文件写对象存储（MinIO，内容寻址），创建 documents(status=pending)
   → 同一事务写 jobs(type=document_ingest) + outbox_events
   → MQ 投递唤醒 worker
   → worker 领取 job（条件更新 + locked_until）
@@ -159,7 +159,7 @@ MindOS 是一个**单用户、本地优先的 AI 个人知识与行动工作空�
 | mime | text | `text/markdown` / `text/plain` / `application/pdf` / `text/html` |
 | size_bytes | bigint | 上传前校验上限 |
 | content_hash | char(64) | SHA-256，**唯一索引**，重复导入的幂等依据 |
-| storage_path | text | 原始文件路径；note 类型为空 |
+| storage_path | text | 原文的对象 key（`documents/ab/cd/<sha256>`）；note 类型为空 |
 | content | text | note 正文 / 网页提取正文；file 类型为空 |
 | collection | text | 分类（单值，够用；多维用 tags） |
 | tags | text[] | 标签，GIN 索引 |
@@ -595,7 +595,7 @@ draft ──用户确认──> approved ──开始执行──> active ──
 | Eino ADK | ReAct 循环、checkpoint、取消、事件流 | 手写循环，状态恢复与取消每个都是坑 |
 | SSE | 流式回答与执行轨迹 | 只能轮询，用户体验差一个量级 |
 | Redis（按需） | 缓存与限流 | 单用户本地场景可以先用进程内缓存，暂不引入 |
-| 本地文件系统 | 原始文件存储 | 对象存储对单机部署是多余的运维负担 |
+| MinIO（S3 协议） | 原始文件存储 | 原文跟应用容器的磁盘绑在一起：重建、换机器、多实例都会让"重索引/重算向量"失去依据 |
 
 ## 15. 非目标
 

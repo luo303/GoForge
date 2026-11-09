@@ -29,7 +29,13 @@ export function settingsFixture(overrides: Partial<SettingsView> = {}): Settings
     log: { level: 'debug', format: 'console' },
     db: { host: '127.0.0.1', port: 5432, name: 'mindos', sslmode: 'disable', user: 'mindos' },
     redis: { addr: '127.0.0.1:6379', db: 0, pool_size: 10, password_configured: false },
-    storage: { dir: './storage', max_upload_bytes: 10485760 },
+    storage: {
+      driver: 'minio',
+      dir: './storage',
+      endpoint: 'localhost:9000',
+      bucket: 'mindos',
+      max_upload_bytes: 10485760,
+    },
     llm: {
       api_base: 'https://api.example.com/v1',
       model: 'gpt-test',
