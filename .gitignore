@@ -8,6 +8,8 @@
 # --- build output ---
 /backend/bin/
 /backend/tmp/
+# go build ./cmd/server 不带 -o 时会把二进制写到当前目录
+/backend/server
 /frontend/dist/
 coverage.out
 coverage.html
