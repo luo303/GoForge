@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"strings"
 	"testing"
 	"time"
@@ -16,11 +18,12 @@ import (
 // 价值在于能精确制造"写库失败"，而真实数据库很难在"文档已插入、分块插入失败"
 // 这个中间点稳定地报错。
 type fakeRepo struct {
-	docs      map[int64]*Document
-	chunks    map[int64][]Chunk
-	hashIndex map[string]int64
-	nextID    int64
-	createErr error
+	docs       map[int64]*Document
+	chunks     map[int64][]Chunk
+	hashIndex  map[string]int64
+	nextID     int64
+	createErr  error
+	replaceErr error
 }
 
 func newFakeRepo() *fakeRepo {
@@ -109,12 +112,44 @@ func (f *fakeRepo) CountChunks(_ context.Context, documentID int64) (int64, erro
 	return int64(len(f.chunks[documentID])), nil
 }
 
+func (f *fakeRepo) Delete(_ context.Context, id int64) error {
+	doc, ok := f.docs[id]
+	if !ok {
+		return ErrNotFound
+	}
+	// 真实数据库靠 ON DELETE CASCADE 删分块，假仓储显式做同样的事，
+	// 否则"删除后不该留下分块"这条断言在单测里就失去意义。
+	delete(f.chunks, id)
+	delete(f.hashIndex, doc.ContentHash)
+	delete(f.docs, id)
+	return nil
+}
+
+func (f *fakeRepo) ReplaceChunks(_ context.Context, documentID int64, chunks []Chunk) error {
+	doc, ok := f.docs[documentID]
+	if !ok {
+		return ErrNotFound
+	}
+	if f.replaceErr != nil {
+		// 真实仓储里这一步是单事务：失败时旧分块必须原封不动。
+		return f.replaceErr
+	}
+	for i := range chunks {
+		chunks[i].DocumentID = documentID
+	}
+	f.chunks[documentID] = append([]Chunk(nil), chunks...)
+	doc.ChunkCount = len(chunks)
+	doc.UpdatedAt = time.Now().UTC()
+	return nil
+}
+
 // fakeStore 记录落盘与删除，用于验证失败补偿。
 type fakeStore struct {
-	files   map[string][]byte
-	reused  bool
-	saveErr error
-	removed []string
+	files     map[string][]byte
+	reused    bool
+	saveErr   error
+	removeErr error
+	removed   []string
 }
 
 func newFakeStore() *fakeStore {
@@ -134,15 +169,26 @@ func (f *fakeStore) Save(_ context.Context, data []byte) (platform.SavedFile, er
 	return platform.SavedFile{RelPath: path, Hash: hash, Size: int64(len(data)), Reused: true}, nil
 }
 
+func (f *fakeStore) Read(_ context.Context, relPath string) ([]byte, error) {
+	data, ok := f.files[relPath]
+	if !ok {
+		return nil, fmt.Errorf("read %s: %w", relPath, fs.ErrNotExist)
+	}
+	return append([]byte(nil), data...), nil
+}
+
 func (f *fakeStore) Remove(_ context.Context, relPath string) error {
 	f.removed = append(f.removed, relPath)
+	if f.removeErr != nil {
+		return f.removeErr
+	}
 	delete(f.files, relPath)
 	return nil
 }
 
 func newTestService(maxUploadBytes int64) (*Service, *fakeRepo, *fakeStore) {
 	repo, store := newFakeRepo(), newFakeStore()
-	return NewService(repo, store, maxUploadBytes), repo, store
+	return NewService(repo, store, maxUploadBytes, nil), repo, store
 }
 
 func TestImportFileMarkdown(t *testing.T) {
@@ -559,5 +605,168 @@ func TestImportNoteIsIdempotent(t *testing.T) {
 	}
 	if len(repo.docs) != 1 {
 		t.Errorf("documents = %d, want 1", len(repo.docs))
+	}
+}
+
+func TestDeleteRemovesDocumentChunksAndFile(t *testing.T) {
+	svc, repo, store := newTestService(1 << 20)
+	doc, _, err := svc.ImportFile(context.Background(), FileInput{
+		Filename: "a.md",
+		Content:  strings.NewReader("# 标题\n\n正文。\n"),
+	})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	path := *doc.StoragePath
+
+	if err := svc.Delete(context.Background(), doc.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if len(repo.docs) != 0 {
+		t.Errorf("documents = %d, want 0", len(repo.docs))
+	}
+	if len(repo.chunks[doc.ID]) != 0 {
+		t.Errorf("chunks left behind: %d", len(repo.chunks[doc.ID]))
+	}
+	if _, ok := store.files[path]; ok {
+		t.Error("stored file must be removed after the row is gone")
+	}
+	if len(store.removed) != 1 {
+		t.Errorf("removed = %v, want exactly one path", store.removed)
+	}
+}
+
+func TestDeleteMissingDocument(t *testing.T) {
+	svc, _, _ := newTestService(1 << 20)
+	if err := svc.Delete(context.Background(), 42); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// 删库成功、删文件失败：用户看到的是"已删除"，所以不能回滚也不能报错，
+// 只留一条 warn。这里断言"不报错且文件仍在"，正是为了让这个取舍可见。
+func TestDeleteSucceedsWhenFileRemovalFails(t *testing.T) {
+	svc, repo, store := newTestService(1 << 20)
+	doc, _, err := svc.ImportFile(context.Background(), FileInput{
+		Filename: "a.md",
+		Content:  strings.NewReader("# 标题\n\n正文。\n"),
+	})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	store.removeErr = errors.New("permission denied")
+
+	if err := svc.Delete(context.Background(), doc.ID); err != nil {
+		t.Fatalf("delete must not fail: %v", err)
+	}
+	if len(repo.docs) != 0 {
+		t.Error("row must stay deleted even when the file cannot be removed")
+	}
+	if _, ok := store.files[*doc.StoragePath]; !ok {
+		t.Error("file should still exist; removal failed")
+	}
+}
+
+// 重索引从原文重新切分：不是"再切一份追加"，而是整体替换。
+func TestReindexRecomputesChunksFromStoredFile(t *testing.T) {
+	svc, repo, store := newTestService(1 << 20)
+	doc, _, err := svc.ImportFile(context.Background(), FileInput{
+		Filename: "a.md",
+		Content:  strings.NewReader("# 旧标题\n\n旧正文。\n"),
+	})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	oldChunkCount := len(repo.chunks[doc.ID])
+
+	newText := "# 新标题\n\n新正文第一段。\n\n## 新小节\n\n新正文第二段。\n"
+	store.files[*doc.StoragePath] = []byte(newText)
+
+	updated, err := svc.Reindex(context.Background(), doc.ID)
+	if err != nil {
+		t.Fatalf("reindex: %v", err)
+	}
+	if updated.ChunkCount != len(repo.chunks[doc.ID]) {
+		t.Errorf("chunk_count = %d, stored = %d", updated.ChunkCount, len(repo.chunks[doc.ID]))
+	}
+	if len(repo.chunks[doc.ID]) == oldChunkCount && oldChunkCount == 1 {
+		// 新内容有两个章节，切出来的块数理应变化；固定成 1 说明没重算。
+		t.Error("chunks were not recomputed from the new source")
+	}
+	// 偏移必须仍然能切回新原文（这是"重索引后引用还能定位"的前提）。
+	runes := []rune(newText)
+	for i, c := range repo.chunks[doc.ID] {
+		if c.Seq != i {
+			t.Errorf("chunk %d seq = %d", i, c.Seq)
+		}
+		if got := string(runes[c.StartOffset:c.EndOffset]); got != c.Content {
+			t.Errorf("chunk %d offsets do not map back to the source", i)
+		}
+	}
+	last := repo.chunks[doc.ID][len(repo.chunks[doc.ID])-1]
+	if last.Heading == nil || *last.Heading != "新小节" {
+		t.Errorf("last chunk heading = %v, want 新小节", last.Heading)
+	}
+}
+
+// 替换失败时旧分块必须原封不动，否则用户重试前会看到一条空文档。
+func TestReindexKeepsOldChunksWhenReplaceFails(t *testing.T) {
+	svc, repo, _ := newTestService(1 << 20)
+	doc, _, err := svc.ImportFile(context.Background(), FileInput{
+		Filename: "a.md",
+		Content:  strings.NewReader("# 标题\n\n正文。\n"),
+	})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	before := repo.chunks[doc.ID]
+
+	repo.replaceErr = errors.New("database is down")
+	if _, err := svc.Reindex(context.Background(), doc.ID); err == nil {
+		t.Fatal("expected reindex to fail")
+	}
+	if len(repo.chunks[doc.ID]) != len(before) {
+		t.Fatalf("old chunks changed: %d -> %d", len(before), len(repo.chunks[doc.ID]))
+	}
+}
+
+func TestReindexMissingSource(t *testing.T) {
+	svc, _, store := newTestService(1 << 20)
+	doc, _, err := svc.ImportFile(context.Background(), FileInput{
+		Filename: "a.md",
+		Content:  strings.NewReader("# 标题\n\n正文。\n"),
+	})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	delete(store.files, *doc.StoragePath) // 原文被手工删掉
+
+	if _, err := svc.Reindex(context.Background(), doc.ID); !errors.Is(err, ErrSourceMissing) {
+		t.Fatalf("err = %v, want ErrSourceMissing", err)
+	}
+}
+
+func TestReindexMissingDocument(t *testing.T) {
+	svc, _, _ := newTestService(1 << 20)
+	if _, err := svc.Reindex(context.Background(), 42); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// 笔记没有文件，重索引读的是 documents.content。
+func TestReindexNoteUsesStoredContent(t *testing.T) {
+	svc, repo, _ := newTestService(1 << 20)
+	doc, _, err := svc.ImportNote(context.Background(), NoteInput{
+		Content: "# 标题\n\n正文。\n",
+	})
+	if err != nil {
+		t.Fatalf("import note: %v", err)
+	}
+	updated, err := svc.Reindex(context.Background(), doc.ID)
+	if err != nil {
+		t.Fatalf("reindex: %v", err)
+	}
+	if len(repo.chunks[doc.ID]) == 0 || updated.ChunkCount == 0 {
+		t.Error("note reindex must produce chunks")
 	}
 }

@@ -11,9 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
+
+	"go.uber.org/zap"
 
 	"github.com/luo303/mindos/backend/internal/platform"
 )
@@ -30,6 +33,9 @@ var (
 	ErrDuplicate = errors.New("document content already exists")
 	// ErrNotFound 表示文档不存在。
 	ErrNotFound = errors.New("document not found")
+	// ErrSourceMissing 表示文档的原文已不可得（文件被删、笔记没有正文），
+	// 重索引无法进行。这不是"参数错"，而是数据状态已经不可解释。
+	ErrSourceMissing = errors.New("document source is missing")
 )
 
 // 分页边界。上限 100 是"防止一次拉全库"的护栏，不是性能优化。
@@ -51,14 +57,17 @@ type documentRepository interface {
 	Count(ctx context.Context) (int64, error)
 	ListChunks(ctx context.Context, documentID int64, limit, offset int) ([]Chunk, error)
 	CountChunks(ctx context.Context, documentID int64) (int64, error)
+	Delete(ctx context.Context, id int64) error
+	ReplaceChunks(ctx context.Context, documentID int64, chunks []Chunk) error
 }
 
 // fileStore 是原始文件的存储能力。
 //
-// 刻意只留 Save / Remove：本阶段没有"下载原文"与"重索引"的入口，
-// 多声明一个 Open 就多一个没人调用的方法与一份测试负担。
+// 只声明本模块真正调用的三个方法。Read 到 Phase 5 有了重索引才加进来——
+// 接口窄一点，测试替身就少写一个空方法，也少一处"这个方法到底谁在用"的疑问。
 type fileStore interface {
 	Save(ctx context.Context, data []byte) (platform.SavedFile, error)
+	Read(ctx context.Context, relPath string) ([]byte, error)
 	Remove(ctx context.Context, relPath string) error
 }
 
@@ -67,15 +76,23 @@ type Service struct {
 	repo           documentRepository
 	store          fileStore
 	maxUploadBytes int64
+	log            *zap.Logger
 }
 
 // NewService 组装业务层。maxUploadBytes 来自配置，<=0 时会被兜底成 10 MiB，
 // 避免调用方忘了传导致"任何文件都超限"。
-func NewService(repo documentRepository, store fileStore, maxUploadBytes int64) *Service {
+//
+// log 允许为 nil（测试里常见）：此时退化成不记录。业务逻辑本身不依赖日志，
+// 但"删库成功、删文件失败"这种只能记一笔的情况需要它，所以不做成可选参数
+// 之外的另一套 API。
+func NewService(repo documentRepository, store fileStore, maxUploadBytes int64, log *zap.Logger) *Service {
 	if maxUploadBytes <= 0 {
 		maxUploadBytes = 10 << 20
 	}
-	return &Service{repo: repo, store: store, maxUploadBytes: maxUploadBytes}
+	if log == nil {
+		log = zap.NewNop()
+	}
+	return &Service{repo: repo, store: store, maxUploadBytes: maxUploadBytes, log: log}
 }
 
 // FileInput 是一次文件导入请求。
@@ -242,6 +259,86 @@ func (s *Service) ListChunks(ctx context.Context, documentID int64, limit, offse
 		return nil, 0, err
 	}
 	return chunks, total, nil
+}
+
+// Delete 删除文档：先删库，提交成功后再删原始文件。
+//
+// 顺序不能反。先删文件再删库，一旦删库失败，留下的是一条"记录在、原文没了"
+// 的文档——它还能出现在列表里，但重索引永远失败；而先删库后删文件失败，
+// 最坏结果只是一个没人引用的孤儿文件，不影响任何功能。
+//
+// 所以文件删除失败**不回滚、不返回错误**，只记一条 warn：此时用户看到的
+// "文档已删除"是真的，回滚反而会让他以为没删掉。
+func (s *Service) Delete(ctx context.Context, id int64) error {
+	doc, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := s.repo.Delete(ctx, id); err != nil {
+		return err
+	}
+	if doc.StoragePath == nil {
+		return nil
+	}
+	if err := s.store.Remove(ctx, *doc.StoragePath); err != nil {
+		s.log.Warn("remove document file failed",
+			zap.Int64("document_id", id),
+			zap.String("storage_path", *doc.StoragePath),
+			zap.Error(err),
+		)
+	}
+	return nil
+}
+
+// Reindex 用当前的分块规则重新切分一份已有文档。
+//
+// 存在的意义是"规则会变"：切分粒度、标题识别、未来的语言相关处理都可能在
+// 后续阶段调整，已经入库的文档不应该只能靠重新上传才能用上新规则。
+// 原文取自存储（文件）或 documents.content（笔记），不依赖客户端再传一次。
+//
+// 顺序是先算完、再一次事务替换：算的途中失败什么都不改，
+// 替换的途中失败事务回滚，旧分块完整保留。
+func (s *Service) Reindex(ctx context.Context, id int64) (*Document, error) {
+	doc, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	text, err := s.sourceText(ctx, doc)
+	if err != nil {
+		return nil, err
+	}
+	chunks, err := buildChunks(doc.MIME, text)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.repo.ReplaceChunks(ctx, id, chunks); err != nil {
+		return nil, err
+	}
+	// 重新读一次而不是手工改 doc.ChunkCount：chunk_count 与 updated_at
+	// 都由数据库写入，返回内存里的旧值会让前端看到"重索引了但数字没变"。
+	return s.repo.Get(ctx, id)
+}
+
+// sourceText 取出文档的原始正文，供重索引使用。
+func (s *Service) sourceText(ctx context.Context, doc *Document) (string, error) {
+	if doc.StoragePath != nil {
+		data, err := s.store.Read(ctx, *doc.StoragePath)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return "", fmt.Errorf("%w: file %s is gone", ErrSourceMissing, *doc.StoragePath)
+			}
+			return "", err
+		}
+		// 再走一次 normalizeText：原文可能带着 BOM，偏移必须以去 BOM 之后
+		// 的字节为基准，否则重索引产出的偏移和导入时不一致。
+		text, _, err := normalizeText(data)
+		return text, err
+	}
+	if doc.Content != nil {
+		text, _, err := normalizeText([]byte(*doc.Content))
+		return text, err
+	}
+	return "", ErrSourceMissing
 }
 
 // utf8BOM 是文件开头的字节序标记。Windows 记事本保存的 UTF-8 文件常带它。

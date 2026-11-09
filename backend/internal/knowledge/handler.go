@@ -69,6 +69,12 @@ type documentListView struct {
 	Offset int            `json:"offset"`
 }
 
+// deletedView 只回一个 id。删掉的东西没法再回详情，
+// 回 id 是为了让调用方确认"删的确实是这一条"，而不是靠状态码猜。
+type deletedView struct {
+	ID int64 `json:"id"`
+}
+
 type chunkListView struct {
 	Items  []chunkView `json:"items"`
 	Total  int64       `json:"total"`
@@ -192,6 +198,38 @@ func (h *Handler) ListChunks(c *gin.Context) {
 	httpx.OK(c, chunkListView{Items: items, Total: total, Limit: limit, Offset: offset})
 }
 
+// Delete 删除文档：DELETE /documents/:id。
+//
+// 用 200 + {"id":n} 而不是 204：本项目所有响应都走统一信封，
+// 204 按规范不能带 body，会让客户端多写一条"这个接口没有信封"的例外。
+func (h *Handler) Delete(c *gin.Context) {
+	id, err := parseID(c.Param("id"))
+	if err != nil {
+		httpx.Fail(c, err)
+		return
+	}
+	if err := h.svc.Delete(c.Request.Context(), id); err != nil {
+		httpx.Fail(c, mapError(err))
+		return
+	}
+	httpx.OK(c, deletedView{ID: id})
+}
+
+// Reindex 重新切分文档：POST /documents/:id/reindex。
+func (h *Handler) Reindex(c *gin.Context) {
+	id, err := parseID(c.Param("id"))
+	if err != nil {
+		httpx.Fail(c, err)
+		return
+	}
+	doc, err := h.svc.Reindex(c.Request.Context(), id)
+	if err != nil {
+		httpx.Fail(c, mapError(err))
+		return
+	}
+	httpx.OK(c, newDocumentView(doc))
+}
+
 // respondImported 按"是否新建"选择状态码。
 //
 // 201 表示本次真的写入了新记录；200 表示命中既有文档（幂等命中）。
@@ -284,6 +322,9 @@ func mapError(err error) error {
 		return httpx.ErrNotFound.WithMessage("document not found")
 	case errors.Is(err, ErrDuplicate):
 		return httpx.ErrConflict.WithMessage("a document with identical content already exists")
+	case errors.Is(err, ErrSourceMissing):
+		return httpx.ErrConflict.WithMessage(
+			"original content of this document is missing, reindex is not possible")
 	case errors.Is(err, ErrUnsupportedType):
 		return httpx.ErrUnsupportedMediaType.WithMessage(
 			"only Markdown (.md, .markdown) and plain text (.txt) files are supported")

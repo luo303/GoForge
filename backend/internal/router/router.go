@@ -57,10 +57,13 @@ func Register(e *gin.Engine, deps Deps) {
 	v1.GET("/system/status", deps.System.Status)
 	v1.GET("/settings", deps.Settings.Get)
 
-	// 知识：Phase 4 是同步导入，成功直接 201 返回文档（Phase 6 起改为 202 + job_id）。
+	// 知识：Phase 4 是同步导入，成功直接 201 返回文档（Phase 6 起改为 202 + job_id）；
+	// 同内容重复导入返回 200 + existed=true（Phase 5）。
 	v1.POST("/documents", deps.Knowledge.CreateFile)
 	v1.POST("/documents/note", deps.Knowledge.CreateNote)
 	v1.GET("/documents", deps.Knowledge.List)
 	v1.GET("/documents/:id", deps.Knowledge.Get)
 	v1.GET("/documents/:id/chunks", deps.Knowledge.ListChunks)
+	v1.DELETE("/documents/:id", deps.Knowledge.Delete)
+	v1.POST("/documents/:id/reindex", deps.Knowledge.Reindex)
 }

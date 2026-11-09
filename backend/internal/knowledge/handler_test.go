@@ -3,12 +3,15 @@ package knowledge
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/luo303/mindos/backend/internal/httpx"
 )
 
 // newTestEngine 只挂本模块的路由，不引入全局中间件：
@@ -26,6 +29,8 @@ func newTestEngine(t *testing.T, maxUploadBytes int64) (*gin.Engine, *fakeRepo) 
 	v1.GET("/documents", h.List)
 	v1.GET("/documents/:id", h.Get)
 	v1.GET("/documents/:id/chunks", h.ListChunks)
+	v1.DELETE("/documents/:id", h.Delete)
+	v1.POST("/documents/:id/reindex", h.Reindex)
 	return e, repo
 }
 
@@ -336,5 +341,62 @@ func TestListChunksEndpoint(t *testing.T) {
 	}
 	if first.TokenCount <= 0 {
 		t.Fatalf("token_count should be positive: %+v", first)
+	}
+}
+
+func TestDeleteEndpoint(t *testing.T) {
+	e, repo := newTestEngine(t, 1<<20)
+	if rec, _ := doJSON(t, e, http.MethodPost, "/api/v1/documents/note",
+		map[string]string{"content": "# 待删除\n\n正文。\n"}); rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d", rec.Code)
+	}
+
+	rec, env := doJSON(t, e, http.MethodDelete, "/api/v1/documents/1", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var deleted deletedView
+	if err := json.Unmarshal(env.Data, &deleted); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if deleted.ID != 1 {
+		t.Errorf("deleted id = %d, want 1", deleted.ID)
+	}
+	if len(repo.docs) != 0 {
+		t.Error("document should be gone")
+	}
+
+	// 再删一次是 404，而不是"又成功了一次"。
+	rec, env = doJSON(t, e, http.MethodDelete, "/api/v1/documents/1", nil)
+	if rec.Code != http.StatusNotFound || env.Code != "NOT_FOUND" {
+		t.Fatalf("second delete: status = %d code = %q", rec.Code, env.Code)
+	}
+}
+
+func TestReindexEndpoint(t *testing.T) {
+	e, repo := newTestEngine(t, 1<<20)
+	if rec, _ := doJSON(t, e, http.MethodPost, "/api/v1/documents/note",
+		map[string]string{"content": "# 标题\n\n第一段。\n\n## 小节\n\n第二段。\n"}); rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d", rec.Code)
+	}
+
+	rec, env := doJSON(t, e, http.MethodPost, "/api/v1/documents/1/reindex", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var doc documentView
+	if err := json.Unmarshal(env.Data, &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if doc.ChunkCount != len(repo.chunks[1]) || doc.ChunkCount == 0 {
+		t.Errorf("chunk_count = %d, stored = %d", doc.ChunkCount, len(repo.chunks[1]))
+	}
+}
+
+// 缺原文重索引是"数据状态坏了"，不是参数错，所以映射成 409 而不是 400/500。
+func TestMapErrorSourceMissing(t *testing.T) {
+	err := mapError(fmt.Errorf("reindex: %w", ErrSourceMissing))
+	if !httpx.IsCode(err, "CONFLICT") {
+		t.Fatalf("code = %v, want CONFLICT", err)
 	}
 }

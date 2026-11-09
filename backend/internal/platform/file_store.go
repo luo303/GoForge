@@ -122,6 +122,25 @@ func (s *FileStore) Save(ctx context.Context, data []byte) (SavedFile, error) {
 	return SavedFile{RelPath: relPath, Hash: hash, Size: int64(len(data))}, nil
 }
 
+// Read 读回一个由 Save 写出的文件，用于重索引。
+//
+// 不返回 os.ErrNotExist 的自定义包装：错误链里保留 fs.ErrNotExist 原始值，
+// 调用方才能用 errors.Is 区分"文件被手工删了"（可解释的坏状态）
+// 与"磁盘读失败"（真正的故障），两者的处置方式不同。
+func (s *FileStore) Read(ctx context.Context, relPath string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !filepath.IsLocal(relPath) {
+		return nil, fmt.Errorf("refuse to read path outside storage: %q", relPath)
+	}
+	data, err := os.ReadFile(filepath.Join(s.root, relPath))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", relPath, err)
+	}
+	return data, nil
+}
+
 // Remove 删除一个由 Save 写出的文件，用于入库失败后的补偿清理。
 //
 // 文件不存在视为成功：补偿清理是"尽力而为"的一步，它失败不该掩盖

@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -146,6 +147,59 @@ func (r *Repository) CountChunks(ctx context.Context, documentID int64) (int64, 
 		return 0, translateError("count chunks", err)
 	}
 	return total, nil
+}
+
+// Delete 删除文档。分块由外键 ON DELETE CASCADE 一并删除，不需要在这里显式删。
+//
+// 返回受影响行数是否为 0 来判断"本来就没有这条"：这样并发下两次删除里
+// 只有一次成功，另一次得到 ErrNotFound，而不是两边都以为删掉了。
+func (r *Repository) Delete(ctx context.Context, id int64) error {
+	res := r.db.WithContext(ctx).Delete(&Document{}, "id = ?", id)
+	if res.Error != nil {
+		return translateError("delete document", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ReplaceChunks 用新分块整体替换某个文档的分块，并同步 chunk_count。
+//
+// 必须在同一事务里"先删后插"：中途失败时如果旧分块已经删掉，文档就变成
+// 一条没有任何分块的 ready 记录，检索不到内容也无法解释。
+// 事务保证失败后旧数据完整保留，用户重试即可。
+func (r *Repository) ReplaceChunks(ctx context.Context, documentID int64, chunks []Chunk) error {
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 不检查存在性的话，"删 0 行 + 插 0 行"也会提交成功，
+		// 调用方会误以为重索引跑过了。
+		var exists int64
+		if err := tx.Model(&Document{}).Where("id = ?", documentID).Count(&exists).Error; err != nil {
+			return err
+		}
+		if exists == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		if err := tx.Where("document_id = ?", documentID).Delete(&Chunk{}).Error; err != nil {
+			return err
+		}
+		for i := range chunks {
+			chunks[i].DocumentID = documentID
+		}
+		if len(chunks) > 0 {
+			if err := tx.CreateInBatches(chunks, 200).Error; err != nil {
+				return err
+			}
+		}
+		// 用 map 而不是结构体更新：结构体会跳过零值字段，
+		// 而"新结果恰好是 0 块"是必须真的写进去的值。
+		return tx.Model(&Document{}).Where("id = ?", documentID).
+			Updates(map[string]any{
+				"chunk_count": len(chunks),
+				"updated_at":  time.Now().UTC(),
+			}).Error
+	})
+	return translateError("replace chunks", err)
 }
 
 // translateError 把 GORM 的错误翻译成模块内的哨兵错误。

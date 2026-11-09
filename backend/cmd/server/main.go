@@ -157,6 +157,7 @@ func run() error {
 		knowledge.NewRepository(db),
 		store,
 		cfg.Storage.MaxUploadBytes,
+		log.Named("knowledge"),
 	)
 
 	engine := newEngine(log, cfg.IsDev())

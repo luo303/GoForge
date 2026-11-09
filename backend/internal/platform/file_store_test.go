@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,6 +112,42 @@ func TestFileStoreRemoveRejectsEscapingPath(t *testing.T) {
 	}
 	if _, err := os.Stat(outside); err != nil {
 		t.Fatalf("outside file must survive, stat err = %v", err)
+	}
+}
+
+func TestFileStoreReadRoundTrip(t *testing.T) {
+	store := newTestStore(t)
+	content := []byte("# 标题\n\n重索引要靠它把原文读回来。\n")
+
+	saved, err := store.Save(context.Background(), content)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	got, err := store.Read(context.Background(), saved.RelPath)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("Read = %q, want %q", got, content)
+	}
+
+	// 文件不在时必须能判出来：调用方靠 errors.Is(err, fs.ErrNotExist)
+	// 区分"原文丢了"与"磁盘故障"，两者的处置完全不同。
+	if err := store.Remove(context.Background(), saved.RelPath); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if _, err := store.Read(context.Background(), saved.RelPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Read after remove: err = %v, want fs.ErrNotExist", err)
+	}
+}
+
+func TestFileStoreReadRejectsEscapingPath(t *testing.T) {
+	store := newTestStore(t)
+	for _, p := range []string{"../secret.txt", "/etc/passwd", ""} {
+		if _, err := store.Read(context.Background(), p); err == nil {
+			t.Fatalf("Read(%q) should be rejected", p)
+		}
 	}
 }
 
