@@ -39,7 +39,9 @@ services:
       start_period: 10s
 
   redis:
-    image: redis:7.4-alpine
+    # 7-alpine 是 7.x 的滚动标签：本地已有该镜像时不必再拉一次。
+    # 代价是重建容器可能悄悄带上新的小版本；要复现某个具体版本时改回 7.4-alpine。
+    image: redis:7-alpine
     container_name: mindos-redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
