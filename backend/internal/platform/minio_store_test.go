@@ -10,29 +10,13 @@ import (
 	"github.com/luo303/mindos/backend/internal/config"
 )
 
-// key 规则是两个实现之间的契约：documents.storage_path 里存的就是它，
-// 换驱动后老数据能不能读出来，全看两边是否完全一致。
+// key 规则是与 documents.storage_path 的契约：库里存的就是它，
+// 改了等于让所有历史文档失去原文，所以用用例把它固定住。
 func TestDocumentKeyLayout(t *testing.T) {
 	hash := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 	want := "documents/ab/cd/" + hash
 	if got := documentKey(hash); got != want {
 		t.Fatalf("documentKey = %q, want %q", got, want)
-	}
-}
-
-func TestLocalStoreUsesSharedKeyLayout(t *testing.T) {
-	store, err := NewFileStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("new file store: %v", err)
-	}
-	data := []byte("# 一致性\n\nkey 规则必须与对象存储相同。\n")
-
-	saved, err := store.Save(context.Background(), data)
-	if err != nil {
-		t.Fatalf("save: %v", err)
-	}
-	if want := documentKey(ContentHash(data)); saved.RelPath != want {
-		t.Fatalf("rel path = %q, want %q", saved.RelPath, want)
 	}
 }
 

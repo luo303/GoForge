@@ -204,13 +204,13 @@ func TestReplaceChunksIntegration(t *testing.T) {
 	}
 }
 
-// 端到端：真仓储 + 真文件存储，验证"同内容只留一条记录、一份文件"。
+// 端到端：真仓储 + 内存存储替身，验证"同内容只留一条记录、一份原文"。
 func TestIdempotentImportIntegration(t *testing.T) {
 	db := setupKnowledgeDB(t)
-	store, err := platform.NewFileStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("new store: %v", err)
-	}
+	// 存储用替身而不是真 MinIO：这个用例验证的是 service + repository 的幂等链路，
+	// 对象存储的真实读写由 platform 的 MinIO 集成测试覆盖。
+	// 若这里也要求装 MinIO，跑一次数据库集成测试就得启两个容器。
+	store := newFakeStore()
 	svc := NewService(NewRepository(db), store, 1<<20, nil)
 	ctx := context.Background()
 	text := "# 幂等\n\n同一份内容只应该入库一次。\n"

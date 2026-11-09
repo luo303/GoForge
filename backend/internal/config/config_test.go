@@ -112,10 +112,21 @@ func TestEnvReaderRejectsInvalidValues(t *testing.T) {
 	}
 }
 
+// setRequiredEnv 填入"不配就起不来"的必填项，让用例只关心自己要验证的那部分。
+// 目前必填的有两类：数据库密码、MinIO 凭据（原文存储唯一后端）。
+func setRequiredEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("DB_PASSWORD", "test-password")
+	t.Setenv("MINIO_ACCESS_KEY", "mindos")
+	t.Setenv("MINIO_SECRET_KEY", "test-secret")
+	// 不设 MINIO_BUCKET：它的默认值 mindos 本身就非空，能满足必填校验，
+	// 留给用例自己断言默认值。
+}
+
 // TestLoadRejectsInvalidTypedConfig 直接守住启动路径：多个配置同时写错时一次报全。
 func TestLoadRejectsInvalidTypedConfig(t *testing.T) {
 	t.Chdir(t.TempDir()) // 不读取仓库里的 .env，让测试只受显式环境变量影响
-	t.Setenv("DB_PASSWORD", "test-password")
+	setRequiredEnv(t)
 	t.Setenv("DB_PORT", "not-a-number")
 	t.Setenv("SHUTDOWN_TIMEOUT", "10")
 	t.Setenv("DB_LOG_SQL", "maybe")
@@ -134,7 +145,7 @@ func TestLoadRejectsInvalidTypedConfig(t *testing.T) {
 // TestLoadReadsValidTypedConfig 确认严格解析没有误伤合法值。
 func TestLoadReadsValidTypedConfig(t *testing.T) {
 	t.Chdir(t.TempDir())
-	t.Setenv("DB_PASSWORD", "test-password")
+	setRequiredEnv(t)
 	t.Setenv("DB_PORT", "6543")
 	t.Setenv("DB_MAX_OPEN_CONNS", "12")
 	t.Setenv("DB_MAX_IDLE_CONNS", "4")
@@ -175,7 +186,7 @@ func TestLoadUsesDefaultsForBlankValues(t *testing.T) {
 	t.Setenv("DB_MAX_OPEN_CONNS", "")
 	t.Setenv("SHUTDOWN_TIMEOUT", "")
 	t.Setenv("DB_LOG_SQL", "")
-	t.Setenv("DB_PASSWORD", "test-password")
+	setRequiredEnv(t)
 
 	cfg, err := Load()
 	if err != nil {
@@ -198,14 +209,14 @@ func TestLoadUsesDefaultsForBlankValues(t *testing.T) {
 // TestLoadNewPhase2Defaults 确认 Phase 2 新增配置的默认值与"全空即未配置"语义。
 func TestLoadNewPhase2Defaults(t *testing.T) {
 	t.Chdir(t.TempDir())
-	t.Setenv("DB_PASSWORD", "test-password")
+	setRequiredEnv(t)
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Storage.Dir != "./storage" {
-		t.Fatalf("Storage.Dir = %q, want ./storage", cfg.Storage.Dir)
+	if cfg.Storage.MinIO.Endpoint != "localhost:9000" || cfg.Storage.MinIO.Bucket != "mindos" {
+		t.Fatalf("Storage.MinIO = %+v, want localhost:9000/mindos", cfg.Storage.MinIO)
 	}
 	if cfg.IsLLMConfigured() {
 		t.Fatal("LLM should be unconfigured by default")
@@ -221,8 +232,11 @@ func TestLoadNewPhase2Defaults(t *testing.T) {
 // TestLoadReadsModelAndBudgetConfig 确认模型与预算配置按填写值生效。
 func TestLoadReadsModelAndBudgetConfig(t *testing.T) {
 	t.Chdir(t.TempDir())
-	t.Setenv("DB_PASSWORD", "test-password")
-	t.Setenv("STORAGE_DIR", "/data/mindos")
+	setRequiredEnv(t)
+	// MinIO 是唯一存储后端，凭据属于必填项，这里给够最小可用配置。
+	t.Setenv("MINIO_ACCESS_KEY", "mindos")
+	t.Setenv("MINIO_SECRET_KEY", "test-secret")
+	t.Setenv("MINIO_BUCKET", "mindos-test")
 	t.Setenv("LLM_API_BASE", "https://api.example.com/v1/")
 	t.Setenv("LLM_API_KEY", "sk-1234567890abcdef")
 	t.Setenv("LLM_MODEL", "gpt-4o-mini")
@@ -241,8 +255,8 @@ func TestLoadReadsModelAndBudgetConfig(t *testing.T) {
 	if !cfg.IsLLMConfigured() {
 		t.Fatal("LLM should be configured when all three fields are set")
 	}
-	if cfg.Storage.Dir != "/data/mindos" {
-		t.Fatalf("Storage.Dir = %q", cfg.Storage.Dir)
+	if cfg.Storage.MinIO.Bucket != "mindos-test" {
+		t.Fatalf("Storage.MinIO.Bucket = %q", cfg.Storage.MinIO.Bucket)
 	}
 	if cfg.Agent.MaxSteps != 15 || cfg.Agent.TokenBudget != 50000 || cfg.Agent.RunTimeout != 2*time.Minute {
 		t.Fatalf("Agent = %+v", cfg.Agent)
@@ -252,7 +266,7 @@ func TestLoadReadsModelAndBudgetConfig(t *testing.T) {
 // TestLoadRejectsPartialModelConfig 确认模型配置只配一半时启动报错并指出缺哪几项。
 func TestLoadRejectsPartialModelConfig(t *testing.T) {
 	t.Chdir(t.TempDir())
-	t.Setenv("DB_PASSWORD", "test-password")
+	setRequiredEnv(t)
 	t.Setenv("LLM_API_KEY", "sk-only-key")
 
 	_, err := Load()
@@ -280,11 +294,9 @@ func TestValidate(t *testing.T) {
 				MaxIdleConns: 10,
 				PingTimeout:  3 * time.Second,
 			},
-			// 默认用 local 驱动：这一组用例关心的是各字段自身的校验，
-			// minio 专属的必填项由下面的用例单独覆盖。
+			// MinIO 是唯一存储后端，这一组用例关心的是各字段自身的校验，
+			// 存储项的必填校验由下面三条 minio 用例单独覆盖。
 			Storage: StorageConfig{
-				Driver:         "local",
-				Dir:            "./storage",
 				MaxUploadBytes: 10 << 20,
 				MinIO: MinIOConfig{
 					Endpoint:  "localhost:9000",
@@ -311,18 +323,14 @@ func TestValidate(t *testing.T) {
 		{name: "max open conns", mutate: func(c *Config) { c.DB.MaxOpenConns = 0 }, want: "DB_MAX_OPEN_CONNS"},
 		{name: "max idle conns", mutate: func(c *Config) { c.DB.MaxIdleConns = -1 }, want: "DB_MAX_IDLE_CONNS"},
 		{name: "ping timeout", mutate: func(c *Config) { c.DB.PingTimeout = 0 }, want: "DB_PING_TIMEOUT"},
-		{name: "storage dir empty", mutate: func(c *Config) { c.Storage.Dir = "  " }, want: "STORAGE_DIR"},
-		{name: "storage driver unknown", mutate: func(c *Config) { c.Storage.Driver = "s3" }, want: "STORAGE_DRIVER"},
+		{name: "minio endpoint empty", mutate: func(c *Config) { c.Storage.MinIO.Endpoint = " " }, want: "MINIO_ENDPOINT"},
 		{name: "minio endpoint with scheme", mutate: func(c *Config) {
-			c.Storage.Driver = "minio"
 			c.Storage.MinIO.Endpoint = "http://localhost:9000"
 		}, want: "MINIO_ENDPOINT"},
 		{name: "minio credentials missing", mutate: func(c *Config) {
-			c.Storage.Driver = "minio"
 			c.Storage.MinIO.AccessKey = ""
 		}, want: "MINIO_ACCESS_KEY"},
 		{name: "minio bucket missing", mutate: func(c *Config) {
-			c.Storage.Driver = "minio"
 			c.Storage.MinIO.Bucket = " "
 		}, want: "MINIO_BUCKET"},
 		{name: "agent max steps", mutate: func(c *Config) { c.Agent.MaxSteps = 0 }, want: "AGENT_MAX_STEPS"},
