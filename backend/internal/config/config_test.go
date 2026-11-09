@@ -280,6 +280,19 @@ func TestValidate(t *testing.T) {
 				MaxIdleConns: 10,
 				PingTimeout:  3 * time.Second,
 			},
+			// 默认用 local 驱动：这一组用例关心的是各字段自身的校验，
+			// minio 专属的必填项由下面的用例单独覆盖。
+			Storage: StorageConfig{
+				Driver:         "local",
+				Dir:            "./storage",
+				MaxUploadBytes: 10 << 20,
+				MinIO: MinIOConfig{
+					Endpoint:  "localhost:9000",
+					AccessKey: "key",
+					SecretKey: "secret",
+					Bucket:    "mindos",
+				},
+			},
 		}
 	}
 
@@ -299,6 +312,19 @@ func TestValidate(t *testing.T) {
 		{name: "max idle conns", mutate: func(c *Config) { c.DB.MaxIdleConns = -1 }, want: "DB_MAX_IDLE_CONNS"},
 		{name: "ping timeout", mutate: func(c *Config) { c.DB.PingTimeout = 0 }, want: "DB_PING_TIMEOUT"},
 		{name: "storage dir empty", mutate: func(c *Config) { c.Storage.Dir = "  " }, want: "STORAGE_DIR"},
+		{name: "storage driver unknown", mutate: func(c *Config) { c.Storage.Driver = "s3" }, want: "STORAGE_DRIVER"},
+		{name: "minio endpoint with scheme", mutate: func(c *Config) {
+			c.Storage.Driver = "minio"
+			c.Storage.MinIO.Endpoint = "http://localhost:9000"
+		}, want: "MINIO_ENDPOINT"},
+		{name: "minio credentials missing", mutate: func(c *Config) {
+			c.Storage.Driver = "minio"
+			c.Storage.MinIO.AccessKey = ""
+		}, want: "MINIO_ACCESS_KEY"},
+		{name: "minio bucket missing", mutate: func(c *Config) {
+			c.Storage.Driver = "minio"
+			c.Storage.MinIO.Bucket = " "
+		}, want: "MINIO_BUCKET"},
 		{name: "agent max steps", mutate: func(c *Config) { c.Agent.MaxSteps = 0 }, want: "AGENT_MAX_STEPS"},
 		{name: "agent token budget", mutate: func(c *Config) { c.Agent.TokenBudget = 0 }, want: "AGENT_TOKEN_BUDGET"},
 		{name: "agent run timeout", mutate: func(c *Config) { c.Agent.RunTimeout = 0 }, want: "AGENT_RUN_TIMEOUT"},

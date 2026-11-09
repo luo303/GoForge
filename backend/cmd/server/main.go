@@ -145,13 +145,21 @@ func run() error {
 	)
 	settings := handler.NewSettingsHandler(cfg)
 
-	// 文档存储：启动时就建好目录，目录不可写要立刻暴露，
-	// 而不是等用户第一次上传才看到 500。
-	store, err := platform.NewFileStore(cfg.Storage.Dir)
+	// 文档原文存储：默认 MinIO，也可退回本地目录（STORAGE_DRIVER=local）。
+	// 启动时就建 bucket / 目录：端点不通、凭据不对属于"部署错了"，
+	// 要让服务直接起不来，而不是等用户第一次上传才看到 500。
+	store, err := platform.NewBlobStore(ctx, cfg.Storage)
 	if err != nil {
 		return err
 	}
-	log.Info("document storage ready", zap.String("dir", store.Root()))
+	target := cfg.Storage.Dir
+	if cfg.Storage.Driver == "minio" {
+		target = cfg.Storage.MinIO.Endpoint + "/" + cfg.Storage.MinIO.Bucket
+	}
+	log.Info("document storage ready",
+		zap.String("driver", cfg.Storage.Driver),
+		zap.String("target", target),
+	)
 
 	knowledgeSvc := knowledge.NewService(
 		knowledge.NewRepository(db),

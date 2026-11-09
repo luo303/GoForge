@@ -85,14 +85,35 @@ func (c *Config) IsLLMConfigured() bool {
 	return c.LLM.APIBase != "" && c.LLM.APIKey != "" && c.LLM.Model != ""
 }
 
-// StorageConfig 描述本地文件存储（上传的原始文档保存在这里）。
-// 单用户本地部署用文件系统即可；对象存储对单机是多余的运维负担（见 overview 取舍表）。
+// StorageConfig 描述"原始文档存到哪"以及单次导入的大小上限。
+//
+// 两种驱动：
+//   - local：写本地目录，零外部依赖，适合临时调试；
+//   - minio：写对象存储（S3 协议），开发与生产的默认选择。
+//
+// 为什么默认给 minio：原文是"重索引/重算 embedding"的唯一依据，必须独立于
+// 应用进程的磁盘寿命。容器重建、换机器、将来多实例，都不该让原文跟着丢。
 type StorageConfig struct {
+	// Driver 决定用哪个实现，取值 local | minio。
+	Driver string
+	// Dir 只在 Driver=local 时使用。
 	Dir string
 	// MaxUploadBytes 是单次导入允许的最大字节数。
 	// 放在配置里而不是代码常量：它取决于机器内存与使用习惯，不是业务规则；
 	// 但必须在服务端强制，不能只靠前端 accept 与 input 限制。
 	MaxUploadBytes int64
+	MinIO          MinIOConfig
+}
+
+// MinIOConfig 描述对象存储连接。字段与 .env 同名，不额外发明配置层。
+type MinIOConfig struct {
+	// Endpoint 是 host:port，**不带协议**——minio-go 用 UseSSL 决定 http/https，
+	// 传 "http://localhost:9000" 会被当成非法端点。
+	Endpoint  string
+	AccessKey string
+	SecretKey string
+	Bucket    string
+	UseSSL    bool
 }
 
 // LLMConfig 描述对话模型接入参数（OpenAI 兼容接口）。
@@ -164,8 +185,16 @@ func Load() (*Config, error) {
 			PoolSize: reader.integer("REDIS_POOL_SIZE", 20),
 		},
 		Storage: StorageConfig{
+			Driver:         strings.ToLower(reader.text("STORAGE_DRIVER", "local")),
 			Dir:            reader.text("STORAGE_DIR", "./storage"),
 			MaxUploadBytes: reader.integer64("STORAGE_MAX_UPLOAD_BYTES", 10<<20),
+			MinIO: MinIOConfig{
+				Endpoint:  reader.text("MINIO_ENDPOINT", "localhost:9000"),
+				AccessKey: reader.text("MINIO_ACCESS_KEY", ""),
+				SecretKey: reader.text("MINIO_SECRET_KEY", ""),
+				Bucket:    reader.text("MINIO_BUCKET", "mindos"),
+				UseSSL:    reader.boolean("MINIO_USE_SSL", false),
+			},
 		},
 		LLM: LLMConfig{
 			APIBase: strings.TrimRight(reader.text("LLM_API_BASE", ""), "/"),
@@ -232,12 +261,35 @@ func (c *Config) validate() error {
 	if c.DB.PingTimeout <= 0 {
 		errs = append(errs, errors.New("DB_PING_TIMEOUT must be greater than 0"))
 	}
-	if strings.TrimSpace(c.Storage.Dir) == "" {
-		errs = append(errs, errors.New("STORAGE_DIR must not be empty"))
-	}
 	if c.Storage.MaxUploadBytes < 1 {
 		errs = append(errs, fmt.Errorf(
 			"STORAGE_MAX_UPLOAD_BYTES must be greater than 0, got %d", c.Storage.MaxUploadBytes))
+	}
+	// 驱动相关的必填项分开校验：只配了 minio 一半的凭据就启动，
+	// 会在用户第一次上传时变成 S3 签名错误——那时更难看出是配置问题。
+	switch c.Storage.Driver {
+	case "local":
+		if strings.TrimSpace(c.Storage.Dir) == "" {
+			errs = append(errs, errors.New("STORAGE_DIR must not be empty when STORAGE_DRIVER=local"))
+		}
+	case "minio":
+		if strings.TrimSpace(c.Storage.MinIO.Endpoint) == "" {
+			errs = append(errs, errors.New("MINIO_ENDPOINT is required when STORAGE_DRIVER=minio"))
+		}
+		if strings.Contains(c.Storage.MinIO.Endpoint, "://") {
+			errs = append(errs, fmt.Errorf(
+				"MINIO_ENDPOINT must be host:port without scheme, got %q", c.Storage.MinIO.Endpoint))
+		}
+		if c.Storage.MinIO.AccessKey == "" || c.Storage.MinIO.SecretKey == "" {
+			errs = append(errs, errors.New(
+				"MINIO_ACCESS_KEY and MINIO_SECRET_KEY are required when STORAGE_DRIVER=minio"))
+		}
+		if strings.TrimSpace(c.Storage.MinIO.Bucket) == "" {
+			errs = append(errs, errors.New("MINIO_BUCKET is required when STORAGE_DRIVER=minio"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf(
+			"STORAGE_DRIVER must be local or minio, got %q", c.Storage.Driver))
 	}
 	errs = append(errs, validateModelConfig("LLM", c.LLM.APIBase, c.LLM.APIKey, c.LLM.Model)...)
 	errs = append(errs, validateModelConfig("EMBEDDING", c.Embedding.APIBase, c.Embedding.APIKey, c.Embedding.Model)...)
