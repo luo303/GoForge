@@ -18,17 +18,27 @@ import (
 type fakeRepo struct {
 	docs      map[int64]*Document
 	chunks    map[int64][]Chunk
+	hashIndex map[string]int64
 	nextID    int64
 	createErr error
 }
 
 func newFakeRepo() *fakeRepo {
-	return &fakeRepo{docs: map[int64]*Document{}, chunks: map[int64][]Chunk{}}
+	return &fakeRepo{
+		docs:      map[int64]*Document{},
+		chunks:    map[int64][]Chunk{},
+		hashIndex: map[string]int64{},
+	}
 }
 
 func (f *fakeRepo) CreateWithChunks(_ context.Context, doc *Document, chunks []Chunk) error {
 	if f.createErr != nil {
 		return f.createErr
+	}
+	// 复刻 documents_content_hash_key 唯一索引：真实数据库靠它兜底幂等，
+	// 假仓储如果不模拟，service 的"冲突后读回"分支就永远不会被走到。
+	if _, dup := f.hashIndex[doc.ContentHash]; dup {
+		return ErrDuplicate
 	}
 	f.nextID++
 	doc.ID = f.nextID
@@ -38,11 +48,20 @@ func (f *fakeRepo) CreateWithChunks(_ context.Context, doc *Document, chunks []C
 	doc.UpdatedAt = doc.CreatedAt
 	stored := *doc
 	f.docs[doc.ID] = &stored
+	f.hashIndex[doc.ContentHash] = doc.ID
 	for i := range chunks {
 		chunks[i].DocumentID = doc.ID
 	}
 	f.chunks[doc.ID] = append([]Chunk(nil), chunks...)
 	return nil
+}
+
+func (f *fakeRepo) GetByContentHash(_ context.Context, hash string) (*Document, error) {
+	id, ok := f.hashIndex[hash]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return f.Get(context.Background(), id)
 }
 
 func (f *fakeRepo) Get(_ context.Context, id int64) (*Document, error) {
@@ -130,7 +149,7 @@ func TestImportFileMarkdown(t *testing.T) {
 	svc, repo, store := newTestService(1 << 20)
 	text := "# 标题\n\n第一段内容。\n\n## 小节\n\n第二段内容。\n"
 
-	doc, err := svc.ImportFile(context.Background(), FileInput{
+	doc, _, err := svc.ImportFile(context.Background(), FileInput{
 		Filename: "guide.md",
 		Content:  strings.NewReader(text),
 	})
@@ -189,7 +208,7 @@ func TestImportFileMarkdown(t *testing.T) {
 func TestImportFileRejectsUnsupportedType(t *testing.T) {
 	svc, _, store := newTestService(1 << 20)
 
-	_, err := svc.ImportFile(context.Background(), FileInput{
+	_, _, err := svc.ImportFile(context.Background(), FileInput{
 		Filename: "slides.pdf",
 		Content:  strings.NewReader("%PDF-1.4"),
 	})
@@ -205,14 +224,14 @@ func TestImportFileRejectsNonUTF8AndEmpty(t *testing.T) {
 	svc, _, store := newTestService(1 << 20)
 	ctx := context.Background()
 
-	if _, err := svc.ImportFile(ctx, FileInput{
+	if _, _, err := svc.ImportFile(ctx, FileInput{
 		Filename: "binary.md",
 		Content:  bytes.NewReader([]byte{0xff, 0xfe, 0x00}),
 	}); !errors.Is(err, ErrNotUTF8) {
 		t.Fatalf("non-UTF8 err = %v, want ErrNotUTF8", err)
 	}
 
-	if _, err := svc.ImportFile(ctx, FileInput{
+	if _, _, err := svc.ImportFile(ctx, FileInput{
 		Filename: "empty.txt",
 		Content:  strings.NewReader(" \n\n\t\n"),
 	}); !errors.Is(err, ErrEmptyDocument) {
@@ -227,7 +246,7 @@ func TestImportFileRejectsNonUTF8AndEmpty(t *testing.T) {
 func TestImportFileRejectsOversizedFile(t *testing.T) {
 	svc, _, store := newTestService(8)
 
-	_, err := svc.ImportFile(context.Background(), FileInput{
+	_, _, err := svc.ImportFile(context.Background(), FileInput{
 		Filename: "big.txt",
 		Content:  strings.NewReader("123456789"),
 	})
@@ -239,7 +258,7 @@ func TestImportFileRejectsOversizedFile(t *testing.T) {
 	}
 
 	// 恰好等于上限应当通过：读 limit+1 字节再判断，不能把边界值误判成超限。
-	if _, err := svc.ImportFile(context.Background(), FileInput{
+	if _, _, err := svc.ImportFile(context.Background(), FileInput{
 		Filename: "exact.txt",
 		Content:  strings.NewReader("12345678"),
 	}); err != nil {
@@ -251,7 +270,7 @@ func TestImportFileRemovesFileWhenPersistFails(t *testing.T) {
 	svc, repo, store := newTestService(1 << 20)
 	repo.createErr = errors.New("insert chunks failed")
 
-	_, err := svc.ImportFile(context.Background(), FileInput{
+	_, _, err := svc.ImportFile(context.Background(), FileInput{
 		Filename: "note.md",
 		Content:  strings.NewReader("# 标题\n\n正文。\n"),
 	})
@@ -266,25 +285,38 @@ func TestImportFileRemovesFileWhenPersistFails(t *testing.T) {
 	}
 }
 
-func TestImportFileKeepsReusedFileWhenPersistFails(t *testing.T) {
+// 第二次导入相同内容时文件已在盘上（Reused=true），写入会撞唯一索引。
+//
+// Phase 4 这里断言的是"把 409 抛出去、但不删文件"；Phase 5 起撞索引等于
+// 幂等命中，所以正确结果是返回既有文档。文件仍然不能删——它属于第一条文档。
+func TestImportReusedFileBecomesIdempotentHit(t *testing.T) {
 	svc, repo, store := newTestService(1 << 20)
 	content := "# 标题\n\n正文。\n"
-	if _, err := svc.ImportFile(context.Background(), FileInput{
+
+	first, existed, err := svc.ImportFile(context.Background(), FileInput{
 		Filename: "first.md",
 		Content:  strings.NewReader(content),
-	}); err != nil {
-		t.Fatalf("first import: %v", err)
+	})
+	if err != nil || existed {
+		t.Fatalf("first import: existed=%v err=%v", existed, err)
 	}
 
-	// 第二次导入相同内容：文件已存在（Reused），随后写库失败。
-	repo.createErr = ErrDuplicate
-	if _, err := svc.ImportFile(context.Background(), FileInput{
+	second, existed, err := svc.ImportFile(context.Background(), FileInput{
 		Filename: "second.md",
 		Content:  strings.NewReader(content),
-	}); !errors.Is(err, ErrDuplicate) {
-		t.Fatalf("err = %v, want ErrDuplicate", err)
+	})
+	if err != nil {
+		t.Fatalf("second import: %v", err)
 	}
-
+	if !existed {
+		t.Error("second import must be an idempotent hit")
+	}
+	if second.ID != first.ID {
+		t.Errorf("second import id = %d, want %d", second.ID, first.ID)
+	}
+	if len(repo.docs) != 1 {
+		t.Errorf("documents = %d, want 1", len(repo.docs))
+	}
 	if len(store.removed) != 0 {
 		t.Fatalf("reused file belongs to the earlier document and must not be removed: %v", store.removed)
 	}
@@ -297,7 +329,7 @@ func TestImportNoteDerivesTitleAndStoresContent(t *testing.T) {
 	svc, repo, store := newTestService(1 << 20)
 	content := "# 会议纪要\n\n下周交付。\n"
 
-	doc, err := svc.ImportNote(context.Background(), NoteInput{Content: content})
+	doc, _, err := svc.ImportNote(context.Background(), NoteInput{Content: content})
 	if err != nil {
 		t.Fatalf("ImportNote: %v", err)
 	}
@@ -318,7 +350,7 @@ func TestImportNoteDerivesTitleAndStoresContent(t *testing.T) {
 	}
 
 	// 显式标题优先于正文首行。
-	doc2, err := svc.ImportNote(context.Background(), NoteInput{
+	doc2, _, err := svc.ImportNote(context.Background(), NoteInput{
 		Title:   "自定义标题",
 		Content: "完全不同的正文。",
 	})
@@ -334,10 +366,10 @@ func TestImportNoteRejectsEmptyAndOversized(t *testing.T) {
 	svc, _, _ := newTestService(4)
 	ctx := context.Background()
 
-	if _, err := svc.ImportNote(ctx, NoteInput{Content: "   \n"}); !errors.Is(err, ErrEmptyDocument) {
+	if _, _, err := svc.ImportNote(ctx, NoteInput{Content: "   \n"}); !errors.Is(err, ErrEmptyDocument) {
 		t.Fatalf("empty note err = %v, want ErrEmptyDocument", err)
 	}
-	if _, err := svc.ImportNote(ctx, NoteInput{Content: "五个字符"}); !errors.Is(err, ErrTooLarge) {
+	if _, _, err := svc.ImportNote(ctx, NoteInput{Content: "五个字符"}); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("oversized note err = %v, want ErrTooLarge", err)
 	}
 }
@@ -346,7 +378,7 @@ func TestImportStripsBOMAndKeepsOffsets(t *testing.T) {
 	svc, repo, _ := newTestService(1 << 20)
 	content := "\ufeff# 标题\n\n正文。\n"
 
-	doc, err := svc.ImportFile(context.Background(), FileInput{
+	doc, _, err := svc.ImportFile(context.Background(), FileInput{
 		Filename: "bom.md",
 		Content:  strings.NewReader(content),
 	})
@@ -380,7 +412,7 @@ func TestListClampsPaging(t *testing.T) {
 	svc, _, _ := newTestService(1 << 20)
 	ctx := context.Background()
 	for i := 0; i < 3; i++ {
-		if _, err := svc.ImportNote(ctx, NoteInput{Content: string(rune('a'+i)) + " 号笔记"}); err != nil {
+		if _, _, err := svc.ImportNote(ctx, NoteInput{Content: string(rune('a'+i)) + " 号笔记"}); err != nil {
 			t.Fatalf("seed note %d: %v", i, err)
 		}
 	}
@@ -422,5 +454,110 @@ func TestClampPaging(t *testing.T) {
 			t.Errorf("ClampPaging(%d,%d) = (%d,%d), want (%d,%d)",
 				c.limit, c.offset, gotLimit, gotOffset, c.wantLimit, c.wantOffset)
 		}
+	}
+}
+
+// 幂等导入：同样的内容再传一次，返回既有文档，不建第二条记录、不产生第二份文件。
+func TestImportFileIsIdempotent(t *testing.T) {
+	svc, repo, store := newTestService(1 << 20)
+	text := "# 标题\n\n同一份内容。\n"
+
+	first, existed, err := svc.ImportFile(context.Background(), FileInput{
+		Filename: "a.md",
+		Content:  strings.NewReader(text),
+	})
+	if err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	if existed {
+		t.Error("first import must not be reported as existing")
+	}
+	firstChunks := len(repo.chunks[first.ID])
+
+	// 第二次用不同的文件名，但内容一致：标题不能因此被改写。
+	second, existed, err := svc.ImportFile(context.Background(), FileInput{
+		Filename: "b.md",
+		Content:  strings.NewReader(text),
+	})
+	if err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+	if !existed {
+		t.Error("second import must report existed=true")
+	}
+	if second.ID != first.ID {
+		t.Errorf("second import returned id %d, want existing id %d", second.ID, first.ID)
+	}
+	if second.Title != first.Title {
+		t.Errorf("existing document title changed to %q", second.Title)
+	}
+	if len(repo.docs) != 1 {
+		t.Errorf("documents = %d, want 1", len(repo.docs))
+	}
+	if got := len(repo.chunks[first.ID]); got != firstChunks {
+		t.Errorf("chunks = %d, want %d (duplicate must not re-split)", got, firstChunks)
+	}
+	if len(store.files) != 1 {
+		t.Errorf("stored files = %d, want 1", len(store.files))
+	}
+	// 最要紧的一条：既有文档的原文不能被"补偿清理"删掉。
+	if len(store.removed) != 0 {
+		t.Errorf("duplicate import removed files: %v", store.removed)
+	}
+}
+
+// 库里已有记录、但盘上文件丢了（例如手工删了 storage 目录）：
+// 这次 Save 会真的写一份新文件，随后的冲突分支仍然不能删它——
+// 那条既有文档此刻正指着这个路径。
+func TestImportFileDuplicateKeepsRewrittenFile(t *testing.T) {
+	svc, _, store := newTestService(1 << 20)
+	text := "# 标题\n\n原文。\n"
+
+	first, _, err := svc.ImportFile(context.Background(), FileInput{
+		Filename: "a.md",
+		Content:  strings.NewReader(text),
+	})
+	if err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	store.files = map[string][]byte{} // 模拟原文丢失
+
+	if _, existed, err := svc.ImportFile(context.Background(), FileInput{
+		Filename: "a.md",
+		Content:  strings.NewReader(text),
+	}); err != nil || !existed {
+		t.Fatalf("second import: existed=%v err=%v", existed, err)
+	}
+
+	if len(store.removed) != 0 {
+		t.Errorf("duplicate import removed the rewritten file: %v", store.removed)
+	}
+	if _, ok := store.files[*first.StoragePath]; !ok {
+		t.Error("rewritten file must stay on disk for the existing document")
+	}
+}
+
+// 笔记与文件共用同一条幂等规则：内容相同就是同一条记录。
+func TestImportNoteIsIdempotent(t *testing.T) {
+	svc, repo, _ := newTestService(1 << 20)
+	content := "# 会议记录\n\n结论：先做幂等。\n"
+
+	first, existed, err := svc.ImportNote(context.Background(), NoteInput{Content: content})
+	if err != nil || existed {
+		t.Fatalf("first note: existed=%v err=%v", existed, err)
+	}
+
+	second, existed, err := svc.ImportNote(context.Background(), NoteInput{
+		Title:   "另一个标题",
+		Content: content,
+	})
+	if err != nil {
+		t.Fatalf("second note: %v", err)
+	}
+	if !existed || second.ID != first.ID {
+		t.Errorf("second note = id %d existed=%v, want id %d existed=true", second.ID, existed, first.ID)
+	}
+	if len(repo.docs) != 1 {
+		t.Errorf("documents = %d, want 1", len(repo.docs))
 	}
 }

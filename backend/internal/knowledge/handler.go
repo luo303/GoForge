@@ -42,6 +42,16 @@ type documentView struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+// importedDocumentView 是导入接口的响应：文档视图 + 本次是否命中既有记录。
+//
+// 用内嵌而不是给 documentView 加字段：existed 只对"导入"这一个动作有意义，
+// 挂在详情/列表的视图上会让前端以为它是文档的固有属性。
+// 内嵌结构体的字段在 JSON 里会被提升到同一层，因此响应形状仍是扁平的。
+type importedDocumentView struct {
+	documentView
+	Existed bool `json:"existed"`
+}
+
 type chunkView struct {
 	ID          int64  `json:"id"`
 	Seq         int    `json:"seq"`
@@ -88,7 +98,7 @@ func (h *Handler) CreateFile(c *gin.Context) {
 	// 否则句柄会一直占着临时文件，Windows 下甚至删不掉。
 	defer func() { _ = f.Close() }()
 
-	doc, err := h.svc.ImportFile(c.Request.Context(), FileInput{
+	doc, existed, err := h.svc.ImportFile(c.Request.Context(), FileInput{
 		Filename: fileHeader.Filename,
 		Content:  f,
 	})
@@ -96,7 +106,7 @@ func (h *Handler) CreateFile(c *gin.Context) {
 		httpx.Fail(c, mapError(err))
 		return
 	}
-	httpx.Created(c, newDocumentView(doc))
+	respondImported(c, doc, existed)
 }
 
 // CreateNote 处理笔记导入：POST /documents/note。
@@ -108,7 +118,7 @@ func (h *Handler) CreateNote(c *gin.Context) {
 		return
 	}
 
-	doc, err := h.svc.ImportNote(c.Request.Context(), NoteInput{
+	doc, existed, err := h.svc.ImportNote(c.Request.Context(), NoteInput{
 		Title:   req.Title,
 		Content: req.Content,
 	})
@@ -116,7 +126,7 @@ func (h *Handler) CreateNote(c *gin.Context) {
 		httpx.Fail(c, mapError(err))
 		return
 	}
-	httpx.Created(c, newDocumentView(doc))
+	respondImported(c, doc, existed)
 }
 
 // List 返回分页后的文档列表：GET /documents?limit=&offset=。
@@ -180,6 +190,20 @@ func (h *Handler) ListChunks(c *gin.Context) {
 		items = append(items, newChunkView(&chunks[i]))
 	}
 	httpx.OK(c, chunkListView{Items: items, Total: total, Limit: limit, Offset: offset})
+}
+
+// respondImported 按"是否新建"选择状态码。
+//
+// 201 表示本次真的写入了新记录；200 表示命中既有文档（幂等命中）。
+// 不统一成 200 是为了让调用方能只凭状态码区分"我刚创建了它"与"它本来就在"，
+// 不必解析 body；也不统一成 201 是因为那会让"重复上传"看起来像产生了第二份数据。
+func respondImported(c *gin.Context, doc *Document, existed bool) {
+	view := importedDocumentView{documentView: newDocumentView(doc), Existed: existed}
+	if existed {
+		httpx.OK(c, view)
+		return
+	}
+	httpx.Created(c, view)
 }
 
 func newDocumentView(doc *Document) documentView {

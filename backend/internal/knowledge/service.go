@@ -46,6 +46,7 @@ const (
 type documentRepository interface {
 	CreateWithChunks(ctx context.Context, doc *Document, chunks []Chunk) error
 	Get(ctx context.Context, id int64) (*Document, error)
+	GetByContentHash(ctx context.Context, hash string) (*Document, error)
 	List(ctx context.Context, limit, offset int) ([]Document, error)
 	Count(ctx context.Context) (int64, error)
 	ListChunks(ctx context.Context, documentID int64, limit, offset int) ([]Chunk, error)
@@ -91,33 +92,38 @@ type NoteInput struct {
 
 // ImportFile 同步导入一个文本文件。
 //
+// 返回值第二项 existed 表示"同内容的文档已存在，本次没有写入任何新记录"。
+// 幂等的语义只到这里：重复导入不会更新标题、标签或分块，需要改这些走 PATCH。
+// 理由是"同内容 = 同一条记录"——如果第二次上传能改第一次的结果，那这条记录
+// 就不再由内容唯一决定，前端拿到的 existed 也失去意义。
+//
 // Phase 4 在请求内完成解析与切分（文件上限 10 MiB，同步执行是可接受的）；
 // Phase 6 会把它改成"落盘 + 建 job + 202 受理"，切分搬进 worker，
 // 届时 Service 的入参形态基本不变，只是返回 job_id。
-func (s *Service) ImportFile(ctx context.Context, in FileInput) (*Document, error) {
+func (s *Service) ImportFile(ctx context.Context, in FileInput) (*Document, bool, error) {
 	mime, ok := MIMEByFilename(in.Filename)
 	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrUnsupportedType, filepath.Ext(in.Filename))
+		return nil, false, fmt.Errorf("%w: %s", ErrUnsupportedType, filepath.Ext(in.Filename))
 	}
 
 	data, err := readAllLimited(in.Content, s.maxUploadBytes)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	text, data, err := normalizeText(data)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	chunks, err := buildChunks(mime, text)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// 先落盘再落库：文件系统不在数据库事务里，顺序反过来会出现
 	// "事务已提交但文件写失败"——那才是真正不可修复的坏状态。
 	saved, err := s.store.Save(ctx, data)
 	if err != nil {
-		return nil, fmt.Errorf("save document file: %w", err)
+		return nil, false, fmt.Errorf("save document file: %w", err)
 	}
 
 	doc := &Document{
@@ -130,19 +136,7 @@ func (s *Service) ImportFile(ctx context.Context, in FileInput) (*Document, erro
 		Status:      StatusReady,
 		// ChunkCount 由 repository 按实际写入的分块数赋值，这里不重复计算。
 	}
-	if err := s.repo.CreateWithChunks(ctx, doc, chunks); err != nil {
-		// 补偿清理：库里没留下记录，盘上就不该留文件。
-		// Reused 表示这份内容属于更早的一条文档，删了会让那条文档失去原文。
-		if !saved.Reused {
-			// 两个错误一起返回：清理失败不该掩盖真正的失败原因，
-			// 但也不能悄悄吞掉（errors.Join 会保留两条链，日志里都看得到）。
-			if rmErr := s.store.Remove(ctx, saved.RelPath); rmErr != nil {
-				return nil, errors.Join(err, fmt.Errorf("cleanup stored file: %w", rmErr))
-			}
-		}
-		return nil, err
-	}
-	return doc, nil
+	return s.persist(ctx, doc, chunks, &saved)
 }
 
 // ImportNote 导入一条笔记。
@@ -152,17 +146,17 @@ func (s *Service) ImportFile(ctx context.Context, in FileInput) (*Document, erro
 //
 // 笔记一律按 Markdown 解析：用户自己写的东西里出现 "# 小节" 是常见用法，
 // 而纯文本文件里以 # 开头的行更可能是日志，所以两者规则不同。
-func (s *Service) ImportNote(ctx context.Context, in NoteInput) (*Document, error) {
+func (s *Service) ImportNote(ctx context.Context, in NoteInput) (*Document, bool, error) {
 	if int64(len(in.Content)) > s.maxUploadBytes {
-		return nil, ErrTooLarge
+		return nil, false, ErrTooLarge
 	}
 	text, data, err := normalizeText([]byte(in.Content))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	chunks, err := buildChunks(MIMEMarkdown, text)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	doc := &Document{
@@ -174,10 +168,41 @@ func (s *Service) ImportNote(ctx context.Context, in NoteInput) (*Document, erro
 		Content:     &text,
 		Status:      StatusReady,
 	}
-	if err := s.repo.CreateWithChunks(ctx, doc, chunks); err != nil {
-		return nil, err
+	return s.persist(ctx, doc, chunks, nil)
+}
+
+// persist 写入文档与分块，并把"同内容已存在"翻译成 (既有文档, true)。
+//
+// 三个分支的顺序有讲究：
+//  1. 成功 → 新建；
+//  2. 唯一索引冲突（ErrDuplicate）→ 读回既有记录，**不删文件**。
+//     此时盘上的文件正是那条既有文档指向的原文（内容寻址下路径由哈希决定），
+//     删掉会让它变成"有记录没原文"，之后重索引就再也跑不起来；
+//  3. 其他失败 → 补偿清理，且只在文件是本次新写的时候删（Reused=false）。
+//
+// saved 为 nil 表示这次导入没有文件（笔记）。
+func (s *Service) persist(ctx context.Context, doc *Document, chunks []Chunk, saved *platform.SavedFile) (*Document, bool, error) {
+	err := s.repo.CreateWithChunks(ctx, doc, chunks)
+	if err == nil {
+		return doc, false, nil
 	}
-	return doc, nil
+	if errors.Is(err, ErrDuplicate) {
+		existing, getErr := s.repo.GetByContentHash(ctx, doc.ContentHash)
+		if getErr == nil {
+			return existing, true, nil
+		}
+		// 撞了唯一索引却读不回来，说明这条记录在冲突与读取之间被删了。
+		// 这种情况极少见，退回冲突语义（409）比假装成功更诚实。
+		return nil, false, err
+	}
+	if saved != nil && !saved.Reused {
+		// 两个错误一起返回：清理失败不该掩盖真正的失败原因，
+		// 但也不能悄悄吞掉（errors.Join 会保留两条链，日志里都看得到）。
+		if rmErr := s.store.Remove(ctx, saved.RelPath); rmErr != nil {
+			return nil, false, errors.Join(err, fmt.Errorf("cleanup stored file: %w", rmErr))
+		}
+	}
+	return nil, false, err
 }
 
 // Get 读取文档详情。

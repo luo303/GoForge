@@ -80,6 +80,22 @@ func (r *Repository) Get(ctx context.Context, id int64) (*Document, error) {
 	return &doc, nil
 }
 
+// GetByContentHash 按内容哈希读取文档。
+//
+// 幂等导入靠它：写入撞上 content_hash 唯一索引后，用它把"已经存在的那一条"读回来。
+// 不用"先查再插"是因为那在并发下有竞态（两个请求同时查不到，随后一个必然插入失败）；
+// 而"先插、冲突再查"由数据库的唯一索引保证串行化——冲突方看到的必然是已提交的行。
+func (r *Repository) GetByContentHash(ctx context.Context, hash string) (*Document, error) {
+	var doc Document
+	err := r.db.WithContext(ctx).
+		Select(documentColumns).
+		First(&doc, "content_hash = ?", hash).Error
+	if err != nil {
+		return nil, translateError("get document by content hash", err)
+	}
+	return &doc, nil
+}
+
 // List 按创建时间倒序分页。
 func (r *Repository) List(ctx context.Context, limit, offset int) ([]Document, error) {
 	docs := make([]Document, 0, limit)

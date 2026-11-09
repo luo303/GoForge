@@ -113,6 +113,61 @@ func TestCreateFileEndpoint(t *testing.T) {
 	}
 }
 
+// 重复导入同一份内容：200 + existed=true，而不是 409 或 201。
+//
+// 三种状态码的分工：201 新建、200 命中既有、409 保留给"撞了唯一索引却读不回
+// 既有记录"这种已无法解释的情况。
+func TestCreateDuplicateReturnsExisting(t *testing.T) {
+	e, repo := newTestEngine(t, 1<<20)
+	content := []byte("# 标题\n\n正文内容。\n")
+
+	first, _ := doUpload(t, e, "guide.md", content)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, body = %s", first.Code, first.Body.String())
+	}
+
+	rec, env := doUpload(t, e, "copy.md", content)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("duplicate status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var duplicate struct {
+		ID      int64  `json:"id"`
+		Title   string `json:"title"`
+		Existed bool   `json:"existed"`
+	}
+	if err := json.Unmarshal(env.Data, &duplicate); err != nil {
+		t.Fatalf("decode document: %v", err)
+	}
+	if !duplicate.Existed {
+		t.Error("existed must be true for a duplicate import")
+	}
+	if duplicate.Title != "guide" {
+		t.Errorf("title = %q, want the existing document's title", duplicate.Title)
+	}
+	if len(repo.docs) != 1 {
+		t.Errorf("documents = %d, want 1", len(repo.docs))
+	}
+
+	// 笔记走同一条规则。
+	noteBody := map[string]string{"content": "# 会议记录\n\n结论。\n"}
+	if rec, _ := doJSON(t, e, http.MethodPost, "/api/v1/documents/note", noteBody); rec.Code != http.StatusCreated {
+		t.Fatalf("first note status = %d", rec.Code)
+	}
+	rec, env = doJSON(t, e, http.MethodPost, "/api/v1/documents/note", noteBody)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("duplicate note status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var duplicateNote struct {
+		Existed bool `json:"existed"`
+	}
+	if err := json.Unmarshal(env.Data, &duplicateNote); err != nil {
+		t.Fatalf("decode note: %v", err)
+	}
+	if !duplicateNote.Existed {
+		t.Error("existed must be true for a duplicate note")
+	}
+}
+
 func TestCreateFileRejectsUnsupportedType(t *testing.T) {
 	e, _ := newTestEngine(t, 1<<20)
 
