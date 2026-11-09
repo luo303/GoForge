@@ -128,7 +128,7 @@ func (s *Service) ImportFile(ctx context.Context, in FileInput) (*Document, erro
 		SourceType:  SourceFile,
 		StoragePath: &saved.RelPath,
 		Status:      StatusReady,
-		ChunkCount:  len(chunks),
+		// ChunkCount 由 repository 按实际写入的分块数赋值，这里不重复计算。
 	}
 	if err := s.repo.CreateWithChunks(ctx, doc, chunks); err != nil {
 		// 补偿清理：库里没留下记录，盘上就不该留文件。
@@ -173,7 +173,6 @@ func (s *Service) ImportNote(ctx context.Context, in NoteInput) (*Document, erro
 		SourceType:  SourceNote,
 		Content:     &text,
 		Status:      StatusReady,
-		ChunkCount:  len(chunks),
 	}
 	if err := s.repo.CreateWithChunks(ctx, doc, chunks); err != nil {
 		return nil, err

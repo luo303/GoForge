@@ -32,6 +32,8 @@ func (f *fakeRepo) CreateWithChunks(_ context.Context, doc *Document, chunks []C
 	}
 	f.nextID++
 	doc.ID = f.nextID
+	// 与真实 Repository 保持一致：chunk_count 由写入方按实际分块数赋值。
+	doc.ChunkCount = len(chunks)
 	doc.CreatedAt = time.Now().UTC()
 	doc.UpdatedAt = doc.CreatedAt
 	stored := *doc

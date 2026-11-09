@@ -48,6 +48,10 @@ var chunkColumns = []string{
 // 分块用 CreateInBatches 而不是逐条 Create：一次 INSERT 多行，把 N 次往返压成
 // ceil(N/200) 次；200 是兼顾 SQL 长度与单条语句参数上限的经验值。
 func (r *Repository) CreateWithChunks(ctx context.Context, doc *Document, chunks []Chunk) error {
+	// chunk_count 是派生值。在这里统一赋值而不是让调用方自己算：
+	// 它必须与本次写入的分块数严格一致，放在写入方才能保证不漏、不写错。
+	doc.ChunkCount = len(chunks)
+
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(doc).Error; err != nil {
 			return err
