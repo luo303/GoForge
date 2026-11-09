@@ -22,7 +22,7 @@
 
 技术主线：Go + Gin + GORM + PostgreSQL 16（pgvector）+ RabbitMQ + Redis（按需）+ Eino ADK；前端 React + TypeScript + Vite + Tailwind + shadcn/ui。
 
-**当前进度：Phase 1 已完成（2026-11-08），Phase 2 未开始。** 现有代码是 Phase 0 骨架加 Phase 1 的工程基线修复（中间件顺序、配置严格解析与回归测试）。阶段见 `docs/plan.md`，设计见 `docs/design/overview.md`。
+**当前进度：Phase 2 已完成（2026-11-09），Phase 3 进行中。** 已有迁移机制、系统状态与只读设置接口、配置严格解析；下一步是前端工程与产品骨架。阶段见 `docs/plan.md`，设计见 `docs/design/overview.md`。
 
 ## 2. 仓库结构与命令
 

@@ -136,6 +136,36 @@ docker compose --env-file backend/.env -f deployments/docker-compose.yml down -v
 
 > PostgreSQL 镜像为 `pgvector/pgvector:pg16`。从旧版本切过来时数据卷不兼容，需要 `down -v` 后重建（当前阶段库内无业务数据）。
 
+## 数据库迁移
+
+迁移文件在 `backend/migrations/`，命名对齐 golang-migrate（`0001_xxx.up.sql` / `0001_xxx.down.sql`），由 `cmd/migrate` 执行。**`server` 启动时不会自动迁移**：部署与数据结构变更分开，误重启不会动到库。
+
+| 命令（工作目录 `backend/`） | 作用 |
+|---|---|
+| `go run ./cmd/migrate up` | 按版本号顺序执行所有未应用的迁移 |
+| `go run ./cmd/migrate down` | 回滚最近一个已应用的迁移（执行对应 `.down.sql`） |
+| `go run ./cmd/migrate version` | 打印当前版本与 dirty 标记 |
+| `go run ./cmd/migrate force N` | 仅把版本号改写为 N 并清除 dirty，**不执行任何 SQL** |
+
+`up` 与 `down` 都先写 `schema_migrations.dirty = true`（事务外），再在事务内执行 SQL，成功后清除标记。版本号记录在 `schema_migrations` 表，重复 `up` 不会重复建表；`force` 只用于人工确认后的恢复，不当日常命令用。
+
+### 中断后处于 dirty 状态怎么处理
+
+`version` 输出 `dirty=true, version=N` 表示第 N 个迁移执行到一半进程就没了（Ctrl+C、断网、被 kill）。工具会拒绝继续执行，这是设计如此——它无法判断半个迁移做了什么。
+
+1. `go run ./cmd/migrate version` 确认 dirty 与版本号。
+2. 打开 `migrations/` 里第 N 个迁移的 `.up.sql`，连库核对该文件里的语句是否**全部**生效。
+3. 全部生效：`force N`；完全没生效：`force N-1` 后重跑 `up`；只生效一部分：手工把该迁移补完或撤干净，再 `force N`（补完）或 `force N-1`（撤净）。
+4. 恢复后 `GET /api/v1/system/status` 的 `migration.state` 应回到 `ok`。
+
+**不要直接改 `schema_migrations` 表**：dirty 标记的意义就是拦住自动继续，改表等于绕过唯一的保护。
+
+### 常见迁移错误
+
+- `migrate: query schema_migrations: sql: no rows in result set`：空库首次迁移时表还不存在。已在 Phase 2 修复（按“未初始化”处理），若再遇到说明代码被回退。
+- `ping postgres 127.0.0.1:5432/mindos: ...`：库没起或 `.env` 的连接参数不对，先 `docker compose ... ps` 再看 `logs postgres`。
+- `migrate: dirty at version N`：见上一节。
+
 ## 文档导航
 
 | 文档 | 内容 |
@@ -149,7 +179,7 @@ docker compose --env-file backend/.env -f deployments/docker-compose.yml down -v
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | Phase 0 | 服务骨架（配置、日志、中间件、健康检查、优雅关闭） | 已完成 |
-| Phase 1–3 | 工程基线：缺陷纠偏、迁移与系统状态、前端工程骨架 | Phase 1 已完成；P2–3 待开始 |
+| Phase 1–3 | 工程基线：缺陷纠偏、迁移与系统状态、前端工程骨架 | Phase 1–2 已完成；P3 进行中 |
 | Phase 4–9 | Knowledge：文本入库、多格式、异步任务、向量、混合检索、RAG | 待开始 |
 | Phase 10–12 | Memory：人工管理、提炼与冲突治理、召回质量 | 待开始 |
 | Phase 13–16 | Agent：最小对话、工具与预算、审批恢复、MQ 与后台执行 | 待开始 |
