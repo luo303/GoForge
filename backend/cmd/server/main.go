@@ -19,6 +19,7 @@ import (
 
 	"github.com/luo303/mindos/backend/internal/config"
 	"github.com/luo303/mindos/backend/internal/handler"
+	"github.com/luo303/mindos/backend/internal/knowledge"
 	"github.com/luo303/mindos/backend/internal/logging"
 	"github.com/luo303/mindos/backend/internal/middleware"
 	"github.com/luo303/mindos/backend/internal/migrate"
@@ -144,11 +145,26 @@ func run() error {
 	)
 	settings := handler.NewSettingsHandler(cfg)
 
+	// 文档存储：启动时就建好目录，目录不可写要立刻暴露，
+	// 而不是等用户第一次上传才看到 500。
+	store, err := platform.NewFileStore(cfg.Storage.Dir)
+	if err != nil {
+		return err
+	}
+	log.Info("document storage ready", zap.String("dir", store.Root()))
+
+	knowledgeSvc := knowledge.NewService(
+		knowledge.NewRepository(db),
+		store,
+		cfg.Storage.MaxUploadBytes,
+	)
+
 	engine := newEngine(log, cfg.IsDev())
 	router.Register(engine, router.Deps{
-		Health:   health,
-		System:   system,
-		Settings: settings,
+		Health:    health,
+		System:    system,
+		Settings:  settings,
+		Knowledge: knowledge.NewHandler(knowledgeSvc),
 	})
 
 	// 【为什么不用 router.Run()】

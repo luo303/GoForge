@@ -58,7 +58,8 @@ type settingsView struct {
 		PasswordConfigured bool   `json:"password_configured"`
 	} `json:"redis"`
 	Storage struct {
-		Dir string `json:"dir"`
+		Dir            string `json:"dir"`
+		MaxUploadBytes int64  `json:"max_upload_bytes"`
 	} `json:"storage"`
 	LLM       modelSettingsView `json:"llm"`
 	Embedding modelSettingsView `json:"embedding"`
@@ -88,6 +89,7 @@ func (h *SettingsHandler) Get(c *gin.Context) {
 	view.Redis.PoolSize = cfg.Redis.PoolSize
 	view.Redis.PasswordConfigured = cfg.Redis.Password != ""
 	view.Storage.Dir = cfg.Storage.Dir
+	view.Storage.MaxUploadBytes = cfg.Storage.MaxUploadBytes
 	view.LLM = modelView(cfg.LLM.APIBase, cfg.LLM.APIKey, cfg.LLM.Model)
 	view.Embedding = modelView(cfg.Embedding.APIBase, cfg.Embedding.APIKey, cfg.Embedding.Model)
 	view.Agent.MaxSteps = cfg.Agent.MaxSteps

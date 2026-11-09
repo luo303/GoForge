@@ -11,6 +11,7 @@ import (
 
 	"github.com/luo303/mindos/backend/internal/handler"
 	"github.com/luo303/mindos/backend/internal/httpx"
+	"github.com/luo303/mindos/backend/internal/knowledge"
 )
 
 // Deps 收集构建路由需要的依赖。
@@ -20,8 +21,11 @@ type Deps struct {
 	System   *handler.SystemHandler
 	Settings *handler.SettingsHandler
 
+	// Knowledge 是知识模块（文档入库与分块）。
+	Knowledge *knowledge.Handler
+
 	// 后续阶段在这里扩展：
-	//   Knowledge *handler.KnowledgeHandler（Phase 4 起按模块拆分）
+	//   Chat *chat.Handler（Phase 13 起）
 }
 
 // Register 把路由注册到已经挂好全局中间件的 engine 上。
@@ -52,4 +56,11 @@ func Register(e *gin.Engine, deps Deps) {
 	v1 := e.Group("/api/v1")
 	v1.GET("/system/status", deps.System.Status)
 	v1.GET("/settings", deps.Settings.Get)
+
+	// 知识：Phase 4 是同步导入，成功直接 201 返回文档（Phase 6 起改为 202 + job_id）。
+	v1.POST("/documents", deps.Knowledge.CreateFile)
+	v1.POST("/documents/note", deps.Knowledge.CreateNote)
+	v1.GET("/documents", deps.Knowledge.List)
+	v1.GET("/documents/:id", deps.Knowledge.Get)
+	v1.GET("/documents/:id/chunks", deps.Knowledge.ListChunks)
 }

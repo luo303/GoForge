@@ -142,13 +142,15 @@ func (e *Error) Wrap(cause error) *Error {
 // 没有任何代码写这些字段。一旦有人直接写 ErrNotFound.Message = "xxx"，
 // 就会同时污染所有请求 —— 这是 AGENTS.md 里禁止的行为。
 var (
-	ErrInternal           = &Error{Code: "INTERNAL", Message: "internal server error", HTTPStatus: http.StatusInternalServerError}
-	ErrInvalidArgument    = &Error{Code: "INVALID_ARGUMENT", Message: "invalid argument", HTTPStatus: http.StatusBadRequest}
-	ErrUnauthorized       = &Error{Code: "UNAUTHORIZED", Message: "unauthorized", HTTPStatus: http.StatusUnauthorized}
-	ErrForbidden          = &Error{Code: "FORBIDDEN", Message: "forbidden", HTTPStatus: http.StatusForbidden}
-	ErrNotFound           = &Error{Code: "NOT_FOUND", Message: "resource not found", HTTPStatus: http.StatusNotFound}
-	ErrConflict           = &Error{Code: "CONFLICT", Message: "resource conflict", HTTPStatus: http.StatusConflict}
-	ErrServiceUnavailable = &Error{Code: "SERVICE_UNAVAILABLE", Message: "service unavailable", HTTPStatus: http.StatusServiceUnavailable}
+	ErrInternal             = &Error{Code: "INTERNAL", Message: "internal server error", HTTPStatus: http.StatusInternalServerError}
+	ErrInvalidArgument      = &Error{Code: "INVALID_ARGUMENT", Message: "invalid argument", HTTPStatus: http.StatusBadRequest}
+	ErrUnauthorized         = &Error{Code: "UNAUTHORIZED", Message: "unauthorized", HTTPStatus: http.StatusUnauthorized}
+	ErrForbidden            = &Error{Code: "FORBIDDEN", Message: "forbidden", HTTPStatus: http.StatusForbidden}
+	ErrNotFound             = &Error{Code: "NOT_FOUND", Message: "resource not found", HTTPStatus: http.StatusNotFound}
+	ErrConflict             = &Error{Code: "CONFLICT", Message: "resource conflict", HTTPStatus: http.StatusConflict}
+	ErrPayloadTooLarge      = &Error{Code: "PAYLOAD_TOO_LARGE", Message: "payload too large", HTTPStatus: http.StatusRequestEntityTooLarge}
+	ErrUnsupportedMediaType = &Error{Code: "UNSUPPORTED_MEDIA_TYPE", Message: "unsupported media type", HTTPStatus: http.StatusUnsupportedMediaType}
+	ErrServiceUnavailable   = &Error{Code: "SERVICE_UNAVAILABLE", Message: "service unavailable", HTTPStatus: http.StatusServiceUnavailable}
 )
 
 // IsCode 判断 err 链上是否有指定错误码的 *Error。

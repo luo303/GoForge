@@ -57,6 +57,16 @@ func NewFileStore(dir string) (*FileStore, error) {
 // Root 返回存储根的绝对路径，供启动日志与 /settings 展示。
 func (s *FileStore) Root() string { return s.root }
 
+// ContentHash 返回内容的 SHA-256 十六进制小写串。
+//
+// 单独导出是因为"笔记"没有文件也要算同一个哈希：documents.content_hash
+// 的唯一索引必须对 file 与 note 用同一种算法，否则同一段内容以两种来源
+// 进来会被当成两条文档。
+func ContentHash(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 // Save 把整块内容写入存储，并返回内容哈希与相对路径。
 //
 // 参数是 []byte 而不是 io.Reader：上传上限由配置控制（默认 10 MiB），
@@ -71,8 +81,7 @@ func (s *FileStore) Save(ctx context.Context, data []byte) (SavedFile, error) {
 		return SavedFile{}, err
 	}
 
-	sum := sha256.Sum256(data)
-	hash := hex.EncodeToString(sum[:])
+	hash := ContentHash(data)
 	relPath := filepath.Join("documents", hash[:2], hash[2:4], hash)
 	absPath := filepath.Join(s.root, relPath)
 
