@@ -118,7 +118,7 @@ npm run build
 
 **退出标准**：全新环境只按 README 即可完成迁移；状态接口能准确定位“库不通、扩展缺失、迁移落后”三类问题。
 
-## Phase 3 前端工程与产品骨架
+## Phase 3 前端工程与产品骨架（已完成，2026-11-09）
 
 **目标**：建立可长期演进的前端基础，而不是堆六个静态页面。
 
@@ -139,6 +139,13 @@ npm run build
 - API 类型无散落 `any`，生产构建无 TypeScript 错误。
 
 **退出标准**：前端能真实读取 `/system/status`，lint/test/build 全绿，后续页面只需在既有规范内扩展。
+
+**验收记录（2026-11-09）**
+
+- 命令（工作目录 `frontend/`）：`npm run lint` 0 error；`npm run test` 3 个文件 19 个用例全通过；`npm run build`（`tsc --noEmit` + vite）无类型错误，产物 `index-*.js` 397.87 kB / gzip 125.49 kB。
+- 覆盖范围：统一信封解析与 `network` / `timeout` / `aborted` / `http` / `business` / `malformed` 六类失败；六页导航与 `aria-current`；404 保留外壳并可返回；设置页加载态（骨架）、成功态（依赖与迁移状态、脱敏密钥）、失败态（两块卡片各自报错）、重试后恢复。
+- 数据真实性：`/system/status` 与 `/settings` 走同一 `apiRequest`；页面在接口不可用时显示失败原因，不用模拟数据兜底。
+- 已知限制：窄屏抽屉与整体视觉未做浏览器人工验收，需本地起服务后目视确认；主题切换未做；生产静态托管留到 Phase 21。
 
 ## Phase 4 文本文档入库
 

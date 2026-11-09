@@ -60,12 +60,16 @@ mindos/
 │   │   ├── job/ worker/     异步任务与消费
 │   │   ├── handler/ router/ 协议层与路由表
 │   └── migrations/          SQL 迁移（Phase 2 起）
-├── frontend/                React 应用（Phase 3 起）
+├── frontend/                React 应用（Vite + TS + Tailwind + shadcn/ui）
+│   ├── src/api/             统一 API 客户端、错误模型、接口类型
+│   ├── src/app/             路由表、应用外壳、模块元数据
+│   ├── src/pages/           六页 + 404
+│   └── src/components/ui/   shadcn/ui 基础组件
 ├── deployments/             PostgreSQL(pgvector) / RabbitMQ / Redis compose
 └── docs/                    设计、计划
 ```
 
-依赖单向：`router → <module>/handler → <module>/service → <module>/repository → <module>/model`；`agent` 与 `worker` 复用模块 service，不经过 HTTP 层。当前代码只到 Phase 0 骨架，模块目录随阶段落地。
+依赖单向：`router → <module>/handler → <module>/service → <module>/repository → <module>/model`；`agent` 与 `worker` 复用模块 service，不经过 HTTP 层。当前代码覆盖 Phase 1–3：后端迁移与系统状态接口、前端六页骨架与只读设置页。
 
 ## 快速开始
 
@@ -82,6 +86,11 @@ docker compose --env-file backend/.env -f deployments/docker-compose.yml up -d
 cd backend
 go run ./cmd/migrate up          # Phase 2 起可用
 go run ./cmd/server
+
+# 4. 前端（另开终端，在仓库根目录）
+cd frontend
+npm install
+npm run dev                      # http://localhost:5173，/api 代理到 8080
 ```
 
 验证：
@@ -173,13 +182,14 @@ docker compose --env-file backend/.env -f deployments/docker-compose.yml down -v
 | [AGENTS.md](AGENTS.md) | 开发准入约定：模块边界、硬约束、禁止事项、Git 规范 |
 | [docs/design/overview.md](docs/design/overview.md) | 领域模型、检索与记忆机制、Agent 运行时、API 清单 |
 | [docs/plan.md](docs/plan.md) | Phase 1–21：范围、提交拆分、分层测试、故障验证、退出标准 |
+| [frontend/README.md](frontend/README.md) | 前端开发约定、目录结构、测试写法 |
 
 ## 路线图
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | Phase 0 | 服务骨架（配置、日志、中间件、健康检查、优雅关闭） | 已完成 |
-| Phase 1–3 | 工程基线：缺陷纠偏、迁移与系统状态、前端工程骨架 | Phase 1–2 已完成；P3 进行中 |
+| Phase 1–3 | 工程基线：缺陷纠偏、迁移与系统状态、前端工程骨架 | 已完成 |
 | Phase 4–9 | Knowledge：文本入库、多格式、异步任务、向量、混合检索、RAG | 待开始 |
 | Phase 10–12 | Memory：人工管理、提炼与冲突治理、召回质量 | 待开始 |
 | Phase 13–16 | Agent：最小对话、工具与预算、审批恢复、MQ 与后台执行 | 待开始 |

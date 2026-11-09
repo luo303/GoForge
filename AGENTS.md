@@ -22,14 +22,14 @@
 
 技术主线：Go + Gin + GORM + PostgreSQL 16（pgvector）+ RabbitMQ + Redis（按需）+ Eino ADK；前端 React + TypeScript + Vite + Tailwind + shadcn/ui。
 
-**当前进度：Phase 2 已完成（2026-11-09），Phase 3 进行中。** 已有迁移机制、系统状态与只读设置接口、配置严格解析；下一步是前端工程与产品骨架。阶段见 `docs/plan.md`，设计见 `docs/design/overview.md`。
+**当前进度：Phase 3 已完成（2026-11-09），下一步 Phase 4 文本文档入库。** 已有迁移机制、系统状态与只读设置接口，以及六页前端骨架（真实读取状态，其余页面空态）。阶段见 `docs/plan.md`，设计见 `docs/design/overview.md`。
 
 ## 2. 仓库结构与命令
 
 ```text
 mindos/
 ├── backend/        Go 服务（独立 module：github.com/luo303/mindos/backend）
-├── frontend/       React 应用（Phase 3 起）
+├── frontend/       React 应用（Vite + TS + Tailwind + shadcn/ui）
 ├── deployments/    基础设施 compose（PostgreSQL+pgvector / RabbitMQ / Redis）
 └── docs/           设计、计划
 ```
@@ -52,7 +52,7 @@ Windows 侧编辑器经 UNC 读取会有延迟，**以 WSL 内 `go build` 输出
 | `go build -o bin/mindos ./cmd/server` | 编译可执行文件 |
 | `docker compose --env-file backend/.env -f deployments/docker-compose.yml up -d` | 启动基础设施（在仓库根执行） |
 
-前端命令（工作目录 `frontend/`）：`npm run dev` / `build` / `lint`。**环境归属：Docker 与数据库由项目所有者自行在 Windows 侧启动**，不代为安装，不在 WSL 内搭替代环境绕过依赖。
+前端命令（工作目录 `frontend/`）：`npm run dev` / `build` / `lint` / `test`，约定见 `frontend/README.md`。**环境归属：Docker 与数据库由项目所有者自行在 Windows 侧启动**，不代为安装，不在 WSL 内搭替代环境绕过依赖。
 
 Go 版本：`go.mod` 声明 1.27.0，工具链 go1.27.1。不为用新特性抬高 go directive。
 
@@ -97,7 +97,7 @@ agent  → 各模块 service（受控读写）      worker → 各模块 service
 9. **资源必须关闭、goroutine 必须有退出路径**：连接池、`resp.Body`、`sql.Rows`、上传文件打开即 `defer Close()`；后台 goroutine 靠 `ctx.Done()` 退出并自带 `defer recover()`。
 10. **Agent 三重上限**：`max_steps`、token 预算、整体超时，缺一不允许合并。
 11. **工具调用必须留痕**：每次调用写 `tool_audits`；写类工具必须过审批门。
-12. **阶段收尾门槛**：`go build ./...` + `go vet ./...` + `go test -race ./...` 全绿，且该阶段的端到端验证跑通。
+12. **阶段收尾门槛**：后端 `go build ./...` + `go vet ./...` + `go test -race ./...` 全绿；前端 `npm run lint` + `test` + `build` 全绿；该阶段端到端验证跑通。
 
 ## 5. Never（明确禁止）
 
