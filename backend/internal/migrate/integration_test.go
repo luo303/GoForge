@@ -89,6 +89,20 @@ func TestUpDownUpIntegration(t *testing.T) {
 		t.Fatalf("fresh db status = %+v, want zero", st)
 	}
 
+	// 回归：表已建但没有记录（ensureTable 之后、第一条迁移之前）也必须等于
+	// "从未迁移"。早期实现只把"表不存在"当零值，漏了 QueryRow 的 ErrNoRows，
+	// 导致空库首次 up 直接失败：Up 先建表再查版本，每次都撞在 ErrNoRows 上。
+	if err := runner.ensureTable(ctx); err != nil {
+		t.Fatalf("ensureTable: %v", err)
+	}
+	st, err = runner.Version(ctx)
+	if err != nil {
+		t.Fatalf("Version on empty schema_migrations: %v", err)
+	}
+	if st.Version != 0 || st.Dirty {
+		t.Fatalf("empty schema_migrations status = %+v, want zero", st)
+	}
+
 	// up：应用到最新版本。
 	if err := runner.Up(ctx); err != nil {
 		t.Fatalf("Up: %v", err)

@@ -57,8 +57,15 @@ func New(db *sql.DB, fsys fs.FS) *Runner {
 
 // Version 返回当前迁移状态。
 //
-// 表不存在（从未运行过迁移）返回零值 Status，而不是报错——这样调用方
-// 能区分"没迁移过"（可自动修复）与"数据库连不上"（真故障）。
+// 有两种"什么都没有"的状态必须都当成零值 Status，而不是报错：
+//  1. 表不存在（还没跑过任何迁移）；
+//  2. 表存在但没有记录（ensureTable 刚建完表，第一条迁移还没执行）。
+//
+// 第 2 种来自 QueryRow().Scan() 的 sql.ErrNoRows——它看起来像错误，
+// 实际表达的是"查不到行"。漏掉它会让空库的首次 up 直接失败：
+// Up 先 ensureTable 建出空表，再调 Version，于是每次都撞在 ErrNoRows 上。
+//
+// 这样调用方才能区分"没迁移过"（可自动修复）与"数据库连不上"（真故障）。
 // 只有数据库本身出错才返回 error。
 func (r *Runner) Version(ctx context.Context) (Status, error) {
 	var st Status
@@ -67,6 +74,9 @@ func (r *Runner) Version(ctx context.Context) (Status, error) {
 	switch err := row.Scan(&st.Version, &st.Dirty); {
 	case err == nil:
 		return st, nil
+	case errors.Is(err, sql.ErrNoRows):
+		// 表在、行没有：等价于"从未迁移"，版本 0 且不脏。
+		return Status{}, nil
 	case isRelationNotExist(err):
 		return Status{}, nil
 	default:
