@@ -161,3 +161,210 @@ describe('知识库页面', () => {
     })
   })
 })
+
+/**
+ * Phase 5 的文档管理能力：幂等提示、分类标签、筛选、编辑、重索引、删除。
+ *
+ * 这组用例同样走真实 api 客户端与真实 Query，只把 fetch 换掉：
+ * 要验证的正是"点一下之后到底发了什么请求、列表有没有跟着变"。
+ */
+describe('知识库页面的文档管理', () => {
+  it('列表与详情展示分类和标签', async () => {
+    const doc = documentFixture({ collection: '工作', tags: ['go', '检索'] })
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === '/api/v1/documents?limit=20&offset=0') {
+        return jsonOk(envelope(documentListFixture([doc])))
+      }
+      if (url === `/api/v1/documents/${doc.id}`) {
+        return jsonOk(envelope(doc))
+      }
+      if (url === `/api/v1/documents/${doc.id}/chunks?limit=100&offset=0`) {
+        return jsonOk(envelope(chunkList([chunkFixture()])))
+      }
+      return jsonOk({ code: 'NOT_FOUND', message: url }, 404)
+    })
+
+    renderApp('/knowledge')
+
+    await screen.findByText('集成测试笔记')
+    // 先等详情卡片出现（哈希那行只在详情里），再断言"列表 + 详情各一份"。
+    await screen.findByText(/^sha256:/)
+    expect(screen.getAllByText('工作').length).toBe(2)
+    expect(screen.getAllByText('go').length).toBe(2)
+    expect(screen.getAllByText('检索').length).toBe(2)
+  })
+
+  it('按标签筛选时把条件带进查询参数', async () => {
+    const user = userEvent.setup()
+    const tagged = documentFixture({ id: 5, title: '带 go 标签', tags: ['go'] })
+    const requested: string[] = []
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      requested.push(url)
+      if (url === '/api/v1/documents?limit=20&offset=0' || url === '/api/v1/documents?limit=20&offset=0&tag=go') {
+        return jsonOk(envelope(documentListFixture([tagged])))
+      }
+      if (url === `/api/v1/documents/${tagged.id}`) {
+        return jsonOk(envelope(tagged))
+      }
+      if (url === `/api/v1/documents/${tagged.id}/chunks?limit=100&offset=0`) {
+        return jsonOk(envelope(chunkList([chunkFixture()])))
+      }
+      return jsonOk({ code: 'NOT_FOUND', message: url }, 404)
+    })
+
+    renderApp('/knowledge')
+    await screen.findByText('带 go 标签')
+
+    await user.type(screen.getByLabelText('按标签筛选'), 'go')
+    await user.click(screen.getByRole('button', { name: '筛选' }))
+
+    await vi.waitFor(() => {
+      expect(requested).toContain('/api/v1/documents?limit=20&offset=0&tag=go')
+    })
+  })
+
+  it('编辑标签只提交改动过的字段', async () => {
+    const user = userEvent.setup()
+    const doc = documentFixture({ tags: ['go'] })
+    const updated = { ...doc, tags: ['go', '检索'] }
+
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (init?.method === 'PATCH') {
+        return jsonOk(envelope(updated))
+      }
+      if (url === '/api/v1/documents?limit=20&offset=0') {
+        return jsonOk(envelope(documentListFixture([doc])))
+      }
+      if (url === `/api/v1/documents/${doc.id}`) {
+        return jsonOk(envelope(doc))
+      }
+      if (url === `/api/v1/documents/${doc.id}/chunks?limit=100&offset=0`) {
+        return jsonOk(envelope(chunkList([chunkFixture()])))
+      }
+      return jsonOk({ code: 'NOT_FOUND', message: url }, 404)
+    })
+
+    renderApp('/knowledge')
+    await screen.findByText('集成测试笔记')
+
+    await user.click(await screen.findByRole('button', { name: '编辑分类与标签' }))
+    const tagInput = await screen.findByLabelText('文档标签')
+    await user.clear(tagInput)
+    await user.type(tagInput, 'go, 检索')
+    await user.click(screen.getByRole('button', { name: '保存' }))
+
+    await vi.waitFor(() => {
+      const call = fetchMock.mock.calls.find(([, init]) => init?.method === 'PATCH')
+      expect(call).toBeDefined()
+      // 标题与分类没动，就不该出现在请求体里。
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({ tags: ['go', '检索'] })
+    })
+  })
+
+  it('重新切分调用 reindex 接口', async () => {
+    const user = userEvent.setup()
+    const doc = documentFixture()
+
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === `/api/v1/documents/${doc.id}/reindex` && init?.method === 'POST') {
+        return jsonOk(envelope({ ...doc, chunk_count: 3 }))
+      }
+      if (url === '/api/v1/documents?limit=20&offset=0') {
+        return jsonOk(envelope(documentListFixture([doc])))
+      }
+      if (url === `/api/v1/documents/${doc.id}`) {
+        return jsonOk(envelope(doc))
+      }
+      if (url === `/api/v1/documents/${doc.id}/chunks?limit=100&offset=0`) {
+        return jsonOk(envelope(chunkList([chunkFixture()])))
+      }
+      return jsonOk({ code: 'NOT_FOUND', message: url }, 404)
+    })
+
+    renderApp('/knowledge')
+    await screen.findByText('集成测试笔记')
+
+    await user.click(await screen.findByRole('button', { name: '重新切分' }))
+
+    await vi.waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        ([url, init]) => String(url) === `/api/v1/documents/${doc.id}/reindex` && init?.method === 'POST',
+      )
+      expect(call).toBeDefined()
+    })
+  })
+
+  it('删除需要二次确认，确认后发出 DELETE 并清空选中', async () => {
+    const user = userEvent.setup()
+    const doc = documentFixture()
+    let deleted = false
+
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === `/api/v1/documents/${doc.id}` && init?.method === 'DELETE') {
+        deleted = true
+        return jsonOk(envelope({ id: doc.id }))
+      }
+      if (url === '/api/v1/documents?limit=20&offset=0') {
+        return jsonOk(envelope(documentListFixture(deleted ? [] : [doc])))
+      }
+      if (url === `/api/v1/documents/${doc.id}`) {
+        return jsonOk(envelope(doc))
+      }
+      if (url === `/api/v1/documents/${doc.id}/chunks?limit=100&offset=0`) {
+        return jsonOk(envelope(chunkList([chunkFixture()])))
+      }
+      return jsonOk({ code: 'NOT_FOUND', message: url }, 404)
+    })
+
+    renderApp('/knowledge')
+    await screen.findByText('集成测试笔记')
+
+    await user.click(await screen.findByRole('button', { name: '删除' }))
+    // 第一次点击只是展开确认区，还不该发请求。
+    expect(screen.getByRole('alertdialog', { name: '确认删除文档' })).toBeInTheDocument()
+    expect(deleted).toBe(false)
+
+    await user.click(screen.getByRole('button', { name: '确认删除' }))
+
+    await vi.waitFor(() => {
+      expect(deleted).toBe(true)
+    })
+    // 删掉当前文档后不能继续显示它——否则会立刻触发一次注定 404 的详情请求。
+    expect(await screen.findByText('还没有可查看的文档')).toBeInTheDocument()
+  })
+
+  it('上传命中既有文档时提示没有重复入库', async () => {
+    const user = userEvent.setup()
+    const existing = documentFixture({ id: 3, title: '已有内容' })
+
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === '/api/v1/documents' && init?.method === 'POST') {
+        return jsonOk(envelope({ ...existing, existed: true }))
+      }
+      if (url === '/api/v1/documents?limit=20&offset=0') {
+        return jsonOk(envelope(documentListFixture([existing])))
+      }
+      if (url === `/api/v1/documents/${existing.id}`) {
+        return jsonOk(envelope(existing))
+      }
+      if (url === `/api/v1/documents/${existing.id}/chunks?limit=100&offset=0`) {
+        return jsonOk(envelope(chunkList([chunkFixture()])))
+      }
+      return jsonOk({ code: 'NOT_FOUND', message: url }, 404)
+    })
+
+    renderApp('/knowledge')
+    await screen.findByText('已有内容')
+
+    const file = new File(['# 标题'], 'copy.md', { type: 'text/markdown' })
+    await user.upload(screen.getByLabelText('选择要导入的文件'), file)
+
+    expect(await screen.findByText(/已复用《已有内容》，没有重复入库/)).toBeInTheDocument()
+  })
+})

@@ -50,6 +50,8 @@ export function documentFixture(overrides: Partial<DocumentView> = {}): Document
     mime: 'text/markdown',
     size_bytes: 42,
     content_hash: 'a'.repeat(64),
+    collection: '',
+    tags: [],
     status: 'ready',
     chunk_count: 2,
     created_at: '2026-11-09T07:30:00Z',

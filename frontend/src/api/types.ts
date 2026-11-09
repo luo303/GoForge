@@ -66,10 +66,43 @@ export type DocumentView = {
   mime: string
   size_bytes: number
   content_hash: string
+  /** 未分类时是空串（后端把 NULL 收敛成空串，避免前端到处判 null） */
+  collection: string
+  /** 永远是数组，不是 null——后端已统一成 [] */
+  tags: string[]
   status: DocumentStatus
   chunk_count: number
   created_at: string
   updated_at: string
+}
+
+/**
+ * 导入接口的响应：多一个 existed。
+ *
+ * 后端用它区分"本次新建（201）"与"命中既有文档（200）"；
+ * 前端据此提示用户"没有重复入库"，而不是一声不响地多出一条看起来一样的记录。
+ */
+export type ImportedDocumentView = DocumentView & {
+  existed: boolean
+}
+
+/** 列表筛选条件。空串表示不过滤，省掉调用方处理 undefined 的分支。 */
+export type DocumentFilters = {
+  collection: string
+  tag: string
+  status: DocumentStatus | ''
+}
+
+export type DocumentQuery = DocumentFilters & {
+  limit: number
+  offset: number
+}
+
+/** PATCH /documents/:id 的请求体，只传要改的字段 */
+export type DocumentPatch = {
+  title?: string
+  collection?: string
+  tags?: string[]
 }
 
 /**
