@@ -1,7 +1,7 @@
 import { RefreshCw, TriangleAlert } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
 
 type ErrorStateProps = {
   title: string
@@ -17,7 +17,9 @@ type ErrorStateProps = {
  */
 export function ErrorState({ title, description, onRetry, retrying = false }: ErrorStateProps) {
   return (
-    <Card className="border-destructive/40">
+    // role=alert：错误是异步出现的，屏幕阅读器需要主动播报，
+    // 否则用户只能靠自己再扫一遍页面才知道请求失败了。
+    <Card role="alert" className="border-destructive/40">
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-base">
           <TriangleAlert className="text-destructive size-4" aria-hidden="true" />
@@ -33,9 +35,6 @@ export function ErrorState({ title, description, onRetry, retrying = false }: Er
           </Button>
         </CardFooter>
       ) : null}
-      <CardContent className="sr-only" aria-live="polite">
-        {title}
-      </CardContent>
     </Card>
   )
 }
