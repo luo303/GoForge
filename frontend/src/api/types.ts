@@ -47,8 +47,55 @@ export type SettingsView = {
   log: { level: string; format: string }
   db: { host: string; port: number; name: string; sslmode: string; user: string }
   redis: { addr: string; db: number; pool_size: number; password_configured: boolean }
-  storage: { dir: string }
+  storage: { dir: string; max_upload_bytes: number }
   llm: ModelSettings
   embedding: ModelSettings
   agent: { max_steps: number; token_budget: number; run_timeout_seconds: number }
+}
+
+/** 文档状态。Phase 4 同步导入，成功即 ready。 */
+export type DocumentStatus = 'pending' | 'parsing' | 'indexing' | 'ready' | 'failed' | 'cancelling'
+
+export type DocumentSourceType = 'file' | 'note' | 'web'
+
+/** GET /documents 与 /documents/:id 共用的文档视图 */
+export type DocumentView = {
+  id: number
+  title: string
+  source_type: DocumentSourceType
+  mime: string
+  size_bytes: number
+  content_hash: string
+  status: DocumentStatus
+  chunk_count: number
+  created_at: string
+  updated_at: string
+}
+
+/**
+ * 分块。start_offset / end_offset 是 **Unicode 码点**偏移，不是字节、也不是
+ * UTF-16 下标——前端要用 Array.from(text) 切片才能对齐，详见页面里的 highlight 说明。
+ */
+export type ChunkView = {
+  id: number
+  seq: number
+  content: string
+  heading?: string
+  start_offset: number
+  end_offset: number
+  token_count: number
+}
+
+export type DocumentList = {
+  items: DocumentView[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export type ChunkList = {
+  items: ChunkView[]
+  total: number
+  limit: number
+  offset: number
 }

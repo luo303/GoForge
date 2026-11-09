@@ -155,6 +155,10 @@ function SettingsCard({ settings }: { settings: SettingsView }) {
           <Field label="数据库" value={`${settings.db.host}:${settings.db.port}/${settings.db.name}`} />
           <Field label="数据库用户" value={settings.db.user} />
           <Field label="存储目录" value={settings.storage.dir} />
+          <Field
+            label="单次导入上限"
+            value={`${(settings.storage.max_upload_bytes / 1024 / 1024).toFixed(0)} MiB`}
+          />
           <ModelField label="LLM" model={settings.llm} />
           <ModelField label="Embedding" model={settings.embedding} />
           <Field label="Agent 步数上限" value={String(settings.agent.max_steps)} />

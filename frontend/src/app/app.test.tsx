@@ -27,12 +27,12 @@ describe('应用布局与路由', () => {
     const user = userEvent.setup()
     renderApp('/')
 
-    await user.click(screen.getByRole('link', { name: '知识' }))
+    // 用「记忆」而不是「知识」：知识页会真的发请求，这个用例只关心路由与高亮。
+    await user.click(screen.getByRole('link', { name: '记忆' }))
 
-    expect(screen.getByRole('heading', { name: '知识' })).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: '知识' })).toHaveAttribute('aria-current', 'page')
-    // 阶段标记同时出现在徽标与说明文案里，这里只断言"出现过"
-    expect(screen.getAllByText(/Phase 4–9/).length).toBeGreaterThan(0)
+    expect(screen.getByRole('heading', { name: '记忆' })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: '记忆' })).toHaveAttribute('aria-current', 'page')
+    expect(screen.getByText('Phase 10–12')).toBeInTheDocument()
   })
 
   it('未知路径渲染 404 且保留导航外壳', async () => {

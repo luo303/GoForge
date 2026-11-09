@@ -36,10 +36,13 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
 
   let response: Response
   try {
+    // FormData 必须让浏览器自己带 boundary，手写 Content-Type 会破坏 multipart；
+    // JSON 则必须显式声明，否则后端按字符串接收。
+    const isFormData = typeof FormData !== 'undefined' && body instanceof FormData
     response = await fetch(`${API_BASE}${path}`, {
       method,
-      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      headers: body === undefined || isFormData ? undefined : { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : isFormData ? body : JSON.stringify(body),
       signal: controller.signal,
     })
   } catch (error) {
