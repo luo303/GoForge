@@ -53,6 +53,10 @@ type documentView struct {
 type importedDocumentView struct {
 	documentView
 	Existed bool `json:"existed"`
+	// JobID 是排队等待执行的任务 id。
+	// 幂等命中（existed=true）时没有新建任务，这里是 0——
+	// 前端不必区分，它只需要"有没有活要等"。
+	JobID int64 `json:"job_id"`
 }
 
 type chunkView struct {
@@ -119,7 +123,7 @@ func (h *Handler) CreateFile(c *gin.Context) {
 	// 否则句柄会一直占着临时文件，Windows 下甚至删不掉。
 	defer func() { _ = f.Close() }()
 
-	doc, existed, err := h.svc.ImportFile(c.Request.Context(), FileInput{
+	res, err := h.svc.StartFileImport(c.Request.Context(), FileInput{
 		Filename:   fileHeader.Filename,
 		Content:    f,
 		Collection: c.PostForm("collection"),
@@ -131,7 +135,7 @@ func (h *Handler) CreateFile(c *gin.Context) {
 		httpx.Fail(c, mapError(err))
 		return
 	}
-	respondImported(c, doc, existed)
+	respondImported(c, res)
 }
 
 // CreateNote 处理笔记导入：POST /documents/note。
@@ -143,7 +147,7 @@ func (h *Handler) CreateNote(c *gin.Context) {
 		return
 	}
 
-	doc, existed, err := h.svc.ImportNote(c.Request.Context(), NoteInput{
+	res, err := h.svc.StartNoteImport(c.Request.Context(), NoteInput{
 		Title:      req.Title,
 		Content:    req.Content,
 		Collection: req.Collection,
@@ -153,7 +157,7 @@ func (h *Handler) CreateNote(c *gin.Context) {
 		httpx.Fail(c, mapError(err))
 		return
 	}
-	respondImported(c, doc, existed)
+	respondImported(c, res)
 }
 
 // List 返回分页后的文档列表：GET /documents?limit=&offset=&collection=&tag=&status=。
@@ -284,16 +288,23 @@ func (h *Handler) Reindex(c *gin.Context) {
 
 // respondImported 按"是否新建"选择状态码。
 //
-// 201 表示本次真的写入了新记录；200 表示命中既有文档（幂等命中）。
-// 不统一成 200 是为了让调用方能只凭状态码区分"我刚创建了它"与"它本来就在"，
-// 不必解析 body；也不统一成 201 是因为那会让"重复上传"看起来像产生了第二份数据。
-func respondImported(c *gin.Context, doc *Document, existed bool) {
-	view := importedDocumentView{documentView: newDocumentView(doc), Existed: existed}
-	if existed {
+// 202 表示"已受理、任务排队中"：文档此时是 pending，分块要等 worker 跑完。
+// 200 表示命中既有文档（幂等命中）：没有新建任务，也没有任何处理在进行。
+//
+// 为什么不再用 201：201 的语义是"资源创建完成"，而异步导入只完成了
+// "记录与任务落库"这一步。用 201 会让调用方以为可以立刻读分块。
+// 区分 200/202 仍然有意义——只凭状态码就知道"要不要等"。
+func respondImported(c *gin.Context, res *ImportResult) {
+	view := importedDocumentView{
+		documentView: newDocumentView(res.Document),
+		Existed:      res.Existed,
+		JobID:        res.JobID,
+	}
+	if res.Existed {
 		httpx.OK(c, view)
 		return
 	}
-	httpx.Created(c, view)
+	httpx.Accepted(c, view)
 }
 
 func newDocumentView(doc *Document) documentView {

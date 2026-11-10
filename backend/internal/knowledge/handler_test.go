@@ -2,6 +2,7 @@ package knowledge
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
@@ -16,7 +17,7 @@ import (
 
 // newTestEngine 只挂本模块的路由，不引入全局中间件：
 // handler 测试要验证的是"参数与错误码"，request_id / 日志已有单独的测试。
-func newTestEngine(t *testing.T, maxUploadBytes int64) (*gin.Engine, *fakeRepo) {
+func newTestEngine(t *testing.T, maxUploadBytes int64) (*gin.Engine, *fakeRepo, *Service) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	svc, repo, _ := newTestService(maxUploadBytes)
@@ -32,7 +33,24 @@ func newTestEngine(t *testing.T, maxUploadBytes int64) (*gin.Engine, *fakeRepo) 
 	v1.PATCH("/documents/:id", h.Update)
 	v1.DELETE("/documents/:id", h.Delete)
 	v1.POST("/documents/:id/reindex", h.Reindex)
-	return e, repo
+	return e, repo, svc
+}
+
+// processPending 手动跑一遍"后台处理"，等价于 worker 在真实运行时做的事。
+//
+// 契约改成 202 之后，导入接口只写 pending 文档与任务；测试若要看分块、
+// 看 ready 状态，就必须显式走这一步。写成 helper 而不是让接口同步返回，
+// 是为了让"受理"与"执行"的边界在测试里也看得见。
+func processPending(t *testing.T, svc *Service, repo *fakeRepo) {
+	t.Helper()
+	for _, doc := range repo.docs {
+		if doc.Status != StatusPending {
+			continue
+		}
+		if err := svc.ProcessImport(context.Background(), doc.ID); err != nil {
+			t.Fatalf("process pending document %d: %v", doc.ID, err)
+		}
+	}
 }
 
 // envelope 镜像统一响应结构，用来断言"成功/失败都走信封"。
@@ -93,29 +111,53 @@ func doUpload(t *testing.T, e *gin.Engine, filename string, content []byte) (*ht
 	return rec, env
 }
 
+// 导入是"受理 + 后台执行"两段：接口返回 202 时文档还是 pending，
+// 分块要等 worker 跑完。这个用例把两段的边界钉住，
+// 免得以后有人把切分又塞回请求里。
 func TestCreateFileEndpoint(t *testing.T) {
-	e, repo := newTestEngine(t, 1<<20)
+	e, repo, svc := newTestEngine(t, 1<<20)
 
 	rec, env := doUpload(t, e, "guide.md", []byte("# 标题\n\n正文内容。\n"))
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202, body = %s", rec.Code, rec.Body.String())
 	}
 	if env.Code != "OK" {
 		t.Fatalf("envelope code = %q", env.Code)
 	}
 
-	var doc documentView
-	if err := json.Unmarshal(env.Data, &doc); err != nil {
+	var accepted importedDocumentView
+	if err := json.Unmarshal(env.Data, &accepted); err != nil {
 		t.Fatalf("decode document: %v", err)
 	}
-	if doc.ID == 0 || doc.Title != "guide" || doc.Status != StatusReady {
-		t.Fatalf("unexpected document view: %+v", doc)
+	if accepted.ID == 0 || accepted.Title != "guide" {
+		t.Fatalf("unexpected document view: %+v", accepted)
 	}
-	if doc.ChunkCount != 1 {
-		t.Fatalf("chunk_count = %d, want 1", doc.ChunkCount)
+	// 202 的含义：记录与任务已落库，但内容还没处理。
+	if accepted.Status != StatusPending {
+		t.Errorf("status = %s, want pending in the 202 response", accepted.Status)
 	}
-	if _, ok := repo.chunks[doc.ID]; !ok {
-		t.Fatal("chunks should be persisted with the document")
+	if accepted.ChunkCount != 0 {
+		t.Errorf("chunk_count = %d, want 0 before the worker runs", accepted.ChunkCount)
+	}
+	if accepted.JobID == 0 {
+		t.Error("job_id must be returned so the caller can poll")
+	}
+	if len(repo.chunks[accepted.ID]) != 0 {
+		t.Fatal("chunks must not be written inside the HTTP request")
+	}
+
+	// 后台执行段。
+	processPending(t, svc, repo)
+	rec, env = doJSON(t, e, http.MethodGet, fmt.Sprintf("/api/v1/documents/%d", accepted.ID), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detail status = %d", rec.Code)
+	}
+	var ready documentView
+	if err := json.Unmarshal(env.Data, &ready); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if ready.Status != StatusReady || ready.ChunkCount != 1 {
+		t.Fatalf("after processing: status = %s chunk_count = %d", ready.Status, ready.ChunkCount)
 	}
 }
 
@@ -124,11 +166,11 @@ func TestCreateFileEndpoint(t *testing.T) {
 // 三种状态码的分工：201 新建、200 命中既有、409 保留给"撞了唯一索引却读不回
 // 既有记录"这种已无法解释的情况。
 func TestCreateDuplicateReturnsExisting(t *testing.T) {
-	e, repo := newTestEngine(t, 1<<20)
+	e, repo, _ := newTestEngine(t, 1<<20)
 	content := []byte("# 标题\n\n正文内容。\n")
 
 	first, _ := doUpload(t, e, "guide.md", content)
-	if first.Code != http.StatusCreated {
+	if first.Code != http.StatusAccepted {
 		t.Fatalf("first status = %d, body = %s", first.Code, first.Body.String())
 	}
 
@@ -156,7 +198,7 @@ func TestCreateDuplicateReturnsExisting(t *testing.T) {
 
 	// 笔记走同一条规则。
 	noteBody := map[string]string{"content": "# 会议记录\n\n结论。\n"}
-	if rec, _ := doJSON(t, e, http.MethodPost, "/api/v1/documents/note", noteBody); rec.Code != http.StatusCreated {
+	if rec, _ := doJSON(t, e, http.MethodPost, "/api/v1/documents/note", noteBody); rec.Code != http.StatusAccepted {
 		t.Fatalf("first note status = %d", rec.Code)
 	}
 	rec, env = doJSON(t, e, http.MethodPost, "/api/v1/documents/note", noteBody)
@@ -175,7 +217,7 @@ func TestCreateDuplicateReturnsExisting(t *testing.T) {
 }
 
 func TestCreateFileRejectsUnsupportedType(t *testing.T) {
-	e, _ := newTestEngine(t, 1<<20)
+	e, _, _ := newTestEngine(t, 1<<20)
 
 	rec, env := doUpload(t, e, "slides.pdf", []byte("%PDF-1.4"))
 	if rec.Code != http.StatusUnsupportedMediaType {
@@ -187,7 +229,7 @@ func TestCreateFileRejectsUnsupportedType(t *testing.T) {
 }
 
 func TestCreateFileRejectsMissingField(t *testing.T) {
-	e, _ := newTestEngine(t, 1<<20)
+	e, _, _ := newTestEngine(t, 1<<20)
 
 	// 没有 file 字段的 multipart：必须给出明确提示，而不是 500。
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/documents", nil)
@@ -201,7 +243,7 @@ func TestCreateFileRejectsMissingField(t *testing.T) {
 }
 
 func TestCreateFileRejectsOversizedUpload(t *testing.T) {
-	e, _ := newTestEngine(t, 8)
+	e, _, _ := newTestEngine(t, 8)
 
 	rec, env := doUpload(t, e, "big.txt", []byte("123456789"))
 	if rec.Code != http.StatusRequestEntityTooLarge {
@@ -213,12 +255,12 @@ func TestCreateFileRejectsOversizedUpload(t *testing.T) {
 }
 
 func TestCreateNoteEndpoint(t *testing.T) {
-	e, _ := newTestEngine(t, 1<<20)
+	e, _, _ := newTestEngine(t, 1<<20)
 
 	rec, env := doJSON(t, e, http.MethodPost, "/api/v1/documents/note", map[string]string{
 		"content": "# 会议纪要\n\n下周交付。\n",
 	})
-	if rec.Code != http.StatusCreated {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 
@@ -232,7 +274,7 @@ func TestCreateNoteEndpoint(t *testing.T) {
 }
 
 func TestCreateNoteRejectsEmptyContent(t *testing.T) {
-	e, _ := newTestEngine(t, 1<<20)
+	e, _, _ := newTestEngine(t, 1<<20)
 
 	rec, env := doJSON(t, e, http.MethodPost, "/api/v1/documents/note", map[string]string{
 		"content": "   \n\n",
@@ -246,7 +288,7 @@ func TestCreateNoteRejectsEmptyContent(t *testing.T) {
 }
 
 func TestCreateNoteRejectsMalformedJSON(t *testing.T) {
-	e, _ := newTestEngine(t, 1<<20)
+	e, _, _ := newTestEngine(t, 1<<20)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/documents/note", bytes.NewReader([]byte("not json")))
 	req.Header.Set("Content-Type", "application/json")
@@ -259,11 +301,11 @@ func TestCreateNoteRejectsMalformedJSON(t *testing.T) {
 }
 
 func TestListAndDetailEndpoints(t *testing.T) {
-	e, _ := newTestEngine(t, 1<<20)
+	e, _, _ := newTestEngine(t, 1<<20)
 
 	for _, content := range []string{"第一条笔记。", "第二条笔记。"} {
 		if rec, env := doJSON(t, e, http.MethodPost, "/api/v1/documents/note",
-			map[string]string{"content": content}); rec.Code != http.StatusCreated {
+			map[string]string{"content": content}); rec.Code != http.StatusAccepted {
 			t.Fatalf("seed note: status = %d, %s", rec.Code, env.Message)
 		}
 	}
@@ -294,7 +336,7 @@ func TestListAndDetailEndpoints(t *testing.T) {
 }
 
 func TestDetailAndChunksErrorBranches(t *testing.T) {
-	e, _ := newTestEngine(t, 1<<20)
+	e, _, _ := newTestEngine(t, 1<<20)
 
 	// 非整数 id：参数错误，不是 404。
 	if rec, env := doJSON(t, e, http.MethodGet, "/api/v1/documents/abc", nil); rec.Code != http.StatusBadRequest {
@@ -315,10 +357,14 @@ func TestDetailAndChunksErrorBranches(t *testing.T) {
 }
 
 func TestListChunksEndpoint(t *testing.T) {
-	e, _ := newTestEngine(t, 1<<20)
+	e, repo, svc := newTestEngine(t, 1<<20)
 
 	doc := map[string]string{"content": "# 标题\n\n第一段。\n\n## 小节\n\n第二段。"}
 	_, env := doJSON(t, e, http.MethodPost, "/api/v1/documents/note", doc)
+	processPending(t, svc, repo)
+	if _, env = doJSON(t, e, http.MethodGet, "/api/v1/documents/1", nil); env.Code != "OK" {
+		t.Fatalf("detail after processing: %s", env.Message)
+	}
 	var created documentView
 	if err := json.Unmarshal(env.Data, &created); err != nil {
 		t.Fatalf("decode document: %v", err)
@@ -346,9 +392,9 @@ func TestListChunksEndpoint(t *testing.T) {
 }
 
 func TestDeleteEndpoint(t *testing.T) {
-	e, repo := newTestEngine(t, 1<<20)
+	e, repo, _ := newTestEngine(t, 1<<20)
 	if rec, _ := doJSON(t, e, http.MethodPost, "/api/v1/documents/note",
-		map[string]string{"content": "# 待删除\n\n正文。\n"}); rec.Code != http.StatusCreated {
+		map[string]string{"content": "# 待删除\n\n正文。\n"}); rec.Code != http.StatusAccepted {
 		t.Fatalf("create status = %d", rec.Code)
 	}
 
@@ -375,11 +421,13 @@ func TestDeleteEndpoint(t *testing.T) {
 }
 
 func TestReindexEndpoint(t *testing.T) {
-	e, repo := newTestEngine(t, 1<<20)
+	e, repo, svc := newTestEngine(t, 1<<20)
 	if rec, _ := doJSON(t, e, http.MethodPost, "/api/v1/documents/note",
-		map[string]string{"content": "# 标题\n\n第一段。\n\n## 小节\n\n第二段。\n"}); rec.Code != http.StatusCreated {
+		map[string]string{"content": "# 标题\n\n第一段。\n\n## 小节\n\n第二段。\n"}); rec.Code != http.StatusAccepted {
 		t.Fatalf("create status = %d", rec.Code)
 	}
+	// 重索引本身还是同步的（下一笔才切），但前提是文档已经处理完。
+	processPending(t, svc, repo)
 
 	rec, env := doJSON(t, e, http.MethodPost, "/api/v1/documents/1/reindex", nil)
 	if rec.Code != http.StatusOK {
@@ -403,14 +451,14 @@ func TestMapErrorSourceMissing(t *testing.T) {
 }
 
 func TestCreateNoteWithMetadataAndFilterList(t *testing.T) {
-	e, _ := newTestEngine(t, 1<<20)
+	e, _, _ := newTestEngine(t, 1<<20)
 
 	rec, env := doJSON(t, e, http.MethodPost, "/api/v1/documents/note", map[string]any{
 		"content":    "# 带标签\n\n正文。\n",
 		"collection": "工作",
 		"tags":       []string{"go", "检索"},
 	})
-	if rec.Code != http.StatusCreated {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 	var created documentView
@@ -449,7 +497,7 @@ func TestCreateNoteWithMetadataAndFilterList(t *testing.T) {
 }
 
 func TestListRejectsUnknownStatus(t *testing.T) {
-	e, _ := newTestEngine(t, 1<<20)
+	e, _, _ := newTestEngine(t, 1<<20)
 	rec, env := doJSON(t, e, http.MethodGet, "/api/v1/documents?status=whatever", nil)
 	if rec.Code != http.StatusBadRequest || env.Code != "INVALID_ARGUMENT" {
 		t.Fatalf("status = %d code = %q", rec.Code, env.Code)
@@ -457,9 +505,9 @@ func TestListRejectsUnknownStatus(t *testing.T) {
 }
 
 func TestUpdateEndpoint(t *testing.T) {
-	e, _ := newTestEngine(t, 1<<20)
+	e, _, _ := newTestEngine(t, 1<<20)
 	if rec, _ := doJSON(t, e, http.MethodPost, "/api/v1/documents/note",
-		map[string]string{"content": "# 标题\n\n正文。\n"}); rec.Code != http.StatusCreated {
+		map[string]string{"content": "# 标题\n\n正文。\n"}); rec.Code != http.StatusAccepted {
 		t.Fatalf("create status = %d", rec.Code)
 	}
 

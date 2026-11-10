@@ -193,7 +193,15 @@ func run() error {
 		PollInterval:    cfg.Job.PollInterval,
 		RecoverInterval: cfg.Job.RecoverInterval,
 	})
-	// 任务类型 → 处理函数的注册在下面单独一段，业务包之间互不认识。
+	// 任务类型 → 处理函数的注册写在装配层：这是唯一知道"有哪些模块"的地方，
+	// 业务包之间因此不需要互相 import（knowledge 不认识 memory，也不认识 agent）。
+	worker.Register(knowledge.KindDocumentImport, func(ctx context.Context, j *job.Job) error {
+		docID, err := j.DocumentID()
+		if err != nil {
+			return err
+		}
+		return knowledgeSvc.ProcessImport(ctx, docID)
+	})
 
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	workerDone := make(chan struct{})

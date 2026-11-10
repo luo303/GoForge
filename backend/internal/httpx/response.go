@@ -81,6 +81,15 @@ func Created(c *gin.Context, data any) {
 	c.JSON(http.StatusCreated, Envelope{Code: "OK", Message: "success", Data: data, RequestID: RequestID(c)})
 }
 
+// Accepted 返回 202 + 数据，用于"已受理、结果稍后由后台任务产生"。
+//
+// 与 201 的区别不只是数字：201 的语义是"资源已经创建完成"，调用方可以立刻
+// 拿它当最终结果用；202 的语义是"请求被接收，处理还没结束"。异步导入必须用
+// 202——用 201 会让人以为分块已经就绪，实际文档还停在 pending。
+func Accepted(c *gin.Context, data any) {
+	c.JSON(http.StatusAccepted, Envelope{Code: "OK", Message: "accepted", Data: data, RequestID: RequestID(c)})
+}
+
 // Fail 返回错误响应。业务错误会被转换成对应的 HTTP 状态码。
 //
 // 【流程】
