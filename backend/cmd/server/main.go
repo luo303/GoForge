@@ -19,6 +19,7 @@ import (
 
 	"github.com/luo303/mindos/backend/internal/config"
 	"github.com/luo303/mindos/backend/internal/handler"
+	"github.com/luo303/mindos/backend/internal/job"
 	"github.com/luo303/mindos/backend/internal/knowledge"
 	"github.com/luo303/mindos/backend/internal/logging"
 	"github.com/luo303/mindos/backend/internal/middleware"
@@ -30,6 +31,19 @@ import (
 
 // version 可以在编译时注入：go build -ldflags "-X main.version=v0.1.0"
 var version = "dev"
+
+// workerIDFromProcess 生成"谁在跑任务"的标识：主机名 + 进程号。
+//
+// 为什么不用随机 UUID：出问题时要在日志和 jobs.worker_id 里对得上，
+// 主机名 + pid 能直接告诉你去哪台机器、哪个进程看；重启后 pid 变化也符合预期
+// （上一任留下的任务会由补扫收回，不会认错人）。
+func workerIDFromProcess() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "mindos"
+	}
+	return fmt.Sprintf("%s-%d", host, os.Getpid())
+}
 
 // newEngine 装配全局中间件并返回 HTTP 引擎。
 //
@@ -166,6 +180,40 @@ func run() error {
 		cfg.Storage.MaxUploadBytes,
 		log.Named("knowledge"),
 	)
+
+	// 后台任务执行器（Phase 6）：与 HTTP 同一个进程，但生命周期单独管理。
+	//
+	// 它不持有队列——队列就是 jobs 表。所以这里重启、崩溃、多开一个实例，
+	// 看到的都是同一份任务，不存在"队列要同步"这种事。
+	workerID := workerIDFromProcess()
+	worker := job.NewWorker(job.NewRepository(db), log.Named("job"), job.Options{
+		WorkerID:        workerID,
+		Concurrency:     cfg.Job.Workers,
+		Lease:           cfg.Job.Lease,
+		PollInterval:    cfg.Job.PollInterval,
+		RecoverInterval: cfg.Job.RecoverInterval,
+	})
+	// 任务类型 → 处理函数的注册在下面单独一段，业务包之间互不认识。
+
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		_ = worker.Run(workerCtx)
+	}()
+	// 退出顺序很重要：先让 worker 停（把手上任务的终态写完），再关数据库。
+	// defer 后进先出，这一句注册在 ClosePostgres 之后，所以先执行。
+	defer func() {
+		stopWorker()
+		select {
+		case <-workerDone:
+		case <-time.After(cfg.App.ShutdownTimeout):
+			// 有 handler 不响应取消时会走到这里。记 warn 而不是阻塞退出：
+			// 卡死在这个 defer 里，用户看到的是"服务杀不掉"。
+			log.Warn("job worker did not stop before shutdown timeout",
+				zap.Duration("timeout", cfg.App.ShutdownTimeout))
+		}
+	}()
 
 	engine := newEngine(log, cfg.IsDev())
 	router.Register(engine, router.Deps{

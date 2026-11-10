@@ -29,6 +29,7 @@ type Config struct {
 	LLM       LLMConfig
 	Embedding EmbeddingConfig
 	Agent     AgentConfig
+	Job       JobConfig
 }
 
 // AppConfig 控制 HTTP 服务本身。
@@ -135,6 +136,24 @@ type AgentConfig struct {
 	RunTimeout  time.Duration // 单次运行整体超时
 }
 
+// JobConfig 是后台任务执行器的参数（Phase 6）。
+//
+// 放在启动配置里而不是数据库：这些是"这台机器/这个部署跑多快"的运维修量，
+// 不属于业务数据。改它需要重启，也正好让人停下来想清楚要不要调。
+type JobConfig struct {
+	// Workers 是单进程内并发执行的任务数。
+	// 不是越大越好：每个任务都在读 MinIO、写 PostgreSQL，
+	// 并发上去以后瓶颈会从 CPU 移到连接池。
+	Workers int
+	// Lease 是任务租约长度。心跳频率是 Lease/3；
+	// 它同时决定"进程崩了以后多久能被别人接手"。
+	Lease time.Duration
+	// PollInterval 是没活干时的轮询间隔。Phase 16 换成 MQ 唤醒后它只影响兜底扫描。
+	PollInterval time.Duration
+	// RecoverInterval 是补扫间隔，负责把租约过期的任务收回队列。
+	RecoverInterval time.Duration
+}
+
 // IsDev 用于在开发环境输出更详细的错误信息。
 func (c *Config) IsDev() bool { return c.App.Env == "dev" }
 
@@ -202,6 +221,12 @@ func Load() (*Config, error) {
 			MaxSteps:    reader.integer("AGENT_MAX_STEPS", 30),
 			TokenBudget: reader.integer64("AGENT_TOKEN_BUDGET", 200000),
 			RunTimeout:  reader.duration("AGENT_RUN_TIMEOUT", 5*time.Minute),
+		},
+		Job: JobConfig{
+			Workers:         reader.integer("JOB_WORKERS", 2),
+			Lease:           reader.duration("JOB_LEASE", 30*time.Second),
+			PollInterval:    reader.duration("JOB_POLL_INTERVAL", 500*time.Millisecond),
+			RecoverInterval: reader.duration("JOB_RECOVER_INTERVAL", 30*time.Second),
 		},
 	}
 
@@ -283,6 +308,20 @@ func (c *Config) validate() error {
 	}
 	if c.Agent.RunTimeout <= 0 {
 		errs = append(errs, errors.New("AGENT_RUN_TIMEOUT must be greater than 0"))
+	}
+	if c.Job.Workers < 1 || c.Job.Workers > 64 {
+		errs = append(errs, fmt.Errorf("JOB_WORKERS must be between 1 and 64, got %d", c.Job.Workers))
+	}
+	// 租约太短会让"网络抖一下"就丢租约，任务被反复接管又反复中断。
+	// worker 内部也会兜底到 3s，这里提前在启动时报错，避免配置写了却静默无效。
+	if c.Job.Lease < 3*time.Second {
+		errs = append(errs, fmt.Errorf("JOB_LEASE must be at least 3s, got %s", c.Job.Lease))
+	}
+	if c.Job.PollInterval <= 0 {
+		errs = append(errs, errors.New("JOB_POLL_INTERVAL must be greater than 0"))
+	}
+	if c.Job.RecoverInterval <= 0 {
+		errs = append(errs, errors.New("JOB_RECOVER_INTERVAL must be greater than 0"))
 	}
 	// errors.Join 是 Go 1.20 加入的：把多个错误合成一个，报错时一次看全。
 	return errors.Join(errs...)
