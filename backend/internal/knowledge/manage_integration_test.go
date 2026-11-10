@@ -214,7 +214,9 @@ func TestIdempotentImportIntegration(t *testing.T) {
 	// 对象存储的真实读写由 platform 的 MinIO 集成测试覆盖。
 	// 若这里也要求装 MinIO，跑一次数据库集成测试就得启两个容器。
 	store := newFakeStore()
-	svc := NewService(NewRepository(db), store, 1<<20, nil)
+	repo := NewRepository(db)
+	// 取消能力来自 job 仓储：任务表属于 job 包，文档仓储不该重复实现一遍任务 SQL。
+	svc := NewService(repo, store, job.NewRepository(db), 1<<20, nil)
 	ctx := context.Background()
 	text := "# 幂等\n\n同一份内容只应该入库一次。\n"
 

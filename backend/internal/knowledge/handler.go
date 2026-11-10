@@ -298,6 +298,25 @@ func (h *Handler) Reindex(c *gin.Context) {
 	})
 }
 
+// Cancel 请求取消进行中的处理：POST /documents/:id/cancel。
+//
+// 返回 200 + 文档当前状态，而不是 202：取消这个动作本身已经生效
+// （排队中的任务立刻转 cancelled，运行中的已转 cancelling），
+// 用户要的是"现在什么状态"，不是"稍后给你个任务号"。
+func (h *Handler) Cancel(c *gin.Context) {
+	id, err := parseID(c.Param("id"))
+	if err != nil {
+		httpx.Fail(c, err)
+		return
+	}
+	doc, err := h.svc.CancelProcessing(c.Request.Context(), id)
+	if err != nil {
+		httpx.Fail(c, mapError(err))
+		return
+	}
+	httpx.OK(c, newDocumentView(doc))
+}
+
 // respondImported 按"是否新建"选择状态码。
 //
 // 202 表示"已受理、任务排队中"：文档此时是 pending，分块要等 worker 跑完。
@@ -462,6 +481,9 @@ func mapError(err error) error {
 	case errors.Is(err, ErrSourceMissing):
 		return httpx.ErrConflict.WithMessage(
 			"original content of this document is missing, reindex is not possible")
+	case errors.Is(err, ErrNoProcessing):
+		// 没有处理可取消不是参数错误：文档存在，只是当前没在跑。
+		return httpx.ErrConflict.WithMessage("no processing in progress for this document")
 	case errors.Is(err, ErrReindexRunning):
 		// 不是"参数错"，是"同一动作已经在进行中"——409 比 400 更准确。
 		return httpx.ErrConflict.WithMessage("reindex for this document is already running")

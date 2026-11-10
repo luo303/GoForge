@@ -140,6 +140,31 @@ func (r *Repository) MarkFailed(ctx context.Context, documentID int64, code, mes
 	return translateError("mark document failed", err)
 }
 
+// MarkCancelling 把文档置为 cancelling：取消请求已被受理，等 worker 停下后写终态。
+//
+// 与直接写 failed 的区别：任务可能还要一个心跳周期才真正停下，期间文档既不是
+// 成功也不是失败。用"取消中"如实表达这个中间态，比先标失败再改回来诚实。
+func (r *Repository) MarkCancelling(ctx context.Context, documentID int64) error {
+	err := r.db.WithContext(ctx).Model(&Document{}).Where("id = ?", documentID).
+		Updates(map[string]any{
+			"status":     StatusCancelling,
+			"updated_at": time.Now().UTC(),
+		}).Error
+	return translateError("mark document cancelling", err)
+}
+
+// MarkReady 把文档置为 ready（用于重索引被取消：旧分块完好，文档本身没问题）。
+func (r *Repository) MarkReady(ctx context.Context, documentID int64) error {
+	err := r.db.WithContext(ctx).Model(&Document{}).Where("id = ?", documentID).
+		Updates(map[string]any{
+			"status":        StatusReady,
+			"error_code":    nil,
+			"error_message": nil,
+			"updated_at":    time.Now().UTC(),
+		}).Error
+	return translateError("mark document ready", err)
+}
+
 // Get 按主键读取文档，不存在时返回 ErrNotFound。
 func (r *Repository) Get(ctx context.Context, id int64) (*Document, error) {
 	var doc Document

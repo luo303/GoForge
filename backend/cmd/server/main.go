@@ -174,9 +174,14 @@ func run() error {
 	)
 	settings := handler.NewSettingsHandler(cfg)
 
+	// 任务仓储在业务层之前创建：knowledge 需要它来取消进行中的处理，
+	// worker 需要它来领取任务，两者共用同一个对象。
+	jobRepo := job.NewRepository(db)
+
 	knowledgeSvc := knowledge.NewService(
 		knowledge.NewRepository(db),
 		store,
+		jobRepo,
 		cfg.Storage.MaxUploadBytes,
 		log.Named("knowledge"),
 	)
@@ -186,12 +191,25 @@ func run() error {
 	// 它不持有队列——队列就是 jobs 表。所以这里重启、崩溃、多开一个实例，
 	// 看到的都是同一份任务，不存在"队列要同步"这种事。
 	workerID := workerIDFromProcess()
-	worker := job.NewWorker(job.NewRepository(db), log.Named("job"), job.Options{
+	worker := job.NewWorker(jobRepo, log.Named("job"), job.Options{
 		WorkerID:        workerID,
 		Concurrency:     cfg.Job.Workers,
 		Lease:           cfg.Job.Lease,
 		PollInterval:    cfg.Job.PollInterval,
 		RecoverInterval: cfg.Job.RecoverInterval,
+		// 任务被取消后由 worker 通知业务方写终态：取消是异步生效的，
+		// 只有 worker 知道"真的停下来了"这个时刻。
+		OnCancelled: func(ctx context.Context, j *job.Job) {
+			docID, err := j.DocumentID()
+			if err != nil {
+				log.Warn("cancelled job without document id", zap.Int64("job_id", j.ID), zap.Error(err))
+				return
+			}
+			if err := knowledgeSvc.SettleCancelled(ctx, docID, j.Kind == knowledge.KindDocumentReindex); err != nil {
+				log.Warn("settle cancelled document failed",
+					zap.Int64("job_id", j.ID), zap.Int64("document_id", docID), zap.Error(err))
+			}
+		},
 	})
 	// 任务类型 → 处理函数的注册写在装配层：这是唯一知道"有哪些模块"的地方，
 	// 业务包之间因此不需要互相 import（knowledge 不认识 memory，也不认识 agent）。

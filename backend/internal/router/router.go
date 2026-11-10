@@ -67,4 +67,5 @@ func Register(e *gin.Engine, deps Deps) {
 	v1.PATCH("/documents/:id", deps.Knowledge.Update)
 	v1.DELETE("/documents/:id", deps.Knowledge.Delete)
 	v1.POST("/documents/:id/reindex", deps.Knowledge.Reindex)
+	v1.POST("/documents/:id/cancel", deps.Knowledge.Cancel)
 }

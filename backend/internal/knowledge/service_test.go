@@ -135,6 +135,49 @@ func (f *fakeRepo) MarkIndexingWithJob(_ context.Context, documentID int64, j *j
 	return nil
 }
 
+// RequestCancel 复刻"取消该文档未完成任务"：排队的直接 cancelled，
+// 跑着的转 cancelling 等 worker 收手。
+func (f *fakeRepo) RequestCancel(_ context.Context, documentID int64) (int64, job.Kind, job.Status, error) {
+	for i := len(f.jobs) - 1; i >= 0; i-- {
+		j := f.jobs[i]
+		if !j.Status.Active() {
+			continue
+		}
+		if id, ok := j.Payload["document_id"].(int64); !ok || id != documentID {
+			continue
+		}
+		if j.Status == job.StatusQueued {
+			j.Status = job.StatusCancelled
+		} else {
+			j.Status = job.StatusCancelling
+		}
+		return j.ID, j.Kind, j.Status, nil
+	}
+	return 0, "", "", job.ErrNoJob
+}
+
+// MarkCancelling 复刻"取消中"这个中间态。
+func (f *fakeRepo) MarkCancelling(_ context.Context, documentID int64) error {
+	doc, ok := f.docs[documentID]
+	if !ok {
+		return ErrNotFound
+	}
+	doc.Status = StatusCancelling
+	return nil
+}
+
+// MarkReady 复刻"重索引取消后退回 ready"。
+func (f *fakeRepo) MarkReady(_ context.Context, documentID int64) error {
+	doc, ok := f.docs[documentID]
+	if !ok {
+		return ErrNotFound
+	}
+	doc.Status = StatusReady
+	doc.ErrorCode = nil
+	doc.ErrorMessage = nil
+	return nil
+}
+
 // MarkFailed 复刻"写失败状态与原因"。
 func (f *fakeRepo) MarkFailed(_ context.Context, documentID int64, code, message string) error {
 	doc, ok := f.docs[documentID]
@@ -334,7 +377,9 @@ func (f *fakeStore) Remove(_ context.Context, relPath string) error {
 
 func newTestService(maxUploadBytes int64) (*Service, *fakeRepo, *fakeStore) {
 	repo, store := newFakeRepo(), newFakeStore()
-	return NewService(repo, store, maxUploadBytes, nil), repo, store
+	// fakeRepo 同时充当 jobCanceler：假仓储里本来就维护着任务列表，
+	// 再拆一个替身只会让"任务跟着文档变化"这件事分成两处维护。
+	return NewService(repo, store, repo, maxUploadBytes, nil), repo, store
 }
 
 func TestImportFileMarkdown(t *testing.T) {
@@ -1186,7 +1231,7 @@ func TestProcessImportTaskMarksFinalFailure(t *testing.T) {
 	}
 	repo.docs[1] = doc
 	repo.nextID = 1
-	svc := NewService(repo, newFakeStore(), 1<<20, nil)
+	svc := NewService(repo, newFakeStore(), repo, 1<<20, nil)
 
 	err := svc.ProcessImportTask(ctx, 1, 1, 3)
 	if !errors.Is(err, ErrSourceMissing) {
@@ -1217,7 +1262,7 @@ func TestProcessImportTaskKeepsPendingOnRetryableError(t *testing.T) {
 	repo.nextID = 2
 	store := newFakeStore()
 	store.readErr = errors.New("minio: connection reset")
-	svc := NewService(repo, store, 1<<20, nil)
+	svc := NewService(repo, store, repo, 1<<20, nil)
 
 	err := svc.ProcessImportTask(ctx, 2, 1, 3)
 	if err == nil {
@@ -1228,5 +1273,93 @@ func TestProcessImportTaskKeepsPendingOnRetryableError(t *testing.T) {
 	}
 	if doc.ErrorCode != nil {
 		t.Errorf("error_code = %v, want nil before final failure", doc.ErrorCode)
+	}
+}
+
+// 取消导入：文档没成，标 failed 并写明原因；再取消一次返回"没有可取消的处理"。
+func TestCancelProcessingImport(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newTestService(1 << 20)
+
+	res, err := svc.StartNoteImport(ctx, NoteInput{Content: "# 待取消\n\n正文。\n"})
+	if err != nil {
+		t.Fatalf("start note import: %v", err)
+	}
+
+	doc, err := svc.CancelProcessing(ctx, res.Document.ID)
+	if err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if doc.Status != StatusFailed {
+		t.Errorf("status = %s, want failed", doc.Status)
+	}
+	if doc.ErrorCode == nil || *doc.ErrorCode != "cancelled" {
+		t.Errorf("error_code = %v, want cancelled", doc.ErrorCode)
+	}
+
+	if _, err := svc.CancelProcessing(ctx, res.Document.ID); !errors.Is(err, ErrNoProcessing) {
+		t.Fatalf("second cancel error = %v, want ErrNoProcessing", err)
+	}
+}
+
+// 取消重索引：旧分块完好，文档应退回 ready，而不是被标成失败。
+func TestCancelProcessingReindexKeepsReady(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newTestService(1 << 20)
+
+	res, err := svc.StartNoteImport(ctx, NoteInput{Content: "# 标题\n\n正文。\n"})
+	if err != nil {
+		t.Fatalf("start note import: %v", err)
+	}
+	if _, _, err := finishImport(ctx, t, svc, res); err != nil {
+		t.Fatalf("process import: %v", err)
+	}
+	if _, err := svc.StartReindex(ctx, res.Document.ID); err != nil {
+		t.Fatalf("start reindex: %v", err)
+	}
+
+	doc, err := svc.CancelProcessing(ctx, res.Document.ID)
+	if err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if doc.Status != StatusReady {
+		t.Errorf("status = %s, want ready after cancelling a reindex", doc.Status)
+	}
+	if doc.ErrorCode != nil {
+		t.Errorf("error_code = %v, want nil", doc.ErrorCode)
+	}
+}
+
+// 任务正在跑时取消：文档先落"取消中"，终态由 worker 停下后回调写。
+// 不能在这里直接写 failed —— 处理可能刚好完成，两个状态会互相覆盖。
+func TestCancelProcessingRunningMarksCancelling(t *testing.T) {
+	ctx := context.Background()
+	svc, repo, _ := newTestService(1 << 20)
+
+	res, err := svc.StartNoteImport(ctx, NoteInput{Content: "# 跑着的\n\n正文。\n"})
+	if err != nil {
+		t.Fatalf("start note import: %v", err)
+	}
+	// 模拟 worker 已经把任务领走。
+	repo.jobs[0].Status = job.StatusRunning
+
+	doc, err := svc.CancelProcessing(ctx, res.Document.ID)
+	if err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if doc.Status != StatusCancelling {
+		t.Errorf("status = %s, want cancelling while the job is still running", doc.Status)
+	}
+
+	// worker 停下后回调写终态。
+	if err := svc.SettleCancelled(ctx, res.Document.ID, false); err != nil {
+		t.Fatalf("settle cancelled: %v", err)
+	}
+	settled, err := svc.Get(ctx, res.Document.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if settled.Status != StatusFailed || settled.ErrorCode == nil || *settled.ErrorCode != "cancelled" {
+		t.Errorf("settled = %s/%v, want failed/cancelled", settled.Status, settled.ErrorCode)
 	}
 }

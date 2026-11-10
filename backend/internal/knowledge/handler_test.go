@@ -33,6 +33,7 @@ func newTestEngine(t *testing.T, maxUploadBytes int64) (*gin.Engine, *fakeRepo, 
 	v1.PATCH("/documents/:id", h.Update)
 	v1.DELETE("/documents/:id", h.Delete)
 	v1.POST("/documents/:id/reindex", h.Reindex)
+	v1.POST("/documents/:id/cancel", h.Cancel)
 	return e, repo, svc
 }
 
@@ -475,6 +476,39 @@ func TestReindexEndpoint(t *testing.T) {
 	rec, env = doJSON(t, e, http.MethodPost, "/api/v1/documents/1/reindex", nil)
 	if rec.Code != http.StatusConflict || env.Code != "CONFLICT" {
 		t.Fatalf("duplicate reindex: status = %d code = %q, want 409 CONFLICT", rec.Code, env.Code)
+	}
+}
+
+// 取消进行中的导入：200 + 文档变 failed(cancelled)；再取消一次是 409。
+func TestCancelEndpoint(t *testing.T) {
+	e, _, _ := newTestEngine(t, 1<<20)
+
+	rec, env := doJSON(t, e, http.MethodPost, "/api/v1/documents/note",
+		map[string]string{"content": "# 待取消\n\n正文。\n"})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("create status = %d", rec.Code)
+	}
+	var created documentView
+	if err := json.Unmarshal(env.Data, &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	rec, env = doJSON(t, e, http.MethodPost, "/api/v1/documents/1/cancel", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cancel status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var cancelled documentView
+	if err := json.Unmarshal(env.Data, &cancelled); err != nil {
+		t.Fatalf("decode cancelled: %v", err)
+	}
+	if cancelled.Status != StatusFailed || cancelled.ErrorCode != "cancelled" {
+		t.Errorf("status = %s error_code = %s, want failed/cancelled", cancelled.Status, cancelled.ErrorCode)
+	}
+
+	// 已经没有进行中的任务：409 而不是 404——文档还在，只是没得取消。
+	rec, env = doJSON(t, e, http.MethodPost, "/api/v1/documents/1/cancel", nil)
+	if rec.Code != http.StatusConflict || env.Code != "CONFLICT" {
+		t.Fatalf("second cancel: status = %d code = %q, want 409 CONFLICT", rec.Code, env.Code)
 	}
 }
 

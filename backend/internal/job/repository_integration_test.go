@@ -148,7 +148,7 @@ func TestLeaseIntegration(t *testing.T) {
 		}
 		before := *claimed.LeaseExpiresAt
 
-		if err := repo.RenewLease(ctx, claimed.ID, "worker-a", 10*time.Minute); err != nil {
+		if _, err := repo.Heartbeat(ctx, claimed.ID, "worker-a", 10*time.Minute); err != nil {
 			t.Fatalf("renew: %v", err)
 		}
 		after, err := repo.Get(ctx, claimed.ID)
@@ -168,7 +168,7 @@ func TestLeaseIntegration(t *testing.T) {
 		}
 		// 这是"我已被接管"的信号：必须让旧 worker 停下来，
 		// 否则两个进程会同时写同一个文档的分块。
-		if err := repo.RenewLease(ctx, claimed.ID, "worker-b", testLease); !errors.Is(err, ErrLeaseLost) {
+		if _, err := repo.Heartbeat(ctx, claimed.ID, "worker-b", testLease); !errors.Is(err, ErrLeaseLost) {
 			t.Fatalf("renew error = %v, want ErrLeaseLost", err)
 		}
 	})
@@ -184,7 +184,7 @@ func TestLeaseIntegration(t *testing.T) {
 			"UPDATE jobs SET status = 'queued', worker_id = NULL WHERE id = ?", claimed.ID).Error; err != nil {
 			t.Fatalf("requeue: %v", err)
 		}
-		if err := repo.RenewLease(ctx, claimed.ID, "worker-a", testLease); !errors.Is(err, ErrLeaseLost) {
+		if _, err := repo.Heartbeat(ctx, claimed.ID, "worker-a", testLease); !errors.Is(err, ErrLeaseLost) {
 			t.Fatalf("renew error = %v, want ErrLeaseLost after requeue", err)
 		}
 	})
@@ -439,6 +439,81 @@ func TestEnqueueDedupeIntegration(t *testing.T) {
 		}
 		if !created || second.ID == first.ID {
 			t.Fatalf("expected a new job after previous one finished, got created=%v id=%d", created, second.ID)
+		}
+	})
+}
+
+// TestCancelIntegration 覆盖取消的两条路径：
+// 排队中的任务可以直接取消，运行中的只能置 cancelling 等 worker 确认。
+func TestCancelIntegration(t *testing.T) {
+	db := setupJobDB(t)
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	t.Run("排队中的任务取消后立刻是 cancelled", func(t *testing.T) {
+		j := mustEnqueue(t, repo, 50, "document:50:import")
+
+		id, kind, status, err := repo.RequestCancel(ctx, 50)
+		if err != nil {
+			t.Fatalf("request cancel: %v", err)
+		}
+		if id != j.ID || kind != "document.import" {
+			t.Errorf("cancelled job = %d/%s, want %d/document.import", id, kind, j.ID)
+		}
+		if status != StatusCancelled {
+			t.Errorf("status = %s, want cancelled for a queued job", status)
+		}
+		// 不能只信返回值，回查一次确认落库。
+		cancelled, err := repo.Get(ctx, j.ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if cancelled.Status != StatusCancelled || cancelled.FinishedAt == nil {
+			t.Errorf("stored job = %s finished_at=%v, want cancelled with finished_at", cancelled.Status, cancelled.FinishedAt)
+		}
+
+		// 没有进行中的任务了：再取消一次应该明确报"没有"。
+		if _, _, _, err := repo.RequestCancel(ctx, 50); !errors.Is(err, ErrNoJob) {
+			t.Fatalf("second cancel error = %v, want ErrNoJob", err)
+		}
+	})
+
+	t.Run("运行中的任务转 cancelling 由 worker 确认", func(t *testing.T) {
+		j := mustEnqueue(t, repo, 51, "document:51:import")
+		claimed, err := repo.Claim(ctx, "worker-a", testLease)
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		if claimed.ID != j.ID {
+			t.Fatalf("claimed %d, want %d", claimed.ID, j.ID)
+		}
+
+		_, _, status, err := repo.RequestCancel(ctx, 51)
+		if err != nil {
+			t.Fatalf("request cancel: %v", err)
+		}
+		if status != StatusCancelling {
+			t.Errorf("status = %s, want cancelling for a running job", status)
+		}
+
+		// worker 心跳必须能看到 cancelling，才能停手。
+		beatStatus, err := repo.Heartbeat(ctx, claimed.ID, "worker-a", testLease)
+		if err != nil {
+			t.Fatalf("heartbeat: %v", err)
+		}
+		if beatStatus != StatusCancelling {
+			t.Errorf("heartbeat status = %s, want cancelling", beatStatus)
+		}
+
+		if err := repo.Cancel(ctx, claimed.ID, "worker-a"); err != nil {
+			t.Fatalf("cancel: %v", err)
+		}
+		final, err := repo.Get(ctx, claimed.ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if final.Status != StatusCancelled {
+			t.Errorf("status = %s, want cancelled", final.Status)
 		}
 	})
 }

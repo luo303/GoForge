@@ -26,11 +26,12 @@ type HandlerFunc func(ctx context.Context, j *Job) error
 // 这些逻辑可以用内存替身测试——它们的正确性与 SQL 无关，却最容易写错。
 type store interface {
 	Claim(ctx context.Context, workerID string, lease time.Duration) (*Job, error)
-	RenewLease(ctx context.Context, id int64, workerID string, lease time.Duration) error
+	Heartbeat(ctx context.Context, id int64, workerID string, lease time.Duration) (Status, error)
 	Succeed(ctx context.Context, id int64, workerID string) error
 	Fail(ctx context.Context, id int64, workerID, code, message string) error
 	RetryLater(ctx context.Context, id int64, workerID string, delay time.Duration, code, message string) error
 	Release(ctx context.Context, id int64, workerID string) error
+	Cancel(ctx context.Context, id int64, workerID string) error
 	RequeueExpiredLeases(ctx context.Context, grace time.Duration) (int64, error)
 }
 
@@ -63,6 +64,12 @@ type Options struct {
 	// RecoverInterval 是补扫间隔：把租约过期的 running 任务收回队列。
 	// 它是"不出现永远 running"的唯一保险，不能设成 0 关掉。
 	RecoverInterval time.Duration
+	// OnCancelled 在任务被取消后通知业务方收尾（例如把文档从"取消中"改成终态）。
+	//
+	// 为什么需要回调而不是让业务自己处理：取消是异步生效的——请求只把任务置成
+	// cancelling，真正停下来是在 worker 的心跳之后。那一刻只有 worker 知道，
+	// 业务层无法"等一下再写"，否则又会出现取消与完成互相覆盖的竞争。
+	OnCancelled func(ctx context.Context, j *Job)
 }
 
 // Worker 是进程内的任务执行者。
@@ -70,15 +77,16 @@ type Options struct {
 // 它不持有队列：队列就是 jobs 表本身。所以进程重启、多开一个实例，
 // 看到的都是同一份任务，不需要任何"队列同步"。
 type Worker struct {
-	store     store
-	log       *zap.Logger
-	id        string
-	lease     time.Duration
-	poll      time.Duration
-	recover   time.Duration
-	workers   int
-	handlers  map[Kind]HandlerFunc
-	handlersM sync.RWMutex
+	store       store
+	log         *zap.Logger
+	id          string
+	lease       time.Duration
+	poll        time.Duration
+	recover     time.Duration
+	workers     int
+	handlers    map[Kind]HandlerFunc
+	handlersM   sync.RWMutex
+	onCancelled func(ctx context.Context, j *Job)
 }
 
 // NewWorker 创建 worker。handlers 通过 Register 在启动前注册完毕。
@@ -102,14 +110,15 @@ func NewWorker(st store, log *zap.Logger, opts Options) *Worker {
 		opts.WorkerID = "worker"
 	}
 	return &Worker{
-		store:    st,
-		log:      log,
-		id:       opts.WorkerID,
-		lease:    opts.Lease,
-		poll:     opts.PollInterval,
-		recover:  opts.RecoverInterval,
-		workers:  opts.Concurrency,
-		handlers: make(map[Kind]HandlerFunc),
+		store:       st,
+		log:         log,
+		id:          opts.WorkerID,
+		lease:       opts.Lease,
+		poll:        opts.PollInterval,
+		recover:     opts.RecoverInterval,
+		workers:     opts.Concurrency,
+		handlers:    make(map[Kind]HandlerFunc),
+		onCancelled: opts.OnCancelled,
 	}
 }
 
@@ -247,21 +256,27 @@ func (w *Worker) execute(ctx context.Context, j *Job, slot int) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// 心跳发现租约丢失时要单独记一个标记，不能只看 ctx.Err()：
-	// 进程停止同样会让 ctx 变成已取消，但两者该做的事完全不同——
-	// 一个是"把任务放回队列"，一个是"什么都别写"（状态已被接管者改过）。
-	var leaseLost bool
-	var leaseMu sync.Mutex
+	// 心跳的两种结论要分开记：租约丢了（什么都别写）与用户取消（写 cancelled）。
+	// 只看 ctx.Err() 分不出来——进程停止、租约丢失、用户取消都会让 ctx 变成已取消，
+	// 而三者该写的终态完全不同。
+	var (
+		leaseLost bool
+		cancelled bool
+		flagMu    sync.Mutex
+	)
 
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
-		if w.heartbeat(runCtx, j.ID) {
-			leaseMu.Lock()
-			leaseLost = true
-			leaseMu.Unlock()
-			cancel() // 让 handler 尽快停下来
+		lost, cancelRequested := w.heartbeat(runCtx, j.ID)
+		if !lost && !cancelRequested {
+			return
 		}
+		flagMu.Lock()
+		leaseLost = lost
+		cancelled = cancelRequested
+		flagMu.Unlock()
+		cancel() // 让 handler 尽快停下来
 	}()
 
 	fn, ok := w.handlerFor(j.Kind)
@@ -278,22 +293,38 @@ func (w *Worker) execute(ctx context.Context, j *Job, slot int) {
 	cancel() // 让心跳退出
 	<-heartbeatDone
 
-	leaseMu.Lock()
-	lost := leaseLost
-	leaseMu.Unlock()
+	flagMu.Lock()
+	outcome := jobOutcome{err: runErr, leaseLost: leaseLost, cancelled: cancelled}
+	flagMu.Unlock()
 
-	w.finish(ctx, j, slot, runErr, lost)
+	w.finish(ctx, j, slot, outcome)
 }
 
-// heartbeat 周期性续约，返回是否为"租约已丢"。
+// jobOutcome 汇总一条任务跑完之后"为什么结束"。
+//
+// 三个标记而不是一个 error，是因为它们的优先级不同：
+// 租约丢失时我们无权写任何状态；取消要写 cancelled；其余才按成功/失败处理。
+// 用一个 error 表达会让"取消导致的 ctx.Canceled"和"进程停止导致的 ctx.Canceled"
+// 混在一起——那正是最难查的那类 bug。
+type jobOutcome struct {
+	err       error
+	leaseLost bool
+	cancelled bool
+}
+
+// heartbeat 周期性续约，并回报"租约丢失"或"收到取消请求"。
 //
 // 续约失败分两种，处理方式不同：
-//   - ErrLeaseLost：条件更新影响 0 行，说明任务已经不属于自己（被别人接管或已取消），
+//   - ErrLeaseLost：条件更新影响 0 行，说明任务已经不属于自己（被别人接管），
 //     必须立刻停手，否则两个进程会同时写同一份数据。
 //   - 其他错误（网络抖动、数据库瞬时不可用）：继续下一次心跳。
 //     连续失败到租约过期时，数据库层面自然会把任务交给别人；
 //     提前放弃反而会因为一次抖动丢掉正常任务。
-func (w *Worker) heartbeat(ctx context.Context, id int64) bool {
+//
+// 取消走同一个通道是刻意的：取消请求只存在于数据库里（可能由另一个进程发起），
+// 本地没有任何信号能直接唤醒 handler，只能靠心跳这一轮往返发现。代价是
+// 最长一个心跳间隔的延迟，换来的是"不需要跨进程推送"。
+func (w *Worker) heartbeat(ctx context.Context, id int64) (leaseLost, cancelRequested bool) {
 	interval := w.lease / 3
 	if interval <= 0 {
 		interval = time.Second
@@ -304,15 +335,19 @@ func (w *Worker) heartbeat(ctx context.Context, id int64) bool {
 	for {
 		select {
 		case <-ctx.Done():
-			return false
+			return false, false
 		case <-ticker.C:
-			err := w.store.RenewLease(ctx, id, w.id, w.lease)
+			status, err := w.store.Heartbeat(ctx, id, w.id, w.lease)
 			if err == nil {
+				if status == StatusCancelling {
+					w.log.Info("job cancel requested, aborting execution", zap.Int64("job_id", id))
+					return false, true
+				}
 				continue
 			}
 			if errors.Is(err, ErrLeaseLost) {
 				w.log.Warn("job lease lost, aborting execution", zap.Int64("job_id", id))
-				return true
+				return true, false
 			}
 			w.log.Warn("renew job lease failed", zap.Int64("job_id", id), zap.Error(err))
 		}
@@ -321,14 +356,16 @@ func (w *Worker) heartbeat(ctx context.Context, id int64) bool {
 
 // finish 写回终态。
 //
-// 三种结局：
+// 四种结局，优先级从高到低：
 //  1. 租约已丢 → 什么都不写。接管者会负责这条任务，我们写任何状态都是覆盖别人的结果。
-//  2. 进程停止导致的中断 → 放回队列，且不消耗尝试次数（Release 会把 attempts 减回去）。
-//  3. 正常成功/失败 → 落 succeeded / failed，失败带上错误码与原因。
-func (w *Worker) finish(ctx context.Context, j *Job, slot int, runErr error, leaseLost bool) {
-	if leaseLost {
+//  2. 用户取消 → 落 cancelled。handler 大概率返回 ctx.Canceled，但那不是失败。
+//  3. 进程停止导致的中断 → 放回队列，且不消耗尝试次数（Release 会把 attempts 减回去）。
+//  4. 正常成功/失败 → 落 succeeded / failed，失败带上错误码与原因。
+func (w *Worker) finish(ctx context.Context, j *Job, slot int, outcome jobOutcome) {
+	if outcome.leaseLost {
 		return
 	}
+	runErr := outcome.err
 
 	// 写状态时不能直接用外层 ctx：优雅停止的那一刻它已经取消了，
 	// 拿它去 UPDATE 会立刻失败，任务就卡在 running 里等租约过期——
@@ -342,8 +379,26 @@ func (w *Worker) finish(ctx context.Context, j *Job, slot int, runErr error, lea
 		defer cancel()
 	}
 
+	// 取消优先于成功判断：handler 可能在被中断的瞬间碰巧返回 nil，
+	// 但用户按下取消这个事实已经成立，不该再写成 succeeded。
+	if outcome.cancelled {
+		if err := w.store.Cancel(writeCtx, j.ID, w.id); err != nil {
+			w.log.Warn("mark job cancelled failed", zap.Int64("job_id", j.ID), zap.Error(err))
+			return
+		}
+		w.notifyCancelled(writeCtx, j)
+		return
+	}
+
 	if runErr == nil {
 		if err := w.store.Succeed(writeCtx, j.ID, w.id); err != nil {
+			// 收尾瞬间可能刚好被人取消：任务此时已是 cancelling，Succeed 影响 0 行。
+			// 再试一次"按取消处理"，成功说明就是这种情况；失败则是租约已丢，
+			// 由接管者负责，我们什么都不写。
+			if errors.Is(err, ErrLeaseLost) && w.store.Cancel(writeCtx, j.ID, w.id) == nil {
+				w.notifyCancelled(writeCtx, j)
+				return
+			}
 			w.log.Warn("mark job succeeded failed", zap.Int64("job_id", j.ID), zap.Error(err))
 		}
 		return
@@ -383,6 +438,19 @@ func (w *Worker) finish(ctx context.Context, j *Job, slot int, runErr error, lea
 		w.log.Warn("mark job failed failed",
 			zap.Int64("job_id", j.ID), zap.Int("slot", slot), zap.Error(err))
 	}
+}
+
+// notifyCancelled 通知业务方收尾。
+//
+// 用 WithoutCancel：走到这里时任务上下文已经因为取消而失效，
+// 但"把文档状态写对"这件事必须在取消之后仍然完成，否则文档会永久停在"取消中"。
+func (w *Worker) notifyCancelled(ctx context.Context, j *Job) {
+	if w.onCancelled == nil {
+		return
+	}
+	notifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	w.onCancelled(notifyCtx, j)
 }
 
 // ErrUnsupportedKind 由 worker 在"没有注册 handler"时产生，

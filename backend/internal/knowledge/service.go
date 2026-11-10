@@ -40,6 +40,8 @@ var (
 	ErrSourceMissing = errors.New("document source is missing")
 	// ErrInvalidMetadata 表示分类或标签不合法（超长、含分隔符、数量过多）。
 	ErrInvalidMetadata = errors.New("invalid document metadata")
+	// ErrNoProcessing 表示该文档当前没有进行中的处理可以取消。
+	ErrNoProcessing = errors.New("no processing in progress")
 	// ErrReindexRunning 表示同一文档已有未完成的重索引任务。
 	// 与"重复导入"不同，重复导入返回既有文档（幂等），而重索引是"再排队一次"
 	// 的意图——已经排着队了就没必要再来一条，直接告诉调用方在跑。
@@ -76,6 +78,18 @@ type documentRepository interface {
 	MarkIndexingWithJob(ctx context.Context, documentID int64, j *job.Job) error
 	// MarkFailed 记录处理最终失败与原因（Phase 6）。
 	MarkFailed(ctx context.Context, documentID int64, code, message string) error
+	// MarkCancelling 把文档置为"取消中"，等 worker 停下后写终态。
+	MarkCancelling(ctx context.Context, documentID int64) error
+	// MarkReady 把文档置回 ready（重索引被取消时用）。
+	MarkReady(ctx context.Context, documentID int64) error
+}
+
+// jobCanceler 是"取消某个业务对象未完成任务"的能力，由 job.Repository 实现。
+//
+// 定义在消费方（本包）而不是直接用 job.Repository：service 只需要这一个方法，
+// 依赖窄接口能让测试替身少写六个空方法，也让"knowledge 只用 job 的哪部分"一目了然。
+type jobCanceler interface {
+	RequestCancel(ctx context.Context, documentID int64) (jobID int64, kind job.Kind, status job.Status, err error)
 }
 
 // fileStore 是原始文件的存储能力。
@@ -90,7 +104,10 @@ type fileStore interface {
 
 // Service 编排导入流程：校验 → 解析 → 切分 → 落盘 → 落库。
 type Service struct {
-	repo           documentRepository
+	repo documentRepository
+	// jobs 只用于"取消进行中的处理"。受理任务走 repository 的同事务方法，
+	// 那里需要把文档与任务一起写，走 job.Repository 反而要跨两个事务。
+	jobs           jobCanceler
 	store          fileStore
 	maxUploadBytes int64
 	log            *zap.Logger
@@ -102,14 +119,20 @@ type Service struct {
 // log 允许为 nil（测试里常见）：此时退化成不记录。业务逻辑本身不依赖日志，
 // 但"删库成功、删文件失败"这种只能记一笔的情况需要它，所以不做成可选参数
 // 之外的另一套 API。
-func NewService(repo documentRepository, store fileStore, maxUploadBytes int64, log *zap.Logger) *Service {
+func NewService(repo documentRepository, store fileStore, jobs jobCanceler, maxUploadBytes int64, log *zap.Logger) *Service {
 	if maxUploadBytes <= 0 {
 		maxUploadBytes = 10 << 20
 	}
 	if log == nil {
 		log = zap.NewNop()
 	}
-	return &Service{repo: repo, store: store, maxUploadBytes: maxUploadBytes, log: log}
+	return &Service{
+		repo:           repo,
+		store:          store,
+		jobs:           jobs,
+		maxUploadBytes: maxUploadBytes,
+		log:            log,
+	}
 }
 
 // FileInput 是一次文件导入请求。
@@ -560,6 +583,70 @@ func (s *Service) ProcessReindex(ctx context.Context, id int64) error {
 	}
 	// 与导入共用 FinishImport：换分块与置 ready 必须同进同退。
 	return s.repo.FinishImport(ctx, id, chunks)
+}
+
+// CancelProcessing 请求取消某文档进行中的处理。
+//
+// 取消是"请求"而不是"立即生效"：任务在跑时只能置成 cancelling，等 worker 心跳
+// 发现后自己中断——它可能正卡在一次解析里，只有它知道何时能安全停下。
+// 文档状态的收尾分两种情况，取决于任务当时在什么状态：
+//   - 排队中（直接 cancelled）→ 立刻写终态：没有任何东西还在跑；
+//   - 运行中（cancelling）→ 只标"取消中"，终态由 worker 停下后回调写。
+//     这里抢先写 failed 会与"处理其实刚好完成"互相覆盖——实测出现过
+//     failed 但已有分块的半状态，所以收尾必须跟着任务状态的原子转移走。
+//
+// 终态本身取决于被取消的是哪种任务：
+//   - 导入取消 → 这份文档没成，标 failed 并写明原因；
+//   - 重索引取消 → 旧分块完好，退回 ready 才是事实，标失败会让人以为文档坏了。
+func (s *Service) CancelProcessing(ctx context.Context, id int64) (*Document, error) {
+	if _, err := s.repo.Get(ctx, id); err != nil {
+		return nil, err
+	}
+	_, kind, status, err := s.jobs.RequestCancel(ctx, id)
+	if err != nil {
+		if errors.Is(err, job.ErrNoJob) {
+			// 没有进行中的任务：可能是已经完成、已经被取消，或本来就没在处理。
+			// 三种情况对调用方是同一件事——没得取消。
+			return nil, ErrNoProcessing
+		}
+		return nil, err
+	}
+	if status == job.StatusCancelled {
+		// 排队中的任务已被直接取消，没有任何东西还在跑，可以立刻收尾。
+		if err := s.SettleCancelled(ctx, id, kind == KindDocumentReindex); err != nil {
+			return nil, err
+		}
+		return s.repo.Get(ctx, id)
+	}
+
+	// 运行中的任务只能置 cancelling：worker 可能正卡在一次解析里，
+	// 它停下来之后会通过 OnCancelled 回调写终态。这里先如实标"取消中"，
+	// 而不是抢先写 failed —— 那会与"处理其实已经完成了"互相覆盖。
+	if err := s.repo.MarkCancelling(ctx, id); err != nil {
+		return nil, err
+	}
+	return s.repo.Get(ctx, id)
+}
+
+// SettleCancelled 写取消之后的业务终态。由 worker 在任务真正停下后回调，
+// 也在"排队中直接取消"时被 CancelProcessing 调用。
+//
+// 重索引取消 → 退回 ready：旧分块完好，文档本身没问题；
+// 导入取消 → failed + cancelled：这份文档确实没有内容可用。
+func (s *Service) SettleCancelled(ctx context.Context, documentID int64, reindex bool) error {
+	if reindex {
+		return s.repo.MarkReady(ctx, documentID)
+	}
+	doc, err := s.repo.Get(ctx, documentID)
+	if err != nil {
+		return err
+	}
+	if doc.ChunkCount > 0 {
+		// 取消来晚了一步，内容其实已经写完：保留成果比标失败更诚实，
+		// 否则会出现"失败但有分块"的半状态。这条也是取消与完成赛跑时的兜底。
+		return s.repo.MarkReady(ctx, documentID)
+	}
+	return s.repo.MarkFailed(ctx, documentID, "cancelled", "处理已取消")
 }
 
 // sourceText 取出文档的原始正文，供重索引使用。

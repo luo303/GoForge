@@ -25,9 +25,12 @@ type fakeStore struct {
 	failed    map[int64]string // job_id → code
 	failMsg   map[int64]string
 	renewErr  error
-	claimErrs []error // 依次返回的错误，用完后正常领取
-	recovered int     // RequeueExpiredLeases 被调用的次数
-	requeued  int64   // 每次返回的回收条数
+	// heartbeatStatus 是心跳回报的状态；零值视为 running。
+	heartbeatStatus Status
+	cancelled       []int64
+	claimErrs       []error // 依次返回的错误，用完后正常领取
+	recovered       int     // RequeueExpiredLeases 被调用的次数
+	requeued        int64   // 每次返回的回收条数
 }
 
 func newFakeStore(jobs ...*Job) *fakeStore {
@@ -55,10 +58,23 @@ func (f *fakeStore) Claim(ctx context.Context, workerID string, lease time.Durat
 	return j, nil
 }
 
-func (f *fakeStore) RenewLease(ctx context.Context, id int64, workerID string, lease time.Duration) error {
+func (f *fakeStore) Heartbeat(ctx context.Context, id int64, workerID string, lease time.Duration) (Status, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.renewErr
+	if f.renewErr != nil {
+		return "", f.renewErr
+	}
+	if f.heartbeatStatus == "" {
+		return StatusRunning, nil
+	}
+	return f.heartbeatStatus, nil
+}
+
+func (f *fakeStore) Cancel(ctx context.Context, id int64, workerID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelled = append(f.cancelled, id)
+	return nil
 }
 
 func (f *fakeStore) Succeed(ctx context.Context, id int64, workerID string) error {
@@ -329,6 +345,77 @@ func TestWorkerRecoversExpiredLeasesOnStart(t *testing.T) {
 		defer st.mu.Unlock()
 		return st.recovered >= 1
 	})
+}
+
+// 心跳回报 cancelling 时：handler 被中断，任务写 cancelled，
+// 而不是被当成失败去重试。
+func TestWorkerCancelsJobOnRequest(t *testing.T) {
+	st := newFakeStore(&Job{ID: 22, Kind: "document.import", MaxAttempts: 3})
+	st.heartbeatStatus = StatusCancelling
+	aborted := make(chan struct{})
+
+	stop, done := runWorker(t, st, Options{WorkerID: "w1", Lease: 3 * time.Second, PollInterval: 10 * time.Millisecond},
+		func(w *Worker) {
+			w.Register("document.import", func(ctx context.Context, j *Job) error {
+				<-ctx.Done()
+				close(aborted)
+				return ctx.Err()
+			})
+		})
+	defer func() { stop(); <-done }()
+
+	select {
+	case <-aborted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler was not interrupted after cancel request")
+	}
+	waitFor(t, "job cancelled", func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return len(st.cancelled) == 1
+	})
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.retried) != 0 || len(st.failed) != 0 {
+		t.Errorf("cancelled job should not be retried or failed: retried=%v failed=%v",
+			st.retried, st.failed)
+	}
+	if len(st.succeeded) != 0 {
+		t.Error("cancelled job must not be marked succeeded")
+	}
+}
+
+// 取消之后必须回调业务方：否则文档会永久停在"取消中"，
+// 因为 Worker 只写任务状态，不认识文档。
+func TestWorkerNotifiesOnCancelled(t *testing.T) {
+	st := newFakeStore(&Job{ID: 23, Kind: "document.import", MaxAttempts: 3})
+	st.heartbeatStatus = StatusCancelling
+	notified := make(chan int64, 1)
+
+	stop, done := runWorker(t, st, Options{
+		WorkerID:     "w1",
+		Lease:        3 * time.Second,
+		PollInterval: 10 * time.Millisecond,
+		OnCancelled: func(ctx context.Context, j *Job) {
+			notified <- j.ID
+		},
+	}, func(w *Worker) {
+		w.Register("document.import", func(ctx context.Context, j *Job) error {
+			<-ctx.Done()
+			return ctx.Err()
+		})
+	})
+	defer func() { stop(); <-done }()
+
+	select {
+	case id := <-notified:
+		if id != 23 {
+			t.Errorf("notified job = %d, want 23", id)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnCancelled was not called")
+	}
 }
 
 func TestWorkerKeepsRunningWhenClaimFails(t *testing.T) {

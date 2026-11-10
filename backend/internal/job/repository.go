@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"gorm.io/gorm"
@@ -149,23 +150,32 @@ RETURNING *`
 	return &claimed, nil
 }
 
-// RenewLease 为正在执行的任务续约。
+// Heartbeat 续约并回报任务当前状态。
 //
-// WHERE 里带 worker_id 与 status 是关键：如果租约已经过期、任务被别的 worker
-// 接管，或者任务已被取消，这条 UPDATE 影响 0 行。worker 据此得知"我已经不是
-// 这条任务的持有者"，必须停止写入——否则两个进程会同时改同一个文档的分块。
-func (r *Repository) RenewLease(ctx context.Context, id int64, workerID string, lease time.Duration) error {
-	result := r.db.WithContext(ctx).Exec(`
+// 一次查询干两件事，因为这两件事必须在同一时刻成立：续约成功说明"任务还是我的"，
+// 此时读到的状态才可信。分两次查会出现"刚续约成功、状态已经变了"的中间态。
+//
+// WHERE 里带 worker_id 是关键：租约过期被接管、或任务已被置成终态时，
+// 这条 UPDATE 影响 0 行，返回 ErrLeaseLost —— 旧 worker 必须立刻停手，
+// 否则两个进程会同时改同一个文档的分块。
+//
+// 状态范围包含 cancelling：处于取消中的任务仍然属于这个 worker，
+// 它需要继续续约直到 handler 真的停下来，否则租约会先过期、任务被别人捡走。
+func (r *Repository) Heartbeat(ctx context.Context, id int64, workerID string, lease time.Duration) (Status, error) {
+	var status Status
+	err := r.db.WithContext(ctx).Raw(`
 UPDATE jobs SET lease_expires_at = now() + make_interval(secs => ?), updated_at = now()
-WHERE id = ? AND worker_id = ? AND status = 'running'`,
-		lease.Seconds(), id, workerID)
-	if result.Error != nil {
-		return fmt.Errorf("renew lease for job %d: %w", id, result.Error)
+WHERE id = ? AND worker_id = ? AND status IN ('running', 'cancelling')
+RETURNING status`,
+		lease.Seconds(), id, workerID).Scan(&status).Error
+	if err != nil {
+		return "", fmt.Errorf("heartbeat job %d: %w", id, err)
 	}
-	if result.RowsAffected == 0 {
-		return ErrLeaseLost
+	if status == "" {
+		// Scan 找不到行时不报错，只留零值。
+		return "", ErrLeaseLost
 	}
-	return nil
+	return status, nil
 }
 
 // Succeed 把任务标记为成功。
@@ -275,6 +285,61 @@ WHERE status = 'running' AND lease_expires_at IS NOT NULL
 		return 0, fmt.Errorf("requeue expired jobs: %w", result.Error)
 	}
 	return result.RowsAffected, nil
+}
+
+// RequestCancel 为一个业务对象（例如某份文档）的未完成任务请求取消。
+//
+// 返回任务的 id、类型与"取消之后的状态"，调用方据此决定业务侧怎么收尾：
+//   - queued → 直接 cancelled：还没开始跑，取消是即时的；
+//   - running → cancelling：正在跑，只能请求。真正停下要等 worker 心跳发现，
+//     因为它可能正卡在一次解析或一次模型调用里，只有它自己知道何时能安全中断。
+//
+// 按 payload 里的 document_id 找任务，而不是让调用方拼 dedupe_key：
+// 导入任务的 key 用内容哈希（插入前就得成立），重索引用文档 id，
+// 两套规则不该泄漏到业务层的取消逻辑里。jobs 表规模小，jsonb 全扫可以接受。
+func (r *Repository) RequestCancel(ctx context.Context, documentID int64) (int64, Kind, Status, error) {
+	var row struct {
+		ID     int64
+		Kind   Kind
+		Status Status
+	}
+	// CASE 里重复判断 status 是为了让"直接取消"和"请求取消"在同一条语句完成，
+	// 避免先查再改留下的窗口。
+	err := r.db.WithContext(ctx).Raw(`
+UPDATE jobs SET
+    status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancelling' END,
+    finished_at = CASE WHEN status = 'queued' THEN now() ELSE finished_at END,
+    worker_id = CASE WHEN status = 'queued' THEN NULL ELSE worker_id END,
+    lease_expires_at = CASE WHEN status = 'queued' THEN NULL ELSE lease_expires_at END,
+    updated_at = now()
+WHERE id = (
+    SELECT id FROM jobs
+    WHERE payload ->> 'document_id' = ? AND status IN ('queued', 'running')
+    ORDER BY id DESC
+    LIMIT 1
+)
+RETURNING id, kind, status`, strconv.FormatInt(documentID, 10)).Scan(&row).Error
+	if err != nil {
+		return 0, "", "", fmt.Errorf("request cancel for document %d: %w", documentID, err)
+	}
+	if row.ID == 0 {
+		return 0, "", "", ErrNoJob
+	}
+	return row.ID, row.Kind, row.Status, nil
+}
+
+// Cancel 由 worker 在确认停下之后把任务写成终态 cancelled。
+func (r *Repository) Cancel(ctx context.Context, id int64, workerID string) error {
+	result := r.db.WithContext(ctx).Exec(`
+UPDATE jobs SET status = 'cancelled', finished_at = now(), lease_expires_at = NULL, updated_at = now()
+WHERE id = ? AND worker_id = ? AND status IN ('running', 'cancelling')`, id, workerID)
+	if result.Error != nil {
+		return fmt.Errorf("cancel job %d: %w", id, result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return ErrLeaseLost
+	}
+	return nil
 }
 
 // Get 读一条任务，供接口与测试使用。
