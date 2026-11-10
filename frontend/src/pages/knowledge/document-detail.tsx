@@ -9,7 +9,15 @@ import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { StatusPill } from '@/components/status-pill'
 
-import { CHUNK_PAGE_SIZE, formatBytes, formatDate, sourceLabel, splitTags, statusMeta } from './format'
+import {
+  CHUNK_PAGE_SIZE,
+  formatBytes,
+  formatDate,
+  isInFlight,
+  sourceLabel,
+  splitTags,
+  statusMeta,
+} from './format'
 
 type DetailProps = {
   doc: DocumentView
@@ -20,11 +28,13 @@ type DetailProps = {
   editing: boolean
   savingMeta: boolean
   reindexing: boolean
+  cancelling: boolean
   deleting: boolean
   onStartEdit: () => void
   onCancelEdit: () => void
   onSaveMeta: (patch: DocumentPatch) => void
   onReindex: () => void
+  onCancelProcessing: () => void
   onDelete: () => void
 }
 
@@ -42,11 +52,13 @@ export function DocumentDetail({
   editing,
   savingMeta,
   reindexing,
+  cancelling,
   deleting,
   onStartEdit,
   onCancelEdit,
   onSaveMeta,
   onReindex,
+  onCancelProcessing,
   onDelete,
 }: DetailProps) {
   const [confirmingDelete, setConfirmingDelete] = useState(false)
@@ -103,6 +115,13 @@ export function DocumentDetail({
                 {reindexing ? <Loader2 className="animate-spin" aria-hidden="true" /> : <RefreshCw aria-hidden="true" />}
                 {reindexing ? '重新切分中' : '重新切分'}
               </Button>
+              {/* 只在后台处理中才给取消入口：其他状态下按了也只会拿到 409。 */}
+              {isInFlight(doc.status) ? (
+                <Button variant="outline" size="sm" onClick={onCancelProcessing} disabled={cancelling}>
+                  {cancelling ? <Loader2 className="animate-spin" aria-hidden="true" /> : null}
+                  {cancelling ? '取消中' : '取消处理'}
+                </Button>
+              ) : null}
               <Button variant="ghost" size="sm" onClick={() => setConfirmingDelete(true)} disabled={deleting}>
                 <Trash2 aria-hidden="true" />
                 删除

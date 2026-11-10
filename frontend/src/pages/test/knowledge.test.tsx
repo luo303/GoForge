@@ -227,6 +227,39 @@ describe('知识库页面', () => {
     expect(screen.getAllByText('待处理').length).toBeGreaterThan(0)
   })
 
+  it('处理中的文档可以取消，请求打到 cancel 接口', async () => {
+    const user = userEvent.setup()
+    const pending = documentFixture({ id: 11, status: 'pending', chunk_count: 0 })
+    const cancelled = { ...pending, status: 'failed' as const, error_code: 'cancelled', error_message: '处理已取消' }
+
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === '/api/v1/documents/11/cancel' && init?.method === 'POST') {
+        return jsonOk(envelope(cancelled))
+      }
+      if (url === '/api/v1/documents?limit=20&offset=0') {
+        return jsonOk(envelope(documentListFixture([pending])))
+      }
+      if (url === '/api/v1/documents/11') {
+        return jsonOk(envelope(pending))
+      }
+      if (url === '/api/v1/documents/11/chunks?limit=100&offset=0') {
+        return jsonOk(envelope({ items: [], total: 0, limit: 100, offset: 0 }))
+      }
+      return jsonOk({ code: 'NOT_FOUND', message: url }, 404)
+    })
+
+    renderApp('/knowledge')
+    await screen.findByText('集成测试笔记')
+
+    await user.click(await screen.findByRole('button', { name: '取消处理' }))
+
+    await vi.waitFor(() => {
+      const call = fetchMock.mock.calls.find(([url]) => String(url) === '/api/v1/documents/11/cancel')
+      expect(call).toBeDefined()
+    })
+  })
+
   it('取消后关闭面板且不发导入请求', async () => {
     const user = userEvent.setup()
     mockHappyPath(documentFixture(), '正文')

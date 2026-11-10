@@ -3,6 +3,7 @@ import { BookOpen, Loader2, NotebookPen, Upload, X } from 'lucide-react'
 import { useRef, useState, type ChangeEvent } from 'react'
 
 import {
+  cancelProcessing,
   createNote,
   deleteDocument,
   documentKeys,
@@ -134,6 +135,12 @@ export function KnowledgePage() {
     mutationFn: () => reindexDocument(activeId as number),
     onSuccess: invalidateDocuments,
   })
+  const cancelMutation = useMutation({
+    mutationFn: () => cancelProcessing(activeId as number),
+    // 取消成功后不额外改本地状态：文档状态由后端写，轮询会把它带到终态，
+    // 本地再猜一次只会出现"页面说已取消、库里还是 cancelling"的短暂矛盾。
+    onSuccess: invalidateDocuments,
+  })
 
   const onFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
@@ -160,7 +167,8 @@ export function KnowledgePage() {
     setSelectedId(null)
   }
 
-  const actionError = updateMutation.error ?? deleteMutation.error ?? reindexMutation.error
+  const actionError =
+    updateMutation.error ?? deleteMutation.error ?? reindexMutation.error ?? cancelMutation.error
   // 有筛选条件时的空结果与"一条文档都没有"是两种状态，文案要分开。
   const isFiltered = filters.collection !== '' || filters.tag !== '' || filters.status !== ''
 
@@ -311,12 +319,14 @@ export function KnowledgePage() {
               chunksLoading={chunksQuery.isPending}
               savingMeta={updateMutation.isPending}
               reindexing={reindexMutation.isPending}
+              cancelling={cancelMutation.isPending}
               deleting={deleteMutation.isPending}
               editing={editingId === detailQuery.data.id}
               onStartEdit={() => setEditingId(detailQuery.data.id)}
               onCancelEdit={() => setEditingId(null)}
               onSaveMeta={(patch) => updateMutation.mutate(patch)}
               onReindex={() => reindexMutation.mutate()}
+              onCancelProcessing={() => cancelMutation.mutate()}
               onDelete={() => deleteMutation.mutate()}
             />
           )}

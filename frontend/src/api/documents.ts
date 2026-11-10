@@ -160,6 +160,19 @@ export function deleteDocument(id: number): Promise<{ id: number }> {
  * Phase 6 起是异步的：返回 202 + job_id，文档先置 indexing，分块由 worker 重算。
  * 所以不再给 60s 超时——请求里只剩"建任务"这一步。
  */
+/**
+ * 取消进行中的处理。
+ *
+ * 返回 200 + 文档当前状态：排队中的任务已被置为 cancelled，运行中的已置为
+ * cancelling（等 worker 心跳发现后停手）。所以调用方拿到的状态可能仍是"进行中"，
+ * 页面靠轮询自然过渡到终态。
+ */
+export async function cancelProcessing(id: number): Promise<DocumentView> {
+  return normalizeDocument(
+    await apiRequest<WireDocumentView>(`/documents/${id}/cancel`, { method: 'POST' }),
+  )
+}
+
 export async function reindexDocument(id: number): Promise<ImportedDocumentView> {
   return normalizeImported(
     await apiRequest<WireDocumentView & { existed?: boolean; job_id?: number }>(
