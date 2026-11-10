@@ -70,7 +70,7 @@ npm run build
 | P3 | 前端工程与产品骨架 | 六页空壳、统一 API 客户端、系统状态页可用 |
 | P4 | 文本文档入库 | Markdown/TXT/笔记可同步解析、切分、查看 |
 | P5 | 文档管理可靠性 | 重复导入复用既有文档，删除与重索引不留脏数据 |
-| P6 | 本地异步任务 | 文档任务可排队、重试、取消，重启后可恢复；知识页内可看到进度与失败原因 |
+| P6 | 本地异步任务 | 文档任务可排队、重试、取消，重启后可恢复；知识页内可看到进度与失败原因（已完成） |
 | P7 | Embedding 与向量索引 | 向量可批量生成、重建，失败不留下半截索引；模型可配置且换模型有重建路径 |
 | P8 | 混合检索与引用定位 | 全文 + 向量 + RRF 可评测，搜索页可用，结果可回到原文高亮 |
 | P9 | RAG 问答与知识闭环 | 回答有真实引用，无依据时明确拒答；单轮问答页面完整可用 |
@@ -248,7 +248,7 @@ npm run build
 - 门槛：前端 `lint` / `test`（39 用例，新增 3 条）/ `build` 全绿；后端未改动，无需重跑。
 - 已知限制：上传面板不校验文件类型与大小，仍由后端返回 415 / 413 后由页面提示。
 
-## Phase 6 本地异步任务
+## Phase 6 本地异步任务（已完成，2026-11-10）
 
 **目标**：将耗时导入与重索引移出 HTTP 请求，靠 PostgreSQL 建立可恢复的任务语义，并把任务状态做成知识页里能看、能操作的功能，不急于引入 MQ。
 
@@ -281,6 +281,27 @@ npm run build
 4. 运行中点击取消，再刷新页面：状态一致，不回到 running。
 
 **退出标准**：上述四类故障演练全部通过且任务状态可解释、可恢复；六条完成标准同时满足。
+
+**验收记录（2026-11-10）**
+
+- **迁移**：`0003_jobs`，一次建全而不是逐阶段加列。三处约束/索引各有明确用途：状态机 CHECK、部分唯一索引 `(kind, dedupe_key) where status in ('queued','running')` 负责去重、`(run_after)` 与 `(lease_expires_at)` 两条部分索引让领取与补扫只扫"待办"。
+- **契约**：`POST /documents`、`/documents/note`、`/documents/:id/reindex` 均改为 **202 + job_id**，文档先落 `pending` / `indexing`；`POST /documents/:id/cancel` 返回 200 + 文档状态，没有进行中的处理时 409。幂等命中仍是 200 + `existed`，且不建任务。
+- **队列语义**：领取用一条 `UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1)`，判断与改状态同一条语句；`attempts` 在领取时 +1（崩溃那次也算尝试）；心跳每 `lease/3` 一次并回报状态；退避 3s·2^n 封顶 5 分钟并叠加 ±25% 抖动；不可恢复错误（类型不支持、编码错误、元信息非法、原文丢失、文档不存在、任务类型未注册）直接判失败，不占重试名额。
+- **任务与文档的两次同事务写入**：`CreateWithJob`（文档 + 任务）与 `FinishImport`（换分块 + 置 ready）。前者避免"有文档没任务"，后者避免"显示成功但内容是空"。
+- **错误可解释**：`documents.error_code` 与 `jobs.last_error_code` 记同一个码（业务错误实现 `JobErrorCode`，worker 只搬运）。已有码：`unsupported_type`、`empty_document`、`not_utf8`、`invalid_metadata`、`source_missing`、`storage_unavailable`、`document_not_found`、`cancelled`、`process_failed`。前端详情页在失败时就地显示原因。
+- **故障演练（2026-11-10 20:19 起，隔离库 `mindos_drill`，服务跑在 `:18080`）**
+
+| 演练 | 操作 | 观察结果 |
+|---|---|---|
+| kill -9 | 导入返回 202 后立刻 `kill -9`，重启 | 任务从 `queued/a0` 继续，重启后 `succeeded/a1`，文档 `ready` |
+| 执行中死亡 | 直接插入一条 `running` + 租约过期 10 分钟的僵尸任务，重启 | 补扫 1 次将其收回，另一 worker 领走并 `succeeded`，文档 `ready` |
+| 停 PostgreSQL | 服务运行中 `docker stop mindos-postgres`，2 秒后恢复 | 进程不退出；`healthz=200`（存活不看依赖）、`readyz=503`；worker 12 次领取失败只 warn；恢复后 `healthz=200`、导入返回 202 |
+| 停 MinIO | 上传文件后 `docker stop mindos-minio`，再发起重索引 | 重试 2 次后任务 `failed`、`attempts=3`，任务与文档的 code 都是 `storage_unavailable`；恢复 MinIO 后重新切分成功，`ready` 且 `chunk_count=1` |
+| 运行中取消 | 导入后立刻取消 | 返回 200；任务 `cancelled`；文档 `failed` + `cancelled` + 0 分块，两秒后状态不再变化 |
+
+- **演练中修掉的两个真实缺陷**：① 原先取消直接写 `failed`，若 worker 刚好写完分块，会留下"失败但有分块"的半状态；改为运行中只标 `cancelling`，终态由 worker 停下后回调写，回调发现分块已存在则保留成果置 `ready`。② 原先 MinIO 不可用被记成 `handler_error` / `process_failed`，看不出是存储问题；新增 `ErrStorageUnavailable` 与 `storage_unavailable` 码，并让任务表复用同一码。
+- **门禁**：后端 `go build ./...` / `go vet ./...` / `go test -race -count=1 ./...` 全绿；带 `MINDOS_TEST_DSN` 时真实库集成用例通过（job 包新增退避、取消、接管；knowledge 包新增两段式、失败原因、取消收尾）。前端 `lint` / `test`（41 用例）/ `build` 全绿。
+- **已知限制**：① worker 只在进程内，多实例靠租约互斥而不是分区，规模上去后需要按 kind 分队列；② 空闲时仍按 `JOB_POLL_INTERVAL`（默认 500ms）轮询，Phase 16 换成 MQ 唤醒；③ 按 `payload->>'document_id'` 取消会全表扫 jsonb，单用户量级可接受，任务表变大后需要加表达式索引；④ kill -9 演练中任务恰好已完成（`queued` 状态被杀），"执行中死亡"的真实接管由僵尸任务那一条覆盖；⑤ 取消与完成赛跑时，若内容已写完则保留成果（`ready`），此时任务记 `cancelled`、文档记 `ready`，两者语义不同但都如实。
 
 ## Phase 7 Embedding 与向量索引
 

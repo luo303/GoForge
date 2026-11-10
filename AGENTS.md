@@ -22,7 +22,7 @@
 
 技术主线：Go + Gin + GORM + PostgreSQL 16（pgvector）+ RabbitMQ + Redis（按需）+ Eino ADK；前端 React + TypeScript + Vite + Tailwind + shadcn/ui。
 
-**当前进度：Phase 1–5 已完成（2026-11-09），下一步先补 P5 已知尾巴（上传入口分类/标签），再进 Phase 6 本地异步任务。** 原文只存 MinIO（无本地目录备选）；已有文档幂等导入、删除、重索引、分类标签筛选，尚无向量与检索。2026-11-10 起阶段粒度改为"一个阶段一个功能、做完整做可靠"，完成标准见 `docs/plan.md` §2。设计见 `docs/design/overview.md`。
+**当前进度：Phase 1–6 已完成（2026-11-10），下一步 Phase 7 Embedding 与向量索引。** 原文只存 MinIO；导入/重索引已异步化（jobs 表 + 进程内 worker + 租约 + 退避重试 + 取消 + 崩溃补扫），尚无向量与检索。阶段粒度自 2026-11-10 起为"一个阶段一个功能、做完整做可靠"，完成标准见 `docs/plan.md` §2。设计见 `docs/design/overview.md`。
 
 ## 2. 仓库结构与命令
 
