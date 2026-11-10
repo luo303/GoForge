@@ -154,12 +154,17 @@ export function deleteDocument(id: number): Promise<{ id: number }> {
   return apiRequest<{ id: number }>(`/documents/${id}`, { method: 'DELETE' })
 }
 
-export async function reindexDocument(id: number): Promise<DocumentView> {
-  // 重索引要在服务端重新解析整篇原文，比普通请求慢，给到 60s。
-  return normalizeDocument(
-    await apiRequest<WireDocumentView>(`/documents/${id}/reindex`, {
-      method: 'POST',
-      timeoutMs: 60_000,
-    }),
+/**
+ * 发起重新切分。
+ *
+ * Phase 6 起是异步的：返回 202 + job_id，文档先置 indexing，分块由 worker 重算。
+ * 所以不再给 60s 超时——请求里只剩"建任务"这一步。
+ */
+export async function reindexDocument(id: number): Promise<ImportedDocumentView> {
+  return normalizeImported(
+    await apiRequest<WireDocumentView & { existed?: boolean; job_id?: number }>(
+      `/documents/${id}/reindex`,
+      { method: 'POST' },
+    ),
   )
 }
