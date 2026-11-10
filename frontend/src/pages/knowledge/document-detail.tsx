@@ -74,6 +74,13 @@ export function DocumentDetail({
             </span>
           </CardDescription>
           <CardDescription className="font-mono text-xs break-all">sha256: {doc.content_hash}</CardDescription>
+          {/* 失败原因必须就地可见：让用户为了一句"处理失败"去翻后端日志是不合理的。 */}
+          {doc.status === 'failed' && doc.error_message ? (
+            <p role="alert" className="text-destructive text-xs break-words">
+              处理失败：{doc.error_message}
+              {doc.error_code ? `（${doc.error_code}）` : ''}
+            </p>
+          ) : null}
         </CardHeader>
 
         <CardContent className="space-y-3">

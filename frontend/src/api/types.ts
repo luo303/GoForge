@@ -79,6 +79,9 @@ export type DocumentView = {
   tags: string[]
   status: DocumentStatus
   chunk_count: number
+  /** 处理最终失败时才有值；成功响应里这两个字段不出现 */
+  error_code?: string
+  error_message?: string
   created_at: string
   updated_at: string
 }
