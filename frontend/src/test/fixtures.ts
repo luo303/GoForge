@@ -18,6 +18,7 @@ export function systemStatusFixture(overrides: Partial<SystemStatus> = {}): Syst
     version: 'test-1',
     postgres: { status: 'up' },
     pgvector: { status: 'up' },
+    storage: { status: 'up' },
     migration: { state: 'ok', current_version: 1, latest_version: 1, dirty: false },
     ...overrides,
   }

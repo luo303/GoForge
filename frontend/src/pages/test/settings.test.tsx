@@ -40,13 +40,40 @@ describe('设置页', () => {
     renderApp('/settings')
 
     expect(await screen.findByText('PostgreSQL')).toBeInTheDocument()
-    // postgres 与 pgvector 都是 up
-    expect(screen.getAllByText('正常')).toHaveLength(2)
+    // postgres、pgvector、对象存储三项都是 up
+    expect(screen.getAllByText('正常')).toHaveLength(3)
+    expect(screen.getByText('对象存储 MinIO')).toBeInTheDocument()
     expect(screen.getByText('已是最新')).toBeInTheDocument()
     expect(screen.getByText(/当前版本 1 \/ 代码最新 1/)).toBeInTheDocument()
     expect(screen.getByText('gpt-test · sk-1****wxyz')).toBeInTheDocument()
     expect(screen.getByText('未配置模型 · 未配置')).toBeInTheDocument()
     expect(screen.getByText('200,000')).toBeInTheDocument()
+  })
+
+  it('对象存储故障时单独报出，不牵连其他依赖', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string) => {
+        if (input.endsWith('/system/status')) {
+          return jsonResponse(
+            envelope(
+              systemStatusFixture({
+                storage: { status: 'down', detail: 'endpoint unreachable or credentials rejected' },
+              }),
+            ),
+          )
+        }
+        return jsonResponse(envelope(settingsFixture()))
+      }),
+    )
+
+    renderApp('/settings')
+
+    expect(await screen.findByText('对象存储 MinIO')).toBeInTheDocument()
+    // 只剩 postgres 与 pgvector 是"正常"
+    expect(screen.getAllByText('正常')).toHaveLength(2)
+    expect(screen.getByText('不可用')).toBeInTheDocument()
+    expect(screen.getByText('endpoint unreachable or credentials rejected')).toBeInTheDocument()
   })
 
   it('后端未启动时两块卡片各自给出失败原因和重试入口', async () => {

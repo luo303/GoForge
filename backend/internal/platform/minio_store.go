@@ -58,6 +58,27 @@ func (s *MinIOStore) Endpoint() string { return s.endpoint }
 // Bucket 返回 bucket 名，供启动日志与 /settings 展示。
 func (s *MinIOStore) Bucket() string { return s.bucket }
 
+// Health 探测对象存储当前是否可用，供 /system/status 诊断用。
+//
+// 返回 (true, nil) 表示端点可达、凭据有效、bucket 还在；
+// (false, nil) 表示能连上但 bucket 不在了（被删了、或连到另一个空实例）——
+// 这是"部署状态不对"，不是网络故障，所以不当 error 处理；
+// 只有真的连不上/认证失败才返回 err。
+//
+// 这里故意不复用 ensureBucket：诊断接口的职责是如实报告，
+// 如果它顺手把 bucket 重建了，运维看到的永远是"正常"，
+// 而 bucket 被删的原因（挂错卷、换错 endpoint）就再也查不出来。
+func (s *MinIOStore) Health(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	exists, err := s.client.BucketExists(ctx, s.bucket)
+	if err != nil {
+		return false, fmt.Errorf("check bucket %q on %s: %w", s.bucket, s.endpoint, err)
+	}
+	return exists, nil
+}
+
 // ensureBucket 建 bucket（已存在则跳过）。
 func (s *MinIOStore) ensureBucket(ctx context.Context) error {
 	exists, err := s.client.BucketExists(ctx, s.bucket)

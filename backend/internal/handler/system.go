@@ -23,6 +23,10 @@ type MigrationInfo struct {
 // handler 会把这种状态如实标为 unknown，而不是猜一个结果。
 type MigrationStatusFunc func(ctx context.Context) (MigrationInfo, error)
 
+// StorageCheckFunc 检查对象存储（MinIO）是否可用。
+// (false, nil) = 端点可达但 bucket 不存在；(_, err) = 端点不可达或凭据失效。
+type StorageCheckFunc func(ctx context.Context) (bucketExists bool, err error)
+
 // SystemHandler 提供 /system/status 诊断接口。
 //
 // 与 healthz/readyz 的分工：探针回答"活没活、能不能接流量"（给编排系统看）；
@@ -33,21 +37,24 @@ type SystemHandler struct {
 	dbPing  PingFunc
 	vector  VectorCheckFunc
 	migrate MigrationStatusFunc
+	storage StorageCheckFunc
 }
 
-// NewSystemHandler 创建诊断 handler。三个检查函数都可独立为 nil（对应能力降级），
+// NewSystemHandler 创建诊断 handler。四个检查函数都可独立为 nil（对应能力降级），
 // 为 nil 时该项输出 unknown，而不是让接口整体失败。
 func NewSystemHandler(
 	version string,
 	dbPing PingFunc,
 	vector VectorCheckFunc,
 	migrate MigrationStatusFunc,
+	storage StorageCheckFunc,
 ) *SystemHandler {
 	return &SystemHandler{
 		version: version,
 		dbPing:  dbPing,
 		vector:  vector,
 		migrate: migrate,
+		storage: storage,
 	}
 }
 
@@ -71,16 +78,18 @@ type SystemStatusResponse struct {
 	Version   string           `json:"version"`
 	Postgres  DependencyStatus `json:"postgres"`
 	PGVector  DependencyStatus `json:"pgvector"`
+	Storage   DependencyStatus `json:"storage"`
 	Migration MigrationStatus  `json:"migration"`
 }
 
-// Status 汇总数据库、pgvector、迁移三项诊断信息。
+// Status 汇总数据库、pgvector、对象存储、迁移四项诊断信息。
 func (h *SystemHandler) Status(c *gin.Context) {
 	ctx := c.Request.Context()
 	httpx.OK(c, SystemStatusResponse{
 		Version:   h.version,
 		Postgres:  h.checkPostgres(ctx),
 		PGVector:  h.checkVector(ctx),
+		Storage:   h.checkStorage(ctx),
 		Migration: h.checkMigration(ctx),
 	})
 }
@@ -106,6 +115,27 @@ func (h *SystemHandler) checkVector(ctx context.Context) DependencyStatus {
 		return DependencyStatus{Status: "unknown", Detail: "database unreachable"}
 	case !present:
 		return DependencyStatus{Status: "missing", Detail: "run `go run ./cmd/migrate up` to enable pgvector"}
+	default:
+		return DependencyStatus{Status: "up"}
+	}
+}
+
+// checkStorage 检查对象存储。这项在 Phase 4 之前不存在——
+// 当时原文落本地磁盘，磁盘几乎不会"连不上"；换成 MinIO 后它成了
+// 会独立坏掉的外部依赖，而且坏掉的表现是"上传/重索引 500"，
+// 不在这里单独报出来，就只能靠翻日志猜。
+func (h *SystemHandler) checkStorage(ctx context.Context) DependencyStatus {
+	if h.storage == nil {
+		return DependencyStatus{Status: "unknown", Detail: "check not configured"}
+	}
+	exists, err := h.storage(ctx)
+	switch {
+	case err != nil:
+		return DependencyStatus{Status: "down", Detail: "endpoint unreachable or credentials rejected"}
+	case !exists:
+		// bucket 缺失不需要手工修：服务启动时会自动建，
+		// 但"为什么会缺"值得人看一眼（挂错卷、连到了别的实例）。
+		return DependencyStatus{Status: "missing", Detail: "bucket not found; restart to recreate, or check MINIO_BUCKET"}
 	default:
 		return DependencyStatus{Status: "up"}
 	}

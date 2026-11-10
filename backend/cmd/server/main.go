@@ -119,6 +119,18 @@ func run() error {
 			zap.Bool("dirty", st.Dirty))
 	}
 
+	// 文档原文存储：只有 MinIO 一种实现，没有本地目录备选。
+	// 启动时就建连并确保 bucket 存在：端点不通、凭据不对属于"部署错了"，
+	// 要让服务直接起不来，而不是等用户第一次上传才看到 500。
+	store, err := platform.NewMinIOStore(ctx, cfg.Storage.MinIO)
+	if err != nil {
+		return err
+	}
+	log.Info("document storage ready",
+		zap.String("endpoint", store.Endpoint()),
+		zap.String("bucket", store.Bucket()),
+	)
+
 	system := handler.NewSystemHandler(
 		version,
 		func(ctx context.Context) error {
@@ -142,20 +154,11 @@ func run() error {
 				Dirty:   st.Dirty,
 			}, nil
 		},
+		// 运行期复查 MinIO：启动成功不代表一直可用，
+		// 容器被 OOM、卷被卸载、网络分区都会让它中途变坏。
+		store.Health,
 	)
 	settings := handler.NewSettingsHandler(cfg)
-
-	// 文档原文存储：只有 MinIO 一种实现，没有本地目录备选。
-	// 启动时就建连并确保 bucket 存在：端点不通、凭据不对属于"部署错了"，
-	// 要让服务直接起不来，而不是等用户第一次上传才看到 500。
-	store, err := platform.NewMinIOStore(ctx, cfg.Storage.MinIO)
-	if err != nil {
-		return err
-	}
-	log.Info("document storage ready",
-		zap.String("endpoint", store.Endpoint()),
-		zap.String("bucket", store.Bucket()),
-	)
 
 	knowledgeSvc := knowledge.NewService(
 		knowledge.NewRepository(db),

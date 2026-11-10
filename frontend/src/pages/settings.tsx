@@ -123,6 +123,12 @@ function SystemStatusCard({ status }: { status: SystemStatus }) {
           detail={status.pgvector.detail}
           pill={<StatusPill tone={dependencyPill[status.pgvector.status].tone}>{dependencyPill[status.pgvector.status].label}</StatusPill>}
         />
+        {/* 原文都在这一个 bucket 里，它坏了上传与重索引都会失败 */}
+        <StatusRow
+          label="对象存储 MinIO"
+          detail={status.storage.detail}
+          pill={<StatusPill tone={dependencyPill[status.storage.status].tone}>{dependencyPill[status.storage.status].label}</StatusPill>}
+        />
         <StatusRow
           label="数据库迁移"
           detail={migrationDetail(status.migration)}

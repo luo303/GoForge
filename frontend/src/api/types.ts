@@ -30,6 +30,8 @@ export type SystemStatus = {
   version: string
   postgres: DependencyStatus
   pgvector: DependencyStatus
+  /** 对象存储（MinIO）：missing = 能连上但 bucket 不在了 */
+  storage: DependencyStatus
   migration: MigrationStatus
 }
 
