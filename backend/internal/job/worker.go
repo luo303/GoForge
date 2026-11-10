@@ -411,10 +411,8 @@ func (w *Worker) finish(ctx context.Context, j *Job, slot int, outcome jobOutcom
 		return
 	}
 
-	code := "handler_error"
-	if errors.Is(runErr, ErrUnsupportedKind) {
-		code = "unsupported_kind"
-	}
+	// 错误码由错误自己带（业务侧实现 JobErrorCode），worker 不猜业务语义。
+	code := ErrorCode(runErr)
 
 	// 还能再试就退避重排，而不是直接判死。
 	// 判定与"业务层要不要标记文档失败"共用 ShouldRetry，避免出现

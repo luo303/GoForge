@@ -1363,3 +1363,36 @@ func TestCancelProcessingRunningMarksCancelling(t *testing.T) {
 		t.Errorf("settled = %s/%v, want failed/cancelled", settled.Status, settled.ErrorCode)
 	}
 }
+
+// 存储不可用与原文丢失必须区分：前者重试或恢复 MinIO 后能好，后者只能重新导入。
+// 重试次数用尽时落库的错误码要能把这两件事分开。
+func TestProcessImportTaskReportsStorageUnavailable(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepo()
+	path := "documents/abc"
+	doc := &Document{
+		ID: 3, Title: "存储不可用", MIME: MIMEMarkdown, ContentHash: "feedface",
+		SourceType: SourceFile, StoragePath: &path, Status: StatusPending,
+	}
+	repo.docs[3] = doc
+	repo.nextID = 3
+	store := newFakeStore()
+	store.readErr = errors.New("dial tcp: connection refused")
+	svc := NewService(repo, store, repo, 1<<20, nil)
+
+	// attempts == max：这次之后不再重试。
+	err := svc.ProcessImportTask(ctx, 3, 3, 3)
+	if !errors.Is(err, ErrStorageUnavailable) {
+		t.Fatalf("error = %v, want ErrStorageUnavailable", err)
+	}
+	if doc.Status != StatusFailed {
+		t.Errorf("status = %s, want failed after retries exhausted", doc.Status)
+	}
+	if doc.ErrorCode == nil || *doc.ErrorCode != "storage_unavailable" {
+		t.Errorf("error_code = %v, want storage_unavailable", doc.ErrorCode)
+	}
+	// 任务表要记同一个码：两张表说的不是同一件事，排查时就得再猜一次。
+	if got := job.ErrorCode(err); got != "storage_unavailable" {
+		t.Errorf("job error code = %q, want storage_unavailable", got)
+	}
+}

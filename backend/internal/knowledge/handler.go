@@ -481,6 +481,9 @@ func mapError(err error) error {
 	case errors.Is(err, ErrSourceMissing):
 		return httpx.ErrConflict.WithMessage(
 			"original content of this document is missing, reindex is not possible")
+	case errors.Is(err, ErrStorageUnavailable):
+		// 外部依赖暂时不可用：503 让调用方知道"过一会儿再试"，而不是当成代码 bug。
+		return httpx.ErrServiceUnavailable.WithMessage("document storage is temporarily unavailable")
 	case errors.Is(err, ErrNoProcessing):
 		// 没有处理可取消不是参数错误：文档存在，只是当前没在跑。
 		return httpx.ErrConflict.WithMessage("no processing in progress for this document")

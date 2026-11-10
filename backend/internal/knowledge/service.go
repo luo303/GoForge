@@ -40,6 +40,12 @@ var (
 	ErrSourceMissing = errors.New("document source is missing")
 	// ErrInvalidMetadata 表示分类或标签不合法（超长、含分隔符、数量过多）。
 	ErrInvalidMetadata = errors.New("invalid document metadata")
+	// ErrStorageUnavailable 表示读原文时对象存储不可用（连不上、超时）。
+	//
+	// 与 ErrSourceMissing 的区别很重要：原文缺失是数据状态坏了，重试没有意义；
+	// 存储不可用是暂时故障，应该重试。两者混成一个错误，就会出现
+	// "MinIO 重启一下就能好的任务被判成永久失败"。
+	ErrStorageUnavailable = errors.New("document storage is unavailable")
 	// ErrNoProcessing 表示该文档当前没有进行中的处理可以取消。
 	ErrNoProcessing = errors.New("no processing in progress")
 	// ErrReindexRunning 表示同一文档已有未完成的重索引任务。
@@ -310,23 +316,40 @@ func (s *Service) ProcessReindexTask(ctx context.Context, documentID int64, atte
 	return s.settle(ctx, documentID, s.ProcessReindex(ctx, documentID), attempts, maxAttempts)
 }
 
+// codedError 给错误附加机器可读码，让任务表与文档表记同一个原因。
+//
+// job 包只认识"有没有码"，不认识具体有哪些码——那属于业务语义，
+// 放在基础设施里会让它必须知道文档、记忆、Agent 各自的错误分类。
+type codedError struct {
+	code string
+	err  error
+}
+
+func (e *codedError) Error() string        { return e.err.Error() }
+func (e *codedError) Unwrap() error        { return e.err }
+func (e *codedError) JobErrorCode() string { return e.code }
+
 // settle 负责"这次失败之后要不要给文档标红"。
 func (s *Service) settle(ctx context.Context, documentID int64, runErr error, attempts, maxAttempts int) error {
 	if runErr == nil {
 		return nil
 	}
 	err := s.classify(runErr)
+	// 无论重试还是最终失败，都把码附上：worker 会把它写进 jobs.last_error_code，
+	// 与 documents.error_code 保持一致，排查时两张表说的是同一件事。
+	coded := &codedError{code: errorCode(err), err: err}
+
 	probe := job.Job{Attempts: attempts, MaxAttempts: maxAttempts}
 	if job.ShouldRetry(&probe, err) {
 		// 还会重试：文档保持当前状态（pending / indexing），
 		// 万一这次失败被下一轮成功覆盖，用户根本不需要看到中间的失败。
-		return err
+		return coded
 	}
-	if markErr := s.repo.MarkFailed(ctx, documentID, errorCode(err), err.Error()); markErr != nil {
+	if markErr := s.repo.MarkFailed(ctx, documentID, coded.code, err.Error()); markErr != nil {
 		s.log.Warn("mark document failed",
 			zap.Int64("document_id", documentID), zap.Error(markErr))
 	}
-	return err
+	return coded
 }
 
 // classify 把"再试也没用"的错误标记成永久失败。
@@ -362,6 +385,10 @@ func errorCode(err error) string {
 		return "invalid_metadata"
 	case errors.Is(err, ErrSourceMissing):
 		return "source_missing"
+	case errors.Is(err, ErrStorageUnavailable):
+		// 与 source_missing 分开：这是"存储暂时连不上"，重试或恢复 MinIO 后能好；
+		// 前者是原文真的没了，需要用户重新导入。
+		return "storage_unavailable"
 	case errors.Is(err, ErrNotFound):
 		return "document_not_found"
 	default:
@@ -657,7 +684,8 @@ func (s *Service) sourceText(ctx context.Context, doc *Document) (string, error)
 			if errors.Is(err, fs.ErrNotExist) {
 				return "", fmt.Errorf("%w: file %s is gone", ErrSourceMissing, *doc.StoragePath)
 			}
-			return "", err
+			// 其余读失败（连不上、超时）是暂时故障，单独标记以便重试与给出准确错误码。
+			return "", fmt.Errorf("%w: %w", ErrStorageUnavailable, err)
 		}
 		// 再走一次 normalizeText：原文可能带着 BOM，偏移必须以去 BOM 之后
 		// 的字节为基准，否则重索引产出的偏移和导入时不一致。

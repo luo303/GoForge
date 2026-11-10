@@ -83,6 +83,29 @@ func IsPermanent(err error) bool {
 	return errors.As(err, &p)
 }
 
+// codedError 是"自带错误码"的错误。业务侧包一层实现它，
+// worker 就能把同一个码写进 jobs.last_error_code，而不是一律记成 handler_error。
+type codedError interface {
+	JobErrorCode() string
+}
+
+// ErrorCode 取错误的机器可读码，取不到时回退到 handler_error。
+//
+// 为什么不让 worker 自己判断业务错误：那要求基础设施认识文档、记忆、Agent 各自的
+// 错误语义，方向是反的。让错误自带码，worker 只负责搬运。
+func ErrorCode(err error) string {
+	var c codedError
+	if errors.As(err, &c) {
+		if code := c.JobErrorCode(); code != "" {
+			return code
+		}
+	}
+	if errors.Is(err, ErrUnsupportedKind) {
+		return "unsupported_kind"
+	}
+	return "handler_error"
+}
+
 // ShouldRetry 决定一次失败之后要不要再排队。
 //
 // 两个条件缺一不可：错误本身可恢复，且尝试次数还没用尽。
