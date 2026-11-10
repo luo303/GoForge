@@ -161,6 +161,61 @@ WHERE id = ? AND worker_id = ? AND status = 'running'`,
 	return nil
 }
 
+// Succeed 把任务标记为成功。
+//
+// WHERE 同样带 worker_id 与 status：如果执行期间租约已经丢了，这条更新不会生效，
+// 调用方会收到 ErrLeaseLost —— 让旧 worker 知道"这活已经不算我的了"，
+// 而不是让它心安理得地盖掉接管者的结果。
+func (r *Repository) Succeed(ctx context.Context, id int64, workerID string) error {
+	return r.finish(ctx, id, workerID, StatusSucceeded, nil, nil)
+}
+
+// Fail 把任务标记为失败并留下原因。
+//
+// code 给程序判断（Phase 6 后续据此决定可否重试），message 给人看；
+// 两者分开存，是因为"贴给人看的错误文案"以后可能要多语言或改写，
+// 而判断逻辑不能跟着文案变。
+func (r *Repository) Fail(ctx context.Context, id int64, workerID, code, message string) error {
+	return r.finish(ctx, id, workerID, StatusFailed, &code, &message)
+}
+
+func (r *Repository) finish(ctx context.Context, id int64, workerID string, status Status, code, message *string) error {
+	result := r.db.WithContext(ctx).Exec(`
+UPDATE jobs SET status = ?, last_error_code = ?, last_error = ?,
+       finished_at = now(), lease_expires_at = NULL, updated_at = now()
+WHERE id = ? AND worker_id = ? AND status = 'running'`,
+		status, code, message, id, workerID)
+	if result.Error != nil {
+		return fmt.Errorf("finish job %d as %s: %w", id, status, result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+// Release 把任务放回队列，供 worker 优雅停止时使用。
+//
+// attempts 减回去是有意的：这次是"我们自己叫停"，不是任务失败。
+// 不这么做的话，反复部署/重启会让任务白白消耗掉 max_attempts，
+// 最终因为"重启太多次"被判失败——那不是用户或数据的问题。
+//
+// 副作用要求可重跑：任务可能已经改了一半（例如分块替换做到一半被取消），
+// 所以每个 handler 必须按"从头再做一次也没问题"来实现。
+func (r *Repository) Release(ctx context.Context, id int64, workerID string) error {
+	result := r.db.WithContext(ctx).Exec(`
+UPDATE jobs SET status = 'queued', worker_id = NULL, lease_expires_at = NULL,
+       attempts = GREATEST(attempts - 1, 0), run_after = now(), updated_at = now()
+WHERE id = ? AND worker_id = ? AND status = 'running'`, id, workerID)
+	if result.Error != nil {
+		return fmt.Errorf("release job %d: %w", id, result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
 // Get 读一条任务，供接口与测试使用。
 func (r *Repository) Get(ctx context.Context, id int64) (*Job, error) {
 	var found Job

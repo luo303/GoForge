@@ -190,6 +190,104 @@ func TestLeaseIntegration(t *testing.T) {
 	})
 }
 
+func TestFinishIntegration(t *testing.T) {
+	db := setupJobDB(t)
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	t.Run("成功写回终态并释放租约", func(t *testing.T) {
+		mustEnqueue(t, repo, 30, "document:30:import")
+		claimed, err := repo.Claim(ctx, "worker-a", testLease)
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		if err := repo.Succeed(ctx, claimed.ID, "worker-a"); err != nil {
+			t.Fatalf("succeed: %v", err)
+		}
+		done, err := repo.Get(ctx, claimed.ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if done.Status != StatusSucceeded {
+			t.Errorf("status = %s, want succeeded", done.Status)
+		}
+		if done.FinishedAt == nil {
+			t.Error("finished_at should be set")
+		}
+		if done.LeaseExpiresAt != nil {
+			t.Error("lease should be cleared so nothing tries to renew it")
+		}
+	})
+
+	t.Run("失败保留错误码与原因", func(t *testing.T) {
+		mustEnqueue(t, repo, 31, "document:31:import")
+		claimed, err := repo.Claim(ctx, "worker-a", testLease)
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		if err := repo.Fail(ctx, claimed.ID, "worker-a", "parse_error", "文件不是合法 UTF-8"); err != nil {
+			t.Fatalf("fail: %v", err)
+		}
+		done, err := repo.Get(ctx, claimed.ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if done.Status != StatusFailed {
+			t.Errorf("status = %s, want failed", done.Status)
+		}
+		if done.LastErrorCode == nil || *done.LastErrorCode != "parse_error" {
+			t.Errorf("last_error_code = %v, want parse_error", done.LastErrorCode)
+		}
+		if done.LastError == nil || *done.LastError == "" {
+			t.Error("last_error should keep the human readable reason")
+		}
+	})
+
+	t.Run("优雅停止把任务放回队列且不消耗尝试次数", func(t *testing.T) {
+		mustEnqueue(t, repo, 32, "document:32:import")
+		claimed, err := repo.Claim(ctx, "worker-a", testLease)
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		if claimed.Attempts != 1 {
+			t.Fatalf("attempts after claim = %d, want 1", claimed.Attempts)
+		}
+		if err := repo.Release(ctx, claimed.ID, "worker-a"); err != nil {
+			t.Fatalf("release: %v", err)
+		}
+		back, err := repo.Get(ctx, claimed.ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if back.Status != StatusQueued {
+			t.Errorf("status = %s, want queued", back.Status)
+		}
+		// 这次是我们自己叫停的，不该算一次失败尝试——否则反复部署会把重试次数耗光。
+		if back.Attempts != 0 {
+			t.Errorf("attempts = %d, want 0 after release", back.Attempts)
+		}
+		if back.WorkerID != nil {
+			t.Errorf("worker_id = %v, want NULL", back.WorkerID)
+		}
+	})
+
+	t.Run("失去租约后写终态会失败", func(t *testing.T) {
+		mustEnqueue(t, repo, 33, "document:33:import")
+		claimed, err := repo.Claim(ctx, "worker-a", testLease)
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		// 接管者拿走了这条任务，旧 worker 不该还能把它标记成成功。
+		if err := db.WithContext(ctx).Exec(
+			"UPDATE jobs SET worker_id = 'worker-b' WHERE id = ?", claimed.ID).Error; err != nil {
+			t.Fatalf("steal job: %v", err)
+		}
+		if err := repo.Succeed(ctx, claimed.ID, "worker-a"); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("succeed error = %v, want ErrLeaseLost", err)
+		}
+	})
+}
+
 func TestEnqueueDedupeIntegration(t *testing.T) {
 	db := setupJobDB(t)
 	repo := NewRepository(db)
