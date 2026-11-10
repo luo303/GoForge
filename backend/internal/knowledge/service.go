@@ -14,10 +14,12 @@ import (
 	"io/fs"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"go.uber.org/zap"
 
+	"github.com/luo303/mindos/backend/internal/job"
 	"github.com/luo303/mindos/backend/internal/platform"
 )
 
@@ -62,6 +64,10 @@ type documentRepository interface {
 	Update(ctx context.Context, id int64, patch DocumentPatch) error
 	Delete(ctx context.Context, id int64) error
 	ReplaceChunks(ctx context.Context, documentID int64, chunks []Chunk) error
+	// CreateWithJob 在一个事务里写待处理文档与它的任务（Phase 6）。
+	CreateWithJob(ctx context.Context, doc *Document, j *job.Job) error
+	// FinishImport 在同一事务里替换分块并把文档置 ready（Phase 6）。
+	FinishImport(ctx context.Context, documentID int64, chunks []Chunk) error
 }
 
 // fileStore 是原始文件的存储能力。
@@ -125,45 +131,64 @@ type UpdateInput struct {
 	Tags       *[]string
 }
 
-// ImportFile 同步导入一个文本文件。
+// 任务类型。取值属于业务语义，所以定义在业务包而不是 job 包——
+// job 是基础设施，不该知道"文档"这种概念，否则 Phase 16 复用它会很别扭。
+const (
+	KindDocumentImport  job.Kind = "document.import"
+	KindDocumentReindex job.Kind = "document.reindex"
+)
+
+// defaultMaxAttempts 是任务默认重试上限：一次原样重试 + 一次退避后重试。
+// 解析类错误（编码不对、类型不支持）重试也没用，那类错误会在 handler 里
+// 直接判失败，不会真的跑满三次。
+const defaultMaxAttempts = 3
+
+// ImportResult 是一次"导入受理"的结果。
 //
-// 返回值第二项 existed 表示"同内容的文档已存在，本次没有写入任何新记录"。
-// 幂等的语义只到这里：重复导入不会更新标题、标签或分块，需要改这些走 PATCH。
-// 理由是"同内容 = 同一条记录"——如果第二次上传能改第一次的结果，那这条记录
-// 就不再由内容唯一决定，前端拿到的 existed 也失去意义。
+// 与旧返回值（文档 + existed）的区别：多了一个 JobID。
+// 异步化以后，handler 能立刻告诉用户的只有"我收下了，任务号是多少"，
+// 真正的结果要等 worker 跑完才能查。
+type ImportResult struct {
+	Document *Document
+	// JobID 是排队等待执行的任务 id；Existed 为 true 时没有新建任务，值为 0。
+	JobID int64
+	// Existed 表示"同内容的文档已存在，本次没有写入任何新记录"。
+	Existed bool
+}
+
+// StartFileImport 受理一次文件导入：校验 → 存原文 → 写待处理文档 + 任务。
 //
-// Phase 4 在请求内完成解析与切分（文件上限 10 MiB，同步执行是可接受的）；
-// Phase 6 会把它改成"落盘 + 建 job + 202 受理"，切分搬进 worker，
-// 届时 Service 的入参形态基本不变，只是返回 job_id。
-func (s *Service) ImportFile(ctx context.Context, in FileInput) (*Document, bool, error) {
+// 幂等语义与同步版本一致：重复导入不会更新标题、标签或分块，改这些走 PATCH。
+// 理由是"同内容 = 同一条记录"——如果第二次上传能改第一次的结果，这条记录
+// 就不再由内容唯一决定，existed 也失去意义。
+//
+// 注意这里仍然会做一次 normalizeText：类型与编码错误属于"用户传错了"，
+// 必须在请求里就报给用户，不能收了 202 再在后台失败。
+func (s *Service) StartFileImport(ctx context.Context, in FileInput) (*ImportResult, error) {
 	mime, ok := MIMEByFilename(in.Filename)
 	if !ok {
-		return nil, false, fmt.Errorf("%w: %s", ErrUnsupportedType, filepath.Ext(in.Filename))
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedType, filepath.Ext(in.Filename))
 	}
 
 	data, err := readAllLimited(in.Content, s.maxUploadBytes)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	text, data, err := normalizeText(data)
-	if err != nil {
-		return nil, false, err
+	// 只做校验与去 BOM，不保留正文：切分是后台的事，这里多留一份没有意义。
+	if _, data, err = normalizeText(data); err != nil {
+		return nil, err
 	}
-	chunks, err := buildChunks(mime, text)
-	if err != nil {
-		return nil, false, err
-	}
-	// 元信息在落盘之前校验：参数不合法时不该先往磁盘写一份文件再删掉。
+	// 元信息在落盘之前校验：参数不合法时不该先往对象存储写一份再删掉。
 	collection, tags, err := normalizeMetadata(in.Collection, in.Tags)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
-	// 先落盘再落库：文件系统不在数据库事务里，顺序反过来会出现
-	// "事务已提交但文件写失败"——那才是真正不可修复的坏状态。
+	// 先落盘再落库：对象存储不在数据库事务里，顺序反过来会出现
+	// "事务已提交但原文没写成功"——那才是真正不可修复的坏状态。
 	saved, err := s.store.Save(ctx, data)
 	if err != nil {
-		return nil, false, fmt.Errorf("save document file: %w", err)
+		return nil, fmt.Errorf("save document file: %w", err)
 	}
 
 	doc := &Document{
@@ -175,34 +200,30 @@ func (s *Service) ImportFile(ctx context.Context, in FileInput) (*Document, bool
 		StoragePath: &saved.RelPath,
 		Collection:  collection,
 		Tags:        tags,
-		Status:      StatusReady,
-		// ChunkCount 由 repository 按实际写入的分块数赋值，这里不重复计算。
+		// 状态由 worker 推进：pending → ready / failed。
+		Status: StatusPending,
 	}
-	return s.persist(ctx, doc, chunks, &saved)
+	return s.startImport(ctx, doc, &saved)
 }
 
-// ImportNote 导入一条笔记。
+// StartNoteImport 受理一条笔记。
 //
 // 笔记的正文存在 documents.content，同时也切分成分块：检索与引用走同一套逻辑，
 // 不需要为笔记单独开一条查询路径。
 //
 // 笔记一律按 Markdown 解析：用户自己写的东西里出现 "# 小节" 是常见用法，
 // 而纯文本文件里以 # 开头的行更可能是日志，所以两者规则不同。
-func (s *Service) ImportNote(ctx context.Context, in NoteInput) (*Document, bool, error) {
+func (s *Service) StartNoteImport(ctx context.Context, in NoteInput) (*ImportResult, error) {
 	if int64(len(in.Content)) > s.maxUploadBytes {
-		return nil, false, ErrTooLarge
+		return nil, ErrTooLarge
 	}
 	text, data, err := normalizeText([]byte(in.Content))
 	if err != nil {
-		return nil, false, err
-	}
-	chunks, err := buildChunks(MIMEMarkdown, text)
-	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	collection, tags, err := normalizeMetadata(in.Collection, in.Tags)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 
 	doc := &Document{
@@ -214,43 +235,119 @@ func (s *Service) ImportNote(ctx context.Context, in NoteInput) (*Document, bool
 		Content:     &text,
 		Collection:  collection,
 		Tags:        tags,
-		Status:      StatusReady,
+		Status:      StatusPending,
 	}
-	return s.persist(ctx, doc, chunks, nil)
+	return s.startImport(ctx, doc, nil)
 }
 
-// persist 写入文档与分块，并把"同内容已存在"翻译成 (既有文档, true)。
+// ProcessImport 是任务的执行段：读原文 → 切分 → 替换分块 → 置 ready。
+//
+// 三条约定（与 job.HandlerFunc 的契约一致）：
+//   - 响应 ctx：取消与停止靠它传播；
+//   - 可重跑：FinishImport 是"先删后插"的一个事务，重复执行结果不变；
+//   - 不碰任务状态：成功/失败由 worker 统一写回。
+func (s *Service) ProcessImport(ctx context.Context, documentID int64) error {
+	doc, err := s.repo.Get(ctx, documentID)
+	if err != nil {
+		return err
+	}
+	text, err := s.sourceText(ctx, doc)
+	if err != nil {
+		return err
+	}
+	chunks, err := buildChunks(doc.MIME, text)
+	if err != nil {
+		return err
+	}
+	return s.repo.FinishImport(ctx, documentID, chunks)
+}
+
+// startImport 写"待处理文档 + 任务"，并把"同内容已存在"翻译成 Existed。
 //
 // 三个分支的顺序有讲究：
 //  1. 成功 → 新建；
 //  2. 唯一索引冲突（ErrDuplicate）→ 读回既有记录，**不删文件**。
-//     此时盘上的文件正是那条既有文档指向的原文（内容寻址下路径由哈希决定），
+//     此时对象存储里的正是那条既有文档指向的原文（内容寻址下 key 由哈希决定），
 //     删掉会让它变成"有记录没原文"，之后重索引就再也跑不起来；
 //  3. 其他失败 → 补偿清理，且只在文件是本次新写的时候删（Reused=false）。
-//
-// saved 为 nil 表示这次导入没有文件（笔记）。
-func (s *Service) persist(ctx context.Context, doc *Document, chunks []Chunk, saved *platform.SavedFile) (*Document, bool, error) {
-	err := s.repo.CreateWithChunks(ctx, doc, chunks)
+func (s *Service) startImport(ctx context.Context, doc *Document, saved *platform.SavedFile) (*ImportResult, error) {
+	// 去重用内容哈希而不是文档 id：id 要等插入之后才有，
+	// 而"同一份内容同一时刻只该有一个导入任务"在插入前就得成立。
+	dedupeKey := fmt.Sprintf("document:%s:import", doc.ContentHash)
+	queued := &job.Job{
+		Kind:        KindDocumentImport,
+		Status:      job.StatusQueued,
+		DedupeKey:   &dedupeKey,
+		Payload:     job.Payload{},
+		MaxAttempts: defaultMaxAttempts,
+		RunAfter:    time.Now().UTC(),
+	}
+
+	err := s.repo.CreateWithJob(ctx, doc, queued)
 	if err == nil {
-		return doc, false, nil
+		return &ImportResult{Document: doc, JobID: queued.ID}, nil
 	}
 	if errors.Is(err, ErrDuplicate) {
 		existing, getErr := s.repo.GetByContentHash(ctx, doc.ContentHash)
 		if getErr == nil {
-			return existing, true, nil
+			return &ImportResult{Document: existing, Existed: true}, nil
 		}
 		// 撞了唯一索引却读不回来，说明这条记录在冲突与读取之间被删了。
 		// 这种情况极少见，退回冲突语义（409）比假装成功更诚实。
-		return nil, false, err
+		return nil, err
 	}
 	if saved != nil && !saved.Reused {
 		// 两个错误一起返回：清理失败不该掩盖真正的失败原因，
 		// 但也不能悄悄吞掉（errors.Join 会保留两条链，日志里都看得到）。
 		if rmErr := s.store.Remove(ctx, saved.RelPath); rmErr != nil {
-			return nil, false, errors.Join(err, fmt.Errorf("cleanup stored file: %w", rmErr))
+			return nil, errors.Join(err, fmt.Errorf("cleanup stored file: %w", rmErr))
 		}
 	}
-	return nil, false, err
+	return nil, err
+}
+
+// ImportFile 在请求内完成导入：StartFileImport + 立即 ProcessImport。
+//
+// 存在的唯一理由是过渡：HTTP 层还返回 201、测试还断言"函数返回时已有分块"。
+// 下一笔把 handler 切到 202 后，这个方法连同一个提交周期内的测试一起删掉——
+// 同步与异步两条路径长期并存，会出现"改了异步忘了改同步"的隐性 bug。
+func (s *Service) ImportFile(ctx context.Context, in FileInput) (*Document, bool, error) {
+	res, err := s.StartFileImport(ctx, in)
+	if err != nil {
+		return nil, false, err
+	}
+	if res.Existed {
+		return res.Document, true, nil
+	}
+	if err := s.ProcessImport(ctx, res.Document.ID); err != nil {
+		return nil, false, err
+	}
+	// 重新读一次：chunk_count 与 status 都由数据库写入，
+	// 返回内存里的旧值会让调用方看到"导入了但块数是 0"。
+	doc, err := s.repo.Get(ctx, res.Document.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	return doc, false, nil
+}
+
+// ImportNote 是 StartNoteImport 的同步封装，理由同 ImportFile。
+func (s *Service) ImportNote(ctx context.Context, in NoteInput) (*Document, bool, error) {
+	res, err := s.StartNoteImport(ctx, in)
+	if err != nil {
+		return nil, false, err
+	}
+	if res.Existed {
+		return res.Document, true, nil
+	}
+	if err := s.ProcessImport(ctx, res.Document.ID); err != nil {
+		return nil, false, err
+	}
+	doc, err := s.repo.Get(ctx, res.Document.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	return doc, false, nil
 }
 
 // Get 读取文档详情。

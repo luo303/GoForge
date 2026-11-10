@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luo303/mindos/backend/internal/job"
 	"github.com/luo303/mindos/backend/internal/platform"
 )
 
@@ -24,6 +25,8 @@ type fakeRepo struct {
 	nextID     int64
 	createErr  error
 	replaceErr error
+	// jobs 记录本次测试里创建过的任务，供"受理后是否入队"这类断言使用。
+	jobs []*job.Job
 }
 
 func newFakeRepo() *fakeRepo {
@@ -56,6 +59,42 @@ func (f *fakeRepo) CreateWithChunks(_ context.Context, doc *Document, chunks []C
 		chunks[i].DocumentID = doc.ID
 	}
 	f.chunks[doc.ID] = append([]Chunk(nil), chunks...)
+	return nil
+}
+
+// CreateWithJob 复刻"同一事务里写待处理文档与任务"。
+// 先走 CreateWithChunks（零分块），保证唯一索引冲突的行为与真实仓储一致。
+func (f *fakeRepo) CreateWithJob(_ context.Context, doc *Document, j *job.Job) error {
+	if err := f.CreateWithChunks(context.Background(), doc, nil); err != nil {
+		return err
+	}
+	if j != nil {
+		j.ID = int64(len(f.jobs) + 1)
+		if j.Payload == nil {
+			j.Payload = job.Payload{}
+		}
+		j.Payload["document_id"] = doc.ID
+		f.jobs = append(f.jobs, j)
+	}
+	return nil
+}
+
+// FinishImport 复刻"替换分块 + 置 ready"，两件事在真实实现里是同一事务。
+func (f *fakeRepo) FinishImport(_ context.Context, documentID int64, chunks []Chunk) error {
+	if f.replaceErr != nil {
+		return f.replaceErr
+	}
+	doc, ok := f.docs[documentID]
+	if !ok {
+		return ErrNotFound
+	}
+	for i := range chunks {
+		chunks[i].DocumentID = documentID
+	}
+	f.chunks[documentID] = append([]Chunk(nil), chunks...)
+	doc.ChunkCount = len(chunks)
+	doc.Status = StatusReady
+	doc.UpdatedAt = time.Now().UTC()
 	return nil
 }
 
@@ -974,5 +1013,57 @@ func TestReindexNoteUsesStoredContent(t *testing.T) {
 	}
 	if len(repo.chunks[doc.ID]) == 0 || updated.ChunkCount == 0 {
 		t.Error("note reindex must produce chunks")
+	}
+}
+
+// TestStartImportEnqueuesThenProcesses 覆盖 Phase 6 确立的"受理与执行分离"：
+// StartFileImport 只写 pending 文档与任务，分块要等 ProcessImport 才出现。
+//
+// 这个用例是后续异步化的地基——如果受理阶段就把分块写了，"异步"只是换了个
+// 调用位置，任务表也失去意义。
+func TestStartImportEnqueuesThenProcesses(t *testing.T) {
+	svc, repo, _ := newTestService(1 << 20)
+	ctx := context.Background()
+
+	res, err := svc.StartFileImport(ctx, FileInput{
+		Filename: "note.md",
+		Content:  strings.NewReader("# 标题\n\n正文内容。\n"),
+	})
+	if err != nil {
+		t.Fatalf("StartFileImport: %v", err)
+	}
+	if res.Existed {
+		t.Fatal("first import should not be treated as existing")
+	}
+	if res.JobID == 0 {
+		t.Fatal("a job should be enqueued for the new document")
+	}
+	if res.Document.Status != StatusPending {
+		t.Errorf("status = %s, want pending", res.Document.Status)
+	}
+	if res.Document.ChunkCount != 0 {
+		t.Errorf("chunk_count = %d, want 0 before processing", res.Document.ChunkCount)
+	}
+	if len(repo.jobs) != 1 || repo.jobs[0].Kind != KindDocumentImport {
+		t.Fatalf("enqueued jobs = %v, want one %s", repo.jobs, KindDocumentImport)
+	}
+	// 任务必须指向刚建好的文档，否则 worker 不知道该处理谁。
+	if got := repo.jobs[0].Payload["document_id"]; got != res.Document.ID {
+		t.Errorf("job payload document_id = %v, want %d", got, res.Document.ID)
+	}
+
+	// 执行阶段：真实运行时由 worker 调用，这里直接调，避免测试依赖轮询时间。
+	if err := svc.ProcessImport(ctx, res.Document.ID); err != nil {
+		t.Fatalf("ProcessImport: %v", err)
+	}
+	done, err := svc.Get(ctx, res.Document.ID)
+	if err != nil {
+		t.Fatalf("get document: %v", err)
+	}
+	if done.Status != StatusReady {
+		t.Errorf("status = %s, want ready after processing", done.Status)
+	}
+	if done.ChunkCount == 0 {
+		t.Error("processing should write chunks")
 	}
 }

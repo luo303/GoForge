@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+
+	"github.com/luo303/mindos/backend/internal/job"
 )
 
 // Repository 是 documents / document_chunks 的数据访问。
@@ -70,6 +72,31 @@ func (r *Repository) CreateWithChunks(ctx context.Context, doc *Document, chunks
 		return tx.CreateInBatches(chunks, 200).Error
 	})
 	return translateError("create document", err)
+}
+
+// CreateWithJob 在同一个事务里写入"待处理文档"与它的任务。
+//
+// 为什么要一个事务：异步化以后，导入被拆成"建记录 + 后台处理"两步。
+// 如果先建文档再建任务，中间失败会留下一条永远 pending、又没人处理的记录；
+// 反过来则是任务指向一个不存在的文档。两者都是需要人工介入的脏状态。
+//
+// j 为 nil 表示这次不需要任务（当前没有这种调用，保留是为了让"同步写入"的
+// 调试路径不必另写一个方法）。
+func (r *Repository) CreateWithJob(ctx context.Context, doc *Document, j *job.Job) error {
+	doc.ChunkCount = 0
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(doc).Error; err != nil {
+			return err
+		}
+		if j == nil {
+			return nil
+		}
+		// document_id 依赖自增主键，只能在插入文档之后回填。
+		// 让调用方自己先猜 id 再写 payload 是行不通的。
+		j.Payload["document_id"] = doc.ID
+		return tx.Create(j).Error
+	})
+	return translateError("create document with job", err)
 }
 
 // Get 按主键读取文档，不存在时返回 ErrNotFound。
@@ -242,35 +269,61 @@ func (r *Repository) Delete(ctx context.Context, id int64) error {
 // 事务保证失败后旧数据完整保留，用户重试即可。
 func (r *Repository) ReplaceChunks(ctx context.Context, documentID int64, chunks []Chunk) error {
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 不检查存在性的话，"删 0 行 + 插 0 行"也会提交成功，
-		// 调用方会误以为重索引跑过了。
-		var exists int64
-		if err := tx.Model(&Document{}).Where("id = ?", documentID).Count(&exists).Error; err != nil {
-			return err
-		}
-		if exists == 0 {
-			return gorm.ErrRecordNotFound
-		}
-		if err := tx.Where("document_id = ?", documentID).Delete(&Chunk{}).Error; err != nil {
-			return err
-		}
-		for i := range chunks {
-			chunks[i].DocumentID = documentID
-		}
-		if len(chunks) > 0 {
-			if err := tx.CreateInBatches(chunks, 200).Error; err != nil {
-				return err
-			}
-		}
-		// 用 map 而不是结构体更新：结构体会跳过零值字段，
-		// 而"新结果恰好是 0 块"是必须真的写进去的值。
-		return tx.Model(&Document{}).Where("id = ?", documentID).
-			Updates(map[string]any{
-				"chunk_count": len(chunks),
-				"updated_at":  time.Now().UTC(),
-			}).Error
+		return replaceChunks(tx, documentID, chunks)
 	})
 	return translateError("replace chunks", err)
+}
+
+// FinishImport 替换分块并把文档置为 ready，两件事在同一事务里。
+//
+// 为什么必须同一个事务：分块写好了但状态还停在 parsing，界面会一直显示
+// "处理中"；反过来状态先变 ready、分块还没写完，用户点进去看到的是空文档。
+// 这两种都是"看起来成功但其实没成"，比直接失败更难排查。
+func (r *Repository) FinishImport(ctx context.Context, documentID int64, chunks []Chunk) error {
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := replaceChunks(tx, documentID, chunks); err != nil {
+			return err
+		}
+		return tx.Model(&Document{}).Where("id = ?", documentID).
+			Updates(map[string]any{
+				"status":        StatusReady,
+				"error_code":    nil,
+				"error_message": nil,
+				"updated_at":    time.Now().UTC(),
+			}).Error
+	})
+	return translateError("finish import", err)
+}
+
+// replaceChunks 是分块替换的实际实现，接受 tx 以便与状态更新共用事务。
+func replaceChunks(tx *gorm.DB, documentID int64, chunks []Chunk) error {
+	// 不检查存在性的话，"删 0 行 + 插 0 行"也会提交成功，
+	// 调用方会误以为重索引跑过了。
+	var exists int64
+	if err := tx.Model(&Document{}).Where("id = ?", documentID).Count(&exists).Error; err != nil {
+		return err
+	}
+	if exists == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	if err := tx.Where("document_id = ?", documentID).Delete(&Chunk{}).Error; err != nil {
+		return err
+	}
+	for i := range chunks {
+		chunks[i].DocumentID = documentID
+	}
+	if len(chunks) > 0 {
+		if err := tx.CreateInBatches(chunks, 200).Error; err != nil {
+			return err
+		}
+	}
+	// 用 map 而不是结构体更新：结构体会跳过零值字段，
+	// 而"新结果恰好是 0 块"是必须真的写进去的值。
+	return tx.Model(&Document{}).Where("id = ?", documentID).
+		Updates(map[string]any{
+			"chunk_count": len(chunks),
+			"updated_at":  time.Now().UTC(),
+		}).Error
 }
 
 // translateError 把 GORM 的错误翻译成模块内的哨兵错误。
