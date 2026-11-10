@@ -26,6 +26,7 @@ import { DocumentList } from '@/pages/knowledge/document-list'
 import { FilterBar } from '@/pages/knowledge/filter-bar'
 import { PAGE_SIZE } from '@/pages/knowledge/format'
 import { NoteComposer, type NoteDraft } from '@/pages/knowledge/note-composer'
+import { UploadComposer, type UploadDraft } from '@/pages/knowledge/upload-composer'
 
 const emptyFilters: DocumentFilters = { collection: '', tag: '', status: '' }
 
@@ -47,6 +48,8 @@ export function KnowledgePage() {
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [editingId, setEditingId] = useState<number | null>(null)
   const [composerOpen, setComposerOpen] = useState(false)
+  const [uploadOpen, setUploadOpen] = useState(false)
+  const [pendingFile, setPendingFile] = useState<File | null>(null)
   const [importNotice, setImportNotice] = useState<{ existed: boolean; title: string } | null>(null)
 
   const offset = (page - 1) * PAGE_SIZE
@@ -82,12 +85,20 @@ export function KnowledgePage() {
     setSelectedId(doc.id)
     setPage(1)
     setComposerOpen(false)
+    setUploadOpen(false)
+    setPendingFile(null)
     // 幂等命中时说清楚"没有新建"，否则用户会以为又存了一份。
     setImportNotice({ existed: doc.existed, title: doc.title })
     invalidateDocuments()
   }
 
-  const uploadMutation = useMutation({ mutationFn: (file: File) => uploadDocument(file), onSuccess: afterImport })
+  const uploadMutation = useMutation({
+    mutationFn: (draft: UploadDraft & { file: File }) =>
+      // 空值不传：后端把"没有这个字段"与"传了空串"都当未设置，
+      // 但少一个字段能让请求体更接近用户真实意图（与笔记导入一致）。
+      uploadDocument(draft.file, { collection: draft.collection, tags: draft.tags }),
+    onSuccess: afterImport,
+  })
   const noteMutation = useMutation({
     mutationFn: (draft: NoteDraft) =>
       createNote({ content: draft.content, title: draft.title, collection: draft.collection, tags: draft.tags }),
@@ -121,8 +132,18 @@ export function KnowledgePage() {
     // 清空 value：否则再选同一个文件不会触发 change，用户会以为点击没生效。
     event.target.value = ''
     if (file) {
-      uploadMutation.mutate(file)
+      // 选中文件不等于要导入：先摆进确认面板，让人有机会填分类与标签。
+      setPendingFile(file)
+      setUploadOpen(true)
+      setComposerOpen(false)
     }
+  }
+
+  /** 打开上传面板并立刻弹文件框：两次点击合成一次，选完文件才轮到填元信息。 */
+  const startUpload = () => {
+    setUploadOpen(true)
+    setComposerOpen(false)
+    fileInputRef.current?.click()
   }
 
   const changeFilters = (next: DocumentFilters) => {
@@ -153,13 +174,16 @@ export function KnowledgePage() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setComposerOpen((open) => !open)}
+              onClick={() => {
+                setComposerOpen((open) => !open)
+                setUploadOpen(false)
+              }}
               aria-expanded={composerOpen}
             >
               <NotebookPen aria-hidden="true" />
               写笔记
             </Button>
-            <Button size="sm" onClick={() => fileInputRef.current?.click()} disabled={uploadMutation.isPending}>
+            <Button size="sm" onClick={startUpload} disabled={uploadMutation.isPending}>
               {uploadMutation.isPending ? (
                 <Loader2 className="animate-spin" aria-hidden="true" />
               ) : (
@@ -185,6 +209,23 @@ export function KnowledgePage() {
           saving={noteMutation.isPending}
           onCancel={() => setComposerOpen(false)}
           onSubmit={(draft) => noteMutation.mutate(draft)}
+        />
+      ) : null}
+
+      {uploadOpen ? (
+        <UploadComposer
+          file={pendingFile}
+          saving={uploadMutation.isPending}
+          onChooseFile={() => fileInputRef.current?.click()}
+          onCancel={() => {
+            setUploadOpen(false)
+            setPendingFile(null)
+          }}
+          onSubmit={(draft) => {
+            if (pendingFile) {
+              uploadMutation.mutate({ ...draft, file: pendingFile })
+            }
+          }}
         />
       ) : null}
 
@@ -216,7 +257,7 @@ export function KnowledgePage() {
                     清除筛选
                   </Button>
                 ) : (
-                  <Button variant="outline" size="sm" onClick={() => fileInputRef.current?.click()}>
+                  <Button variant="outline" size="sm" onClick={startUpload}>
                     <Upload aria-hidden="true" />
                     上传文件
                   </Button>

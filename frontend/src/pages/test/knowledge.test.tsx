@@ -150,6 +150,9 @@ describe('知识库页面', () => {
 
     const file = new File(['# 笔记\n\n内容'], 'note.md', { type: 'text/markdown' })
     await user.upload(screen.getByLabelText('选择要导入的文件'), file)
+    // 选完文件先落到确认面板，不立刻上传。
+    expect(await screen.findByText('note.md')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '开始导入' }))
 
     await vi.waitFor(() => {
       const call = fetchMock.mock.calls.find(
@@ -158,7 +161,71 @@ describe('知识库页面', () => {
       expect(call).toBeDefined()
       expect(call?.[1]?.body).toBeInstanceOf(FormData)
       expect((call?.[1]?.body as FormData).get('file')).toBeInstanceOf(File)
+      // 没填分类标签时不该凭空多出这两个字段。
+      expect((call?.[1]?.body as FormData).get('collection')).toBeNull()
+      expect((call?.[1]?.body as FormData).get('tags')).toBeNull()
     })
+  })
+
+  it('上传前可以填分类与标签，随 multipart 一起提交', async () => {
+    const user = userEvent.setup()
+    mockHappyPath(documentFixture(), '正文')
+
+    renderApp('/knowledge')
+    await screen.findByText('集成测试笔记')
+
+    const file = new File(['# 笔记\n\n内容'], 'note.md', { type: 'text/markdown' })
+    await user.upload(screen.getByLabelText('选择要导入的文件'), file)
+    await user.type(await screen.findByLabelText('文件分类'), '工作')
+    await user.type(screen.getByLabelText('文件标签'), 'go, 检索')
+    // 标签按逗号切分并去空白，与服务端规则一致。
+    expect(screen.getByText('将保存 2 个标签：go、检索')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '开始导入' }))
+
+    await vi.waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        ([url, init]) => String(url) === '/api/v1/documents' && init?.method === 'POST',
+      )
+      expect(call).toBeDefined()
+      const body = call?.[1]?.body as FormData
+      expect(body.get('collection')).toBe('工作')
+      expect(body.get('tags')).toBe('go,检索')
+    })
+  })
+
+  it('取消后关闭面板且不发导入请求', async () => {
+    const user = userEvent.setup()
+    mockHappyPath(documentFixture(), '正文')
+
+    renderApp('/knowledge')
+    await screen.findByText('集成测试笔记')
+
+    const file = new File(['# 笔记'], 'drop.md', { type: 'text/markdown' })
+    await user.upload(screen.getByLabelText('选择要导入的文件'), file)
+    await user.click(await screen.findByRole('button', { name: '取消' }))
+
+    expect(screen.queryByText('drop.md')).not.toBeInTheDocument()
+    const posted = fetchMock.mock.calls.some(
+      ([url, init]) => String(url) === '/api/v1/documents' && init?.method === 'POST',
+    )
+    expect(posted).toBe(false)
+  })
+
+  it('标签超出上限时给出提示并挡住提交', async () => {
+    const user = userEvent.setup()
+    mockHappyPath(documentFixture(), '正文')
+
+    renderApp('/knowledge')
+    await screen.findByText('集成测试笔记')
+
+    const file = new File(['# 笔记\n\n内容'], 'note.md', { type: 'text/markdown' })
+    await user.upload(screen.getByLabelText('选择要导入的文件'), file)
+    // 21 个标签：后端会拒，前端先挡住，不用等一次往返。
+    const many = Array.from({ length: 21 }, (_, i) => `t${i}`).join(',')
+    await user.type(await screen.findByLabelText('文件标签'), many)
+
+    expect(screen.getByText('最多 20 个标签，当前 21 个')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '开始导入' })).toBeDisabled()
   })
 })
 
@@ -364,6 +431,7 @@ describe('知识库页面的文档管理', () => {
 
     const file = new File(['# 标题'], 'copy.md', { type: 'text/markdown' })
     await user.upload(screen.getByLabelText('选择要导入的文件'), file)
+    await user.click(await screen.findByRole('button', { name: '开始导入' }))
 
     expect(await screen.findByText(/已复用《已有内容》，没有重复入库/)).toBeInTheDocument()
   })
