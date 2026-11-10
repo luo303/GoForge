@@ -194,6 +194,29 @@ WHERE id = ? AND worker_id = ? AND status = 'running'`,
 	return nil
 }
 
+// RetryLater 把失败的任务放回队列，并推迟到 delay 之后才可再次领取。
+//
+// 与 Release 的区别：Release 是"我们自己叫停"（attempts 减回、不需等待），
+// 这里是"这次真的失败了"（attempts 保留，且要等退避时间）。
+//
+// last_error_code / last_error 在重试期间也写进去：排查"一直在重试但没人知道为什么"
+// 时，这行就是全部线索；下一次失败会覆盖它。
+func (r *Repository) RetryLater(ctx context.Context, id int64, workerID string, delay time.Duration, code, message string) error {
+	result := r.db.WithContext(ctx).Exec(`
+UPDATE jobs SET status = 'queued', worker_id = NULL, lease_expires_at = NULL,
+       run_after = now() + make_interval(secs => ?),
+       last_error_code = ?, last_error = ?, updated_at = now()
+WHERE id = ? AND worker_id = ? AND status = 'running'`,
+		delay.Seconds(), code, message, id, workerID)
+	if result.Error != nil {
+		return fmt.Errorf("retry job %d: %w", id, result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
 // Release 把任务放回队列，供 worker 优雅停止时使用。
 //
 // attempts 减回去是有意的：这次是"我们自己叫停"，不是任务失败。

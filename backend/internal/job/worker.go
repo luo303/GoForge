@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -28,6 +29,7 @@ type store interface {
 	RenewLease(ctx context.Context, id int64, workerID string, lease time.Duration) error
 	Succeed(ctx context.Context, id int64, workerID string) error
 	Fail(ctx context.Context, id int64, workerID, code, message string) error
+	RetryLater(ctx context.Context, id int64, workerID string, delay time.Duration, code, message string) error
 	Release(ctx context.Context, id int64, workerID string) error
 	RequeueExpiredLeases(ctx context.Context, grace time.Duration) (int64, error)
 }
@@ -258,8 +260,9 @@ func (w *Worker) execute(ctx context.Context, j *Job, slot int) {
 	var runErr error
 	if !ok {
 		// 领到了没人认领的任务类型：多半是"旧代码在跑新任务"，属于部署问题。
-		// 重试也没用，直接落 failed 并留下原因。
-		runErr = fmt.Errorf("%w: %q", ErrUnsupportedKind, j.Kind)
+		// 重试也没用（下次领到还是没人处理），所以直接标成永久失败，
+		// 不占用三次重试名额，也让这条任务尽快出现在失败列表里。
+		runErr = Permanent(fmt.Errorf("%w: %q", ErrUnsupportedKind, j.Kind))
 	} else {
 		runErr = fn(runCtx, j)
 	}
@@ -349,6 +352,25 @@ func (w *Worker) finish(ctx context.Context, j *Job, slot int, runErr error, lea
 	if errors.Is(runErr, ErrUnsupportedKind) {
 		code = "unsupported_kind"
 	}
+
+	// 还能再试就退避重排，而不是直接判死。
+	// 判定与"业务层要不要标记文档失败"共用 ShouldRetry，避免出现
+	// 任务还在重试、文档已经显示失败的矛盾状态。
+	if ShouldRetry(j, runErr) {
+		delay := Jitter(BaseBackoff(j.Attempts), rand.Int64N)
+		if err := w.store.RetryLater(writeCtx, j.ID, w.id, delay, code, runErr.Error()); err != nil {
+			w.log.Warn("schedule job retry failed",
+				zap.Int64("job_id", j.ID), zap.Duration("delay", delay), zap.Error(err))
+			return
+		}
+		w.log.Info("job scheduled for retry",
+			zap.Int64("job_id", j.ID),
+			zap.Int("attempt", j.Attempts),
+			zap.Int("max_attempts", j.MaxAttempts),
+			zap.Duration("delay", delay))
+		return
+	}
+
 	if err := w.store.Fail(writeCtx, j.ID, w.id, code, runErr.Error()); err != nil {
 		w.log.Warn("mark job failed failed",
 			zap.Int64("job_id", j.ID), zap.Int("slot", slot), zap.Error(err))

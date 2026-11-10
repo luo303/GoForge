@@ -31,25 +31,24 @@ func NewHandler(svc *Service) *Handler {
 // error_*），把模型直接暴露给前端等于让表结构变成接口契约，加一列就可能
 // 影响前端类型。视图层只挑本次要用的字段。
 type documentView struct {
-	ID          int64     `json:"id"`
-	Title       string    `json:"title"`
-	SourceType  string    `json:"source_type"`
-	MIME        string    `json:"mime"`
-	SizeBytes   int64     `json:"size_bytes"`
-	ContentHash string    `json:"content_hash"`
-	Collection  string    `json:"collection"`
-	Tags        []string  `json:"tags"`
-	Status      string    `json:"status"`
-	ChunkCount  int       `json:"chunk_count"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID          int64    `json:"id"`
+	Title       string   `json:"title"`
+	SourceType  string   `json:"source_type"`
+	MIME        string   `json:"mime"`
+	SizeBytes   int64    `json:"size_bytes"`
+	ContentHash string   `json:"content_hash"`
+	Collection  string   `json:"collection"`
+	Tags        []string `json:"tags"`
+	Status      string   `json:"status"`
+	ChunkCount  int      `json:"chunk_count"`
+	// 处理最终失败时才有值。omitempty 让成功响应保持干净，
+	// 前端也能用"有没有这个字段"直接判断要不要显示失败原因。
+	ErrorCode    string    `json:"error_code,omitempty"`
+	ErrorMessage string    `json:"error_message,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// importedDocumentView 是导入接口的响应：文档视图 + 本次是否命中既有记录。
-//
-// 用内嵌而不是给 documentView 加字段：existed 只对"导入"这一个动作有意义，
-// 挂在详情/列表的视图上会让前端以为它是文档的固有属性。
-// 内嵌结构体的字段在 JSON 里会被提升到同一层，因此响应形状仍是扁平的。
 // acceptedDocumentView 是"已受理、结果稍后产生"这类响应的公共形状。
 //
 // 导入与重索引都会返回它：两者都只是把活排进队列，响应里能给的只有
@@ -59,6 +58,11 @@ type acceptedDocumentView struct {
 	JobID int64 `json:"job_id"`
 }
 
+// importedDocumentView 是导入接口的响应：受理视图 + 本次是否命中既有记录。
+//
+// 分两层内嵌而不是继续往 documentView 加字段：existed 只对"导入"这一个动作
+// 有意义，job_id 只对"受理"有意义，挂在详情/列表上会让人误以为它们是文档属性。
+// 内嵌结构体的字段在 JSON 里被提升到同一层，响应形状仍是扁平的。
 type importedDocumentView struct {
 	acceptedDocumentView
 	Existed bool `json:"existed"`
@@ -339,6 +343,13 @@ func newDocumentView(doc *Document) documentView {
 	}
 	if doc.Collection != nil {
 		view.Collection = *doc.Collection
+	}
+	// 失败原因只在有值时出现：成功响应里带 "error_code": "" 会让人怀疑是不是出过错。
+	if doc.ErrorCode != nil {
+		view.ErrorCode = *doc.ErrorCode
+	}
+	if doc.ErrorMessage != nil {
+		view.ErrorMessage = *doc.ErrorMessage
 	}
 	return view
 }

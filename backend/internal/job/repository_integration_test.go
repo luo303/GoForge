@@ -271,6 +271,45 @@ func TestFinishIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("退避重排保留尝试次数并推迟可领取时间", func(t *testing.T) {
+		mustEnqueue(t, repo, 34, "document:34:import")
+		claimed, err := repo.Claim(ctx, "worker-a", testLease)
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		if err := repo.RetryLater(ctx, claimed.ID, "worker-a", time.Minute, "storage_error", "minio 暂时不可用"); err != nil {
+			t.Fatalf("retry later: %v", err)
+		}
+		back, err := repo.Get(ctx, claimed.ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if back.Status != StatusQueued {
+			t.Errorf("status = %s, want queued", back.Status)
+		}
+		// 与优雅停止不同：这次真的尝试过，次数要保留，否则会无限重试。
+		if back.Attempts != 1 {
+			t.Errorf("attempts = %d, want 1 kept", back.Attempts)
+		}
+		if back.WorkerID != nil {
+			t.Errorf("worker_id = %v, want NULL so anyone can pick it up", back.WorkerID)
+		}
+		if !back.RunAfter.After(time.Now()) {
+			t.Errorf("run_after = %s, want in the future", back.RunAfter)
+		}
+		if back.LastErrorCode == nil || *back.LastErrorCode != "storage_error" {
+			t.Errorf("last_error_code = %v, want storage_error", back.LastErrorCode)
+		}
+		// 退避期间不该被领走。先清掉前面用例留下的可领取任务，
+		// 否则这次 Claim 会拿到别的行，断言就失去意义。
+		if err := db.WithContext(ctx).Exec("DELETE FROM jobs WHERE id <> ?", claimed.ID).Error; err != nil {
+			t.Fatalf("clean other jobs: %v", err)
+		}
+		if _, err := repo.Claim(ctx, "worker-b", testLease); !errors.Is(err, ErrNoJob) {
+			t.Fatalf("claim during backoff error = %v, want ErrNoJob", err)
+		}
+	})
+
 	t.Run("失去租约后写终态会失败", func(t *testing.T) {
 		mustEnqueue(t, repo, 33, "document:33:import")
 		claimed, err := repo.Claim(ctx, "worker-a", testLease)

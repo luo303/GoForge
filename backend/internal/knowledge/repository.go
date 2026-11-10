@@ -36,7 +36,7 @@ func NewRepository(db *gorm.DB) *Repository {
 var documentColumns = []string{
 	"id", "title", "source_type", "mime", "size_bytes", "content_hash",
 	"storage_path", "content", "collection", "tags", "status", "chunk_count",
-	"created_at", "updated_at",
+	"error_code", "error_message", "created_at", "updated_at",
 }
 
 // chunkColumns 跳过 embedding 与 tsv：前者 6KB/行且本阶段不用，
@@ -123,6 +123,21 @@ func (r *Repository) MarkIndexingWithJob(ctx context.Context, documentID int64, 
 		return tx.Create(j).Error
 	})
 	return translateError("mark indexing with job", err)
+}
+
+// MarkFailed 把文档标记为处理失败，并留下可解释的原因。
+//
+// 只在"任务最终失败"时调用（不可恢复错误，或重试次数用尽）：
+// 一次失败就标红，会让还在重试的任务与界面上的"失败"互相矛盾。
+func (r *Repository) MarkFailed(ctx context.Context, documentID int64, code, message string) error {
+	err := r.db.WithContext(ctx).Model(&Document{}).Where("id = ?", documentID).
+		Updates(map[string]any{
+			"status":        StatusFailed,
+			"error_code":    code,
+			"error_message": message,
+			"updated_at":    time.Now().UTC(),
+		}).Error
+	return translateError("mark document failed", err)
 }
 
 // Get 按主键读取文档，不存在时返回 ErrNotFound。

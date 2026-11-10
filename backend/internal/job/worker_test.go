@@ -20,6 +20,8 @@ type fakeStore struct {
 	claimed   []int64
 	succeeded []int64
 	released  []int64
+	retried   []int64
+	retryWait []time.Duration
 	failed    map[int64]string // job_id → code
 	failMsg   map[int64]string
 	renewErr  error
@@ -71,6 +73,14 @@ func (f *fakeStore) Fail(ctx context.Context, id int64, workerID, code, message 
 	defer f.mu.Unlock()
 	f.failed[id] = code
 	f.failMsg[id] = message
+	return nil
+}
+
+func (f *fakeStore) RetryLater(ctx context.Context, id int64, workerID string, delay time.Duration, code, message string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.retried = append(f.retried, id)
+	f.retryWait = append(f.retryWait, delay)
 	return nil
 }
 
@@ -143,7 +153,8 @@ func TestWorkerSucceeds(t *testing.T) {
 }
 
 func TestWorkerFailsOnHandlerError(t *testing.T) {
-	st := newFakeStore(&Job{ID: 2, Kind: "document.import"})
+	// MaxAttempts=1：模拟"这次就是最后一次机会"，此时不应再排队重试。
+	st := newFakeStore(&Job{ID: 2, Kind: "document.import", MaxAttempts: 1})
 
 	stop, done := runWorker(t, st, Options{WorkerID: "w1", Lease: 3 * time.Second, PollInterval: 10 * time.Millisecond},
 		func(w *Worker) {
@@ -165,6 +176,59 @@ func TestWorkerFailsOnHandlerError(t *testing.T) {
 	}
 	if st.failMsg[2] == "" {
 		t.Error("failure message should be recorded for humans")
+	}
+}
+
+// 可恢复错误且还有机会：应该退避重排，而不是判死。
+func TestWorkerRetriesRecoverableError(t *testing.T) {
+	st := newFakeStore(&Job{ID: 20, Kind: "document.import", MaxAttempts: 3})
+
+	stop, done := runWorker(t, st, Options{WorkerID: "w1", Lease: 3 * time.Second, PollInterval: 10 * time.Millisecond},
+		func(w *Worker) {
+			w.Register("document.import", func(ctx context.Context, j *Job) error {
+				return errors.New("minio: connection reset")
+			})
+		})
+	defer func() { stop(); <-done }()
+
+	waitFor(t, "job retried", func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return len(st.retried) == 1
+	})
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.failed) != 0 {
+		t.Errorf("failed = %v, want none while retries remain", st.failed)
+	}
+	// 等待时长必须为正：0 等于立即重试，会把对方继续打爆。
+	if st.retryWait[0] <= 0 {
+		t.Errorf("retry delay = %s, want positive backoff", st.retryWait[0])
+	}
+}
+
+// 被标记为永久失败的错误：即使还有重试次数也不该再排队。
+func TestWorkerFailsOnPermanentError(t *testing.T) {
+	st := newFakeStore(&Job{ID: 21, Kind: "document.import", MaxAttempts: 3})
+
+	stop, done := runWorker(t, st, Options{WorkerID: "w1", Lease: 3 * time.Second, PollInterval: 10 * time.Millisecond},
+		func(w *Worker) {
+			w.Register("document.import", func(ctx context.Context, j *Job) error {
+				return Permanent(errors.New("unsupported file type"))
+			})
+		})
+	defer func() { stop(); <-done }()
+
+	waitFor(t, "job failed", func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return st.failed[21] != ""
+	})
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.retried) != 0 {
+		t.Errorf("retried = %v, want none for a permanent error", st.retried)
 	}
 }
 

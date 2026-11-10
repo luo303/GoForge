@@ -74,6 +74,8 @@ type documentRepository interface {
 	FinishImport(ctx context.Context, documentID int64, chunks []Chunk) error
 	// MarkIndexingWithJob 在同一事务里把文档置 indexing 并建重索引任务（Phase 6）。
 	MarkIndexingWithJob(ctx context.Context, documentID int64, j *job.Job) error
+	// MarkFailed 记录处理最终失败与原因（Phase 6）。
+	MarkFailed(ctx context.Context, documentID int64, code, message string) error
 }
 
 // fileStore 是原始文件的存储能力。
@@ -266,6 +268,82 @@ func (s *Service) ProcessImport(ctx context.Context, documentID int64) error {
 		return err
 	}
 	return s.repo.FinishImport(ctx, documentID, chunks)
+}
+
+// ProcessImportTask 是 worker 调用的入口：执行导入，并在"最终失败"时写失败原因。
+//
+// 为什么要这一层，而不是让 worker 直接调 ProcessImport：
+// 只有业务层知道哪些错误是"再试也没用"（文件类型不支持、编码不对、原文丢了），
+// 也只有业务层能把失败原因写回 documents。worker 只管调度，不该认识这些细节。
+//
+// attempts / maxAttempts 由 worker 传入，与它自己的重试判断共用同一个结论，
+// 避免出现"任务还在重试、文档已经标成失败"的矛盾状态。
+func (s *Service) ProcessImportTask(ctx context.Context, documentID int64, attempts, maxAttempts int) error {
+	return s.settle(ctx, documentID, s.ProcessImport(ctx, documentID), attempts, maxAttempts)
+}
+
+// ProcessReindexTask 是重索引任务的入口，职责同 ProcessImportTask。
+func (s *Service) ProcessReindexTask(ctx context.Context, documentID int64, attempts, maxAttempts int) error {
+	return s.settle(ctx, documentID, s.ProcessReindex(ctx, documentID), attempts, maxAttempts)
+}
+
+// settle 负责"这次失败之后要不要给文档标红"。
+func (s *Service) settle(ctx context.Context, documentID int64, runErr error, attempts, maxAttempts int) error {
+	if runErr == nil {
+		return nil
+	}
+	err := s.classify(runErr)
+	probe := job.Job{Attempts: attempts, MaxAttempts: maxAttempts}
+	if job.ShouldRetry(&probe, err) {
+		// 还会重试：文档保持当前状态（pending / indexing），
+		// 万一这次失败被下一轮成功覆盖，用户根本不需要看到中间的失败。
+		return err
+	}
+	if markErr := s.repo.MarkFailed(ctx, documentID, errorCode(err), err.Error()); markErr != nil {
+		s.log.Warn("mark document failed",
+			zap.Int64("document_id", documentID), zap.Error(markErr))
+	}
+	return err
+}
+
+// classify 把"再试也没用"的错误标记成永久失败。
+//
+// 这些错误的共同点：同样的输入、同样的代码，重试三次得到的还是同一个结果。
+// 让它们跑满重试次数只会延迟用户看到错误的时间，并浪费三次任务名额。
+func (s *Service) classify(err error) error {
+	switch {
+	case errors.Is(err, ErrUnsupportedType),
+		errors.Is(err, ErrEmptyDocument),
+		errors.Is(err, ErrNotUTF8),
+		errors.Is(err, ErrInvalidMetadata),
+		errors.Is(err, ErrSourceMissing),
+		errors.Is(err, ErrNotFound):
+		return job.Permanent(err)
+	default:
+		return err
+	}
+}
+
+// errorCode 把错误翻译成稳定的机器可读代码，写进 documents.error_code。
+//
+// 用固定字符串而不是错误文案：文案会改、会翻译，前端与排查脚本不该跟着变。
+func errorCode(err error) string {
+	switch {
+	case errors.Is(err, ErrUnsupportedType):
+		return "unsupported_type"
+	case errors.Is(err, ErrEmptyDocument):
+		return "empty_document"
+	case errors.Is(err, ErrNotUTF8):
+		return "not_utf8"
+	case errors.Is(err, ErrInvalidMetadata):
+		return "invalid_metadata"
+	case errors.Is(err, ErrSourceMissing):
+		return "source_missing"
+	case errors.Is(err, ErrNotFound):
+		return "document_not_found"
+	default:
+		return "process_failed"
+	}
 }
 
 // startImport 写"待处理文档 + 任务"，并把"同内容已存在"翻译成 Existed。

@@ -198,16 +198,16 @@ func run() error {
 	worker.Register(knowledge.KindDocumentImport, func(ctx context.Context, j *job.Job) error {
 		docID, err := j.DocumentID()
 		if err != nil {
-			return err
+			return job.Permanent(err)
 		}
-		return knowledgeSvc.ProcessImport(ctx, docID)
+		return knowledgeSvc.ProcessImportTask(ctx, docID, j.Attempts, j.MaxAttempts)
 	})
 	worker.Register(knowledge.KindDocumentReindex, func(ctx context.Context, j *job.Job) error {
 		docID, err := j.DocumentID()
 		if err != nil {
-			return err
+			return job.Permanent(err)
 		}
-		return knowledgeSvc.ProcessReindex(ctx, docID)
+		return knowledgeSvc.ProcessReindexTask(ctx, docID, j.Attempts, j.MaxAttempts)
 	})
 
 	workerCtx, stopWorker := context.WithCancel(ctx)

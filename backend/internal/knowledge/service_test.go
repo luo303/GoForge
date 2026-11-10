@@ -135,6 +135,18 @@ func (f *fakeRepo) MarkIndexingWithJob(_ context.Context, documentID int64, j *j
 	return nil
 }
 
+// MarkFailed 复刻"写失败状态与原因"。
+func (f *fakeRepo) MarkFailed(_ context.Context, documentID int64, code, message string) error {
+	doc, ok := f.docs[documentID]
+	if !ok {
+		return ErrNotFound
+	}
+	doc.Status = StatusFailed
+	doc.ErrorCode = &code
+	doc.ErrorMessage = &message
+	return nil
+}
+
 func (f *fakeRepo) GetByContentHash(_ context.Context, hash string) (*Document, error) {
 	id, ok := f.hashIndex[hash]
 	if !ok {
@@ -278,6 +290,7 @@ type fakeStore struct {
 	files     map[string][]byte
 	reused    bool
 	saveErr   error
+	readErr   error // 非 fs.ErrNotExist 的读失败：用于模拟"存储暂时不可用"
 	removeErr error
 	removed   []string
 }
@@ -300,6 +313,9 @@ func (f *fakeStore) Save(_ context.Context, data []byte) (platform.SavedFile, er
 }
 
 func (f *fakeStore) Read(_ context.Context, relPath string) ([]byte, error) {
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
 	data, ok := f.files[relPath]
 	if !ok {
 		return nil, fmt.Errorf("read %s: %w", relPath, fs.ErrNotExist)
@@ -1156,4 +1172,61 @@ func finishImport(ctx context.Context, t *testing.T, svc *Service, res *ImportRe
 		return nil, false, err
 	}
 	return doc, false, nil
+}
+
+// 不可恢复的错误（原文丢失）即使还有重试次数，也应该立刻把文档标成失败：
+// 重试三次拿到的是同一个结果，只会延迟用户看到错误。
+func TestProcessImportTaskMarksFinalFailure(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepo()
+	// 既没有 storage_path 也没有 content：sourceText 必然报 ErrSourceMissing。
+	doc := &Document{
+		ID: 1, Title: "孤儿文档", MIME: MIMEMarkdown,
+		ContentHash: "deadbeef", SourceType: SourceFile, Status: StatusPending,
+	}
+	repo.docs[1] = doc
+	repo.nextID = 1
+	svc := NewService(repo, newFakeStore(), 1<<20, nil)
+
+	err := svc.ProcessImportTask(ctx, 1, 1, 3)
+	if !errors.Is(err, ErrSourceMissing) {
+		t.Fatalf("error = %v, want ErrSourceMissing", err)
+	}
+	if doc.Status != StatusFailed {
+		t.Errorf("status = %s, want failed", doc.Status)
+	}
+	if doc.ErrorCode == nil || *doc.ErrorCode != "source_missing" {
+		t.Errorf("error_code = %v, want source_missing", doc.ErrorCode)
+	}
+	if doc.ErrorMessage == nil || *doc.ErrorMessage == "" {
+		t.Error("error_message should keep a human readable reason")
+	}
+}
+
+// 可恢复的错误（存储暂时不可用）不该标红：任务还会重试，
+// 文档此时显示"失败"会和正在排队重试的任务互相矛盾。
+func TestProcessImportTaskKeepsPendingOnRetryableError(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepo()
+	path := "documents/abc"
+	doc := &Document{
+		ID: 2, Title: "正常文档", MIME: MIMEMarkdown, ContentHash: "cafebabe",
+		SourceType: SourceFile, StoragePath: &path, Status: StatusPending,
+	}
+	repo.docs[2] = doc
+	repo.nextID = 2
+	store := newFakeStore()
+	store.readErr = errors.New("minio: connection reset")
+	svc := NewService(repo, store, 1<<20, nil)
+
+	err := svc.ProcessImportTask(ctx, 2, 1, 3)
+	if err == nil {
+		t.Fatal("expected an error from a failing read")
+	}
+	if doc.Status != StatusPending {
+		t.Errorf("status = %s, want pending while retries remain", doc.Status)
+	}
+	if doc.ErrorCode != nil {
+		t.Errorf("error_code = %v, want nil before final failure", doc.ErrorCode)
+	}
 }

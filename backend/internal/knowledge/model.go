@@ -62,8 +62,13 @@ type Document struct {
 	Tags       StringArray `gorm:"column:tags;type:text[]"`
 	Status     string      `gorm:"column:status"`
 	ChunkCount int         `gorm:"column:chunk_count"`
-	CreatedAt  time.Time   `gorm:"column:created_at"`
-	UpdatedAt  time.Time   `gorm:"column:updated_at"`
+	// ErrorCode / ErrorMessage 只在处理最终失败时写入（Phase 6 异步任务）。
+	// 分开存是因为前者给程序判断（例如 source_missing 可以引导用户重新上传），
+	// 后者给人看；混成一个字段就得靠字符串匹配来做判断。
+	ErrorCode    *string   `gorm:"column:error_code"`
+	ErrorMessage *string   `gorm:"column:error_message"`
+	CreatedAt    time.Time `gorm:"column:created_at"`
+	UpdatedAt    time.Time `gorm:"column:updated_at"`
 }
 
 // TableName 显式声明表名。GORM 的默认复数化对 document 恰好正确，
