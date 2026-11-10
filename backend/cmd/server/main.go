@@ -202,6 +202,13 @@ func run() error {
 		}
 		return knowledgeSvc.ProcessImport(ctx, docID)
 	})
+	worker.Register(knowledge.KindDocumentReindex, func(ctx context.Context, j *job.Job) error {
+		docID, err := j.DocumentID()
+		if err != nil {
+			return err
+		}
+		return knowledgeSvc.ProcessReindex(ctx, docID)
+	})
 
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	workerDone := make(chan struct{})

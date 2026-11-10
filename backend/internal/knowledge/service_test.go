@@ -95,6 +95,43 @@ func (f *fakeRepo) FinishImport(_ context.Context, documentID int64, chunks []Ch
 	doc.ChunkCount = len(chunks)
 	doc.Status = StatusReady
 	doc.UpdatedAt = time.Now().UTC()
+	// 处理完成也意味着该文档身上的任务结束了：真实实现里这一步由 worker
+	// 写回 succeeded，假仓储没有 worker，就在这里收尾，
+	// 否则"处理完之后还能不能再排一条"的行为会与真实实现不一致。
+	for _, j := range f.jobs {
+		if !j.Status.Active() {
+			continue
+		}
+		if id, ok := j.Payload["document_id"].(int64); ok && id == documentID {
+			j.Status = job.StatusSucceeded
+		}
+	}
+	return nil
+}
+
+// MarkIndexingWithJob 复刻"置 indexing + 建任务"与部分唯一索引的去重行为：
+// 真实库靠 (kind, dedupe_key) where status in (queued,running) 挡住重复排队，
+// 假仓储不模拟的话，ErrReindexRunning 分支永远不会被走到。
+func (f *fakeRepo) MarkIndexingWithJob(_ context.Context, documentID int64, j *job.Job) error {
+	doc, ok := f.docs[documentID]
+	if !ok {
+		return ErrNotFound
+	}
+	for _, existing := range f.jobs {
+		if existing.Kind != KindDocumentReindex || !existing.Status.Active() {
+			continue
+		}
+		if existing.DedupeKey != nil && j.DedupeKey != nil && *existing.DedupeKey == *j.DedupeKey {
+			return ErrDuplicate
+		}
+	}
+	doc.Status = StatusIndexing
+	j.ID = int64(len(f.jobs) + 1)
+	if j.Payload == nil {
+		j.Payload = job.Payload{}
+	}
+	j.Payload["document_id"] = documentID
+	f.jobs = append(f.jobs, j)
 	return nil
 }
 

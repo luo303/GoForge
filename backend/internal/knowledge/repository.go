@@ -99,6 +99,32 @@ func (r *Repository) CreateWithJob(ctx context.Context, doc *Document, j *job.Jo
 	return translateError("create document with job", err)
 }
 
+// MarkIndexingWithJob 在同一个事务里把文档置为 indexing 并建一条重索引任务。
+//
+// 为什么要事务：只改状态不建任务，页面会永远停在"索引中"；只建任务不改状态，
+// 用户看不出已经在排队。两件事要么一起成立，要么都不成立。
+//
+// 同一文档已有未完成的重索引任务时，任务插入会撞部分唯一索引并返回 ErrDuplicate，
+// 整个事务回滚——状态也不会被动过，保持原样。
+func (r *Repository) MarkIndexingWithJob(ctx context.Context, documentID int64, j *job.Job) error {
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&Document{}).Where("id = ?", documentID).
+			Updates(map[string]any{
+				"status":     StatusIndexing,
+				"updated_at": time.Now().UTC(),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		j.Payload["document_id"] = documentID
+		return tx.Create(j).Error
+	})
+	return translateError("mark indexing with job", err)
+}
+
 // Get 按主键读取文档，不存在时返回 ErrNotFound。
 func (r *Repository) Get(ctx context.Context, id int64) (*Document, error) {
 	var doc Document

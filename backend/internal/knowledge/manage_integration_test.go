@@ -3,9 +3,12 @@ package knowledge
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/luo303/mindos/backend/internal/job"
 	"github.com/luo303/mindos/backend/internal/platform"
 )
 
@@ -259,5 +262,57 @@ func TestIdempotentImportIntegration(t *testing.T) {
 	}
 	if string(data) != text {
 		t.Errorf("stored file changed: %q", data)
+	}
+}
+
+// TestReindexTaskIntegration 验证"重索引受理"在真实库上的三件事：
+// 状态与任务同一事务、同一文档不能排两条队、执行完状态回到 ready。
+func TestReindexTaskIntegration(t *testing.T) {
+	db := setupKnowledgeDB(t)
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	doc := newIntegrationDocument("重索引任务")
+	if err := repo.CreateWithChunks(ctx, doc, chunkFixture(2)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	key := "document:" + strconv.FormatInt(doc.ID, 10) + ":reindex"
+	makeJob := func() *job.Job {
+		return &job.Job{
+			Kind:        KindDocumentReindex,
+			Status:      job.StatusQueued,
+			DedupeKey:   &key,
+			Payload:     job.Payload{},
+			MaxAttempts: 3,
+			RunAfter:    time.Now().UTC(),
+		}
+	}
+
+	if err := repo.MarkIndexingWithJob(ctx, doc.ID, makeJob()); err != nil {
+		t.Fatalf("mark indexing: %v", err)
+	}
+	indexing, err := repo.Get(ctx, doc.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if indexing.Status != StatusIndexing {
+		t.Errorf("status = %s, want indexing", indexing.Status)
+	}
+
+	// 部分唯一索引兜底：同一文档第二条未完成的重索引任务被拒。
+	if err := repo.MarkIndexingWithJob(ctx, doc.ID, makeJob()); !errors.Is(err, ErrDuplicate) {
+		t.Fatalf("second mark indexing error = %v, want ErrDuplicate", err)
+	}
+
+	if err := repo.FinishImport(ctx, doc.ID, chunkFixture(3)); err != nil {
+		t.Fatalf("finish import: %v", err)
+	}
+	got, err := repo.Get(ctx, doc.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != StatusReady || got.ChunkCount != 3 {
+		t.Errorf("after finish: status = %s chunk_count = %d, want ready/3", got.Status, got.ChunkCount)
 	}
 }

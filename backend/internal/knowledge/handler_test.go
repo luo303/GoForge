@@ -44,11 +44,17 @@ func newTestEngine(t *testing.T, maxUploadBytes int64) (*gin.Engine, *fakeRepo, 
 func processPending(t *testing.T, svc *Service, repo *fakeRepo) {
 	t.Helper()
 	for _, doc := range repo.docs {
-		if doc.Status != StatusPending {
+		var err error
+		switch doc.Status {
+		case StatusPending:
+			err = svc.ProcessImport(context.Background(), doc.ID)
+		case StatusIndexing:
+			err = svc.ProcessReindex(context.Background(), doc.ID)
+		default:
 			continue
 		}
-		if err := svc.ProcessImport(context.Background(), doc.ID); err != nil {
-			t.Fatalf("process pending document %d: %v", doc.ID, err)
+		if err != nil {
+			t.Fatalf("process document %d (%s): %v", doc.ID, doc.Status, err)
 		}
 	}
 }
@@ -429,16 +435,46 @@ func TestReindexEndpoint(t *testing.T) {
 	// 重索引本身还是同步的（下一笔才切），但前提是文档已经处理完。
 	processPending(t, svc, repo)
 
+	// 重索引也是异步的：202 + job_id，文档先置 indexing。
 	rec, env := doJSON(t, e, http.MethodPost, "/api/v1/documents/1/reindex", nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202, body = %s", rec.Code, rec.Body.String())
+	}
+	var accepted acceptedDocumentView
+	if err := json.Unmarshal(env.Data, &accepted); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if accepted.JobID == 0 {
+		t.Error("reindex must return a job id")
+	}
+	if accepted.Status != StatusIndexing {
+		t.Errorf("status = %s, want indexing while the job is queued", accepted.Status)
+	}
+
+	processPending(t, svc, repo)
+	rec, env = doJSON(t, e, http.MethodGet, "/api/v1/documents/1", nil)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+		t.Fatalf("detail status = %d", rec.Code)
 	}
 	var doc documentView
 	if err := json.Unmarshal(env.Data, &doc); err != nil {
-		t.Fatalf("decode: %v", err)
+		t.Fatalf("decode detail: %v", err)
+	}
+	if doc.Status != StatusReady {
+		t.Errorf("status = %s, want ready after reindex", doc.Status)
 	}
 	if doc.ChunkCount != len(repo.chunks[1]) || doc.ChunkCount == 0 {
 		t.Errorf("chunk_count = %d, stored = %d", doc.ChunkCount, len(repo.chunks[1]))
+	}
+
+	// 同一文档再点一次：已经有一条在跑，返回 409 而不是排两条队。
+	// 先重新排一条未执行的任务来模拟"正在跑"。
+	if rec, _ := doJSON(t, e, http.MethodPost, "/api/v1/documents/1/reindex", nil); rec.Code != http.StatusAccepted {
+		t.Fatalf("second reindex status = %d, want 202", rec.Code)
+	}
+	rec, env = doJSON(t, e, http.MethodPost, "/api/v1/documents/1/reindex", nil)
+	if rec.Code != http.StatusConflict || env.Code != "CONFLICT" {
+		t.Fatalf("duplicate reindex: status = %d code = %q, want 409 CONFLICT", rec.Code, env.Code)
 	}
 }
 

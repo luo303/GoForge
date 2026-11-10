@@ -50,13 +50,18 @@ type documentView struct {
 // 用内嵌而不是给 documentView 加字段：existed 只对"导入"这一个动作有意义，
 // 挂在详情/列表的视图上会让前端以为它是文档的固有属性。
 // 内嵌结构体的字段在 JSON 里会被提升到同一层，因此响应形状仍是扁平的。
-type importedDocumentView struct {
+// acceptedDocumentView 是"已受理、结果稍后产生"这类响应的公共形状。
+//
+// 导入与重索引都会返回它：两者都只是把活排进队列，响应里能给的只有
+// 当前文档快照与任务 id。抽象出来是为了让两个接口的响应形状不至于漂移。
+type acceptedDocumentView struct {
 	documentView
-	Existed bool `json:"existed"`
-	// JobID 是排队等待执行的任务 id。
-	// 幂等命中（existed=true）时没有新建任务，这里是 0——
-	// 前端不必区分，它只需要"有没有活要等"。
 	JobID int64 `json:"job_id"`
+}
+
+type importedDocumentView struct {
+	acceptedDocumentView
+	Existed bool `json:"existed"`
 }
 
 type chunkView struct {
@@ -278,12 +283,15 @@ func (h *Handler) Reindex(c *gin.Context) {
 		httpx.Fail(c, err)
 		return
 	}
-	doc, err := h.svc.Reindex(c.Request.Context(), id)
+	res, err := h.svc.StartReindex(c.Request.Context(), id)
 	if err != nil {
 		httpx.Fail(c, mapError(err))
 		return
 	}
-	httpx.OK(c, newDocumentView(doc))
+	httpx.Accepted(c, acceptedDocumentView{
+		documentView: newDocumentView(res.Document),
+		JobID:        res.JobID,
+	})
 }
 
 // respondImported 按"是否新建"选择状态码。
@@ -296,9 +304,11 @@ func (h *Handler) Reindex(c *gin.Context) {
 // 区分 200/202 仍然有意义——只凭状态码就知道"要不要等"。
 func respondImported(c *gin.Context, res *ImportResult) {
 	view := importedDocumentView{
-		documentView: newDocumentView(res.Document),
-		Existed:      res.Existed,
-		JobID:        res.JobID,
+		acceptedDocumentView: acceptedDocumentView{
+			documentView: newDocumentView(res.Document),
+			JobID:        res.JobID,
+		},
+		Existed: res.Existed,
 	}
 	if res.Existed {
 		httpx.OK(c, view)
@@ -441,6 +451,9 @@ func mapError(err error) error {
 	case errors.Is(err, ErrSourceMissing):
 		return httpx.ErrConflict.WithMessage(
 			"original content of this document is missing, reindex is not possible")
+	case errors.Is(err, ErrReindexRunning):
+		// 不是"参数错"，是"同一动作已经在进行中"——409 比 400 更准确。
+		return httpx.ErrConflict.WithMessage("reindex for this document is already running")
 	case errors.Is(err, ErrUnsupportedType):
 		return httpx.ErrUnsupportedMediaType.WithMessage(
 			"only Markdown (.md, .markdown) and plain text (.txt) files are supported")

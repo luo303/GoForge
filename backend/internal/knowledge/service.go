@@ -40,6 +40,10 @@ var (
 	ErrSourceMissing = errors.New("document source is missing")
 	// ErrInvalidMetadata 表示分类或标签不合法（超长、含分隔符、数量过多）。
 	ErrInvalidMetadata = errors.New("invalid document metadata")
+	// ErrReindexRunning 表示同一文档已有未完成的重索引任务。
+	// 与"重复导入"不同，重复导入返回既有文档（幂等），而重索引是"再排队一次"
+	// 的意图——已经排着队了就没必要再来一条，直接告诉调用方在跑。
+	ErrReindexRunning = errors.New("document reindex is already running")
 )
 
 // 分页边界。上限 100 是"防止一次拉全库"的护栏，不是性能优化。
@@ -68,6 +72,8 @@ type documentRepository interface {
 	CreateWithJob(ctx context.Context, doc *Document, j *job.Job) error
 	// FinishImport 在同一事务里替换分块并把文档置 ready（Phase 6）。
 	FinishImport(ctx context.Context, documentID int64, chunks []Chunk) error
+	// MarkIndexingWithJob 在同一事务里把文档置 indexing 并建重索引任务（Phase 6）。
+	MarkIndexingWithJob(ctx context.Context, documentID int64, j *job.Job) error
 }
 
 // fileStore 是原始文件的存储能力。
@@ -472,24 +478,66 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 // 顺序是先算完、再一次事务替换：算的途中失败什么都不改，
 // 替换的途中失败事务回滚，旧分块完整保留。
 func (s *Service) Reindex(ctx context.Context, id int64) (*Document, error) {
-	doc, err := s.repo.Get(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	text, err := s.sourceText(ctx, doc)
-	if err != nil {
-		return nil, err
-	}
-	chunks, err := buildChunks(doc.MIME, text)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.repo.ReplaceChunks(ctx, id, chunks); err != nil {
+	if err := s.ProcessReindex(ctx, id); err != nil {
 		return nil, err
 	}
 	// 重新读一次而不是手工改 doc.ChunkCount：chunk_count 与 updated_at
 	// 都由数据库写入，返回内存里的旧值会让前端看到"重索引了但数字没变"。
 	return s.repo.Get(ctx, id)
+}
+
+// StartReindex 受理一次重索引：置 indexing + 建任务，返回 job_id。
+//
+// 与导入不同的是这里不检查原文是否可得：文件在 MinIO 里，读一次要几毫秒到几百毫秒，
+// 放在请求里等于把外部依赖的延迟加到接口上。原文缺失由 worker 报 ErrSourceMissing，
+// 任务落 failed 并把原因写进文档，用户看到的是"重新切分失败：原文已丢失"——
+// 比在请求里 409 少一点即时性，但信息一样清楚，且状态是持久化的。
+//
+// 同一文档已有未完成的重索引任务时返回 ErrReindexRunning（409）：
+// 重复点击不该排两条队，那只会让同一份文档被两个 worker 同时替换分块。
+func (s *Service) StartReindex(ctx context.Context, id int64) (*ImportResult, error) {
+	doc, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	dedupeKey := fmt.Sprintf("document:%d:reindex", id)
+	queued := &job.Job{
+		Kind:        KindDocumentReindex,
+		Status:      job.StatusQueued,
+		DedupeKey:   &dedupeKey,
+		Payload:     job.Payload{},
+		MaxAttempts: defaultMaxAttempts,
+		RunAfter:    time.Now().UTC(),
+	}
+	if err := s.repo.MarkIndexingWithJob(ctx, id, queued); err != nil {
+		if errors.Is(err, ErrDuplicate) {
+			return nil, ErrReindexRunning
+		}
+		return nil, err
+	}
+	doc.Status = StatusIndexing
+	return &ImportResult{Document: doc, JobID: queued.ID}, nil
+}
+
+// ProcessReindex 是重索引任务的执行段。
+//
+// 顺序是先算完、再一次事务替换：算的途中失败什么都不改，
+// 替换的途中失败事务回滚，旧分块完整保留。
+func (s *Service) ProcessReindex(ctx context.Context, id int64) error {
+	doc, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	text, err := s.sourceText(ctx, doc)
+	if err != nil {
+		return err
+	}
+	chunks, err := buildChunks(doc.MIME, text)
+	if err != nil {
+		return err
+	}
+	// 与导入共用 FinishImport：换分块与置 ready 必须同进同退。
+	return s.repo.FinishImport(ctx, id, chunks)
 }
 
 // sourceText 取出文档的原始正文，供重索引使用。
