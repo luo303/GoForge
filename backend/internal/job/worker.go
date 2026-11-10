@@ -228,6 +228,14 @@ func (w *Worker) loop(ctx context.Context, slot int) {
 			continue
 		}
 
+		// 领取成功才记一条 debug：SQL 日志已被静音，这里是"谁领了什么"的唯一线索。
+		// 用 debug 而不是 info：正常运转时它同样会持续产生，只是频率远低于空闲轮询。
+		w.log.Debug("job claimed",
+			zap.Int64("job_id", j.ID),
+			zap.String("kind", string(j.Kind)),
+			zap.Int("attempt", j.Attempts),
+			zap.Int("slot", slot))
+
 		w.execute(ctx, j, slot)
 	}
 }

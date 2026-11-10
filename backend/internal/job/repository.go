@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // ErrNoJob 表示当前没有可领取的任务。
@@ -132,7 +133,13 @@ WHERE id = (
 RETURNING *`
 
 	var claimed Job
-	if err := r.db.WithContext(ctx).Raw(claimSQL, workerID, lease.Seconds()).Scan(&claimed).Error; err != nil {
+	// 这条是全系统唯一高频执行的 SQL：空闲时每个 worker 每 500ms 查一次，
+	// 开着 DB_LOG_SQL 会把控制台刷满，而 rows:0 本身就是"没活干"的正常含义，
+	// 不是值得记录的事件。用 Silent 会话执行它，其余 SQL 照常记录。
+	// 领取失败（真错误）仍会由调用方记 warn，不会因为静音而丢信息。
+	if err := r.db.WithContext(ctx).
+		Session(&gorm.Session{Logger: logger.Discard}).
+		Raw(claimSQL, workerID, lease.Seconds()).Scan(&claimed).Error; err != nil {
 		return nil, fmt.Errorf("claim job: %w", err)
 	}
 	if claimed.ID == 0 {
@@ -255,7 +262,11 @@ WHERE id = ? AND worker_id = ? AND status = 'running'`, id, workerID)
 // attempts 不回退：进程是在执行中死掉的，这次尝试确实发生了，
 // 与优雅停止（Release，我们自己叫停）区别就在于此。
 func (r *Repository) RequeueExpiredLeases(ctx context.Context, grace time.Duration) (int64, error) {
-	result := r.db.WithContext(ctx).Exec(`
+	// 与 Claim 同理：这是按间隔反复执行的维护语句，绝大多数时候回收 0 条。
+	// 真正的"回收了多少"由 worker 在 n > 0 时以 info 记录，不需要 SQL 原文陪跑。
+	result := r.db.WithContext(ctx).
+		Session(&gorm.Session{Logger: logger.Discard}).
+		Exec(`
 UPDATE jobs SET status = 'queued', worker_id = NULL, lease_expires_at = NULL,
        run_after = now(), updated_at = now()
 WHERE status = 'running' AND lease_expires_at IS NOT NULL
