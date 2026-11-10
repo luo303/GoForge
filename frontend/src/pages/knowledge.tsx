@@ -24,7 +24,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { DocumentDetail } from '@/pages/knowledge/document-detail'
 import { DocumentList } from '@/pages/knowledge/document-list'
 import { FilterBar } from '@/pages/knowledge/filter-bar'
-import { PAGE_SIZE } from '@/pages/knowledge/format'
+import { isInFlight, PAGE_SIZE, POLL_INTERVAL_MS } from '@/pages/knowledge/format'
 import { NoteComposer, type NoteDraft } from '@/pages/knowledge/note-composer'
 import { UploadComposer, type UploadDraft } from '@/pages/knowledge/upload-composer'
 
@@ -57,6 +57,10 @@ export function KnowledgePage() {
   const listQuery = useQuery({
     queryKey: documentKeys.list(query),
     queryFn: ({ signal }) => fetchDocuments(query, signal),
+    // 导入是异步的：只要列表里还有文档在处理中，就每秒重取一次，
+    // 让"待处理 → 已解析"自然过渡。全部终态后自动停，不会一直空转。
+    refetchInterval: (q) =>
+      q.state.data?.items.some((item) => isInFlight(item.status)) ? POLL_INTERVAL_MS : false,
   })
 
   const items = listQuery.data?.items ?? []
@@ -68,6 +72,10 @@ export function KnowledgePage() {
     queryKey: documentKeys.detail(activeId ?? 0),
     queryFn: ({ signal }) => fetchDocument(activeId as number, signal),
     enabled: activeId !== null,
+    // 详情与列表各自轮询：详情是"当前这一篇"，列表是"有没有别的还在跑"，
+    // 只看其中一个都会出现"列表变了但详情还显示处理中"。
+    refetchInterval: (q) =>
+      q.state.data && isInFlight(q.state.data.status) ? POLL_INTERVAL_MS : false,
   })
   const chunksQuery = useQuery({
     queryKey: documentKeys.chunks(activeId ?? 0),
@@ -331,7 +339,7 @@ function ImportNotice({
       <p className="text-sm">
         {notice.existed
           ? `内容与已有文档一致，已复用《${notice.title}》，没有重复入库。`
-          : `已导入《${notice.title}》。`}
+          : `已受理《${notice.title}》，正在后台解析，完成后会自动刷新。`}
       </p>
       <Button variant="ghost" size="sm" onClick={onDismiss} aria-label="关闭提示">
         <X aria-hidden="true" />

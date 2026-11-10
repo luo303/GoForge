@@ -193,6 +193,40 @@ describe('知识库页面', () => {
     })
   })
 
+  it('上传受理后提示后台解析并显示待处理状态', async () => {
+    const user = userEvent.setup()
+    const pendingDoc = documentFixture({ id: 8, title: '大文件', status: 'pending', chunk_count: 0 })
+
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === '/api/v1/documents' && init?.method === 'POST') {
+        // 202 的含义：受理成功，但内容还没处理。
+        return jsonOk(envelope({ ...pendingDoc, existed: false, job_id: 7 }), 202)
+      }
+      if (url === '/api/v1/documents?limit=20&offset=0') {
+        return jsonOk(envelope(documentListFixture([pendingDoc])))
+      }
+      if (url === `/api/v1/documents/${pendingDoc.id}`) {
+        return jsonOk(envelope(pendingDoc))
+      }
+      if (url === `/api/v1/documents/${pendingDoc.id}/chunks?limit=100&offset=0`) {
+        return jsonOk(envelope({ items: [], total: 0, limit: 100, offset: 0 }))
+      }
+      return jsonOk({ code: 'NOT_FOUND', message: url }, 404)
+    })
+
+    renderApp('/knowledge')
+    await screen.findByText('大文件')
+
+    const file = new File(['# 大文件'], 'big.md', { type: 'text/markdown' })
+    await user.upload(screen.getByLabelText('选择要导入的文件'), file)
+    await user.click(await screen.findByRole('button', { name: '开始导入' }))
+
+    // 文案不能再说"已导入"：分块还没生成，说导入完成是在骗用户。
+    expect(await screen.findByText(/已受理《大文件》，正在后台解析/)).toBeInTheDocument()
+    expect(screen.getAllByText('待处理').length).toBeGreaterThan(0)
+  })
+
   it('取消后关闭面板且不发导入请求', async () => {
     const user = userEvent.setup()
     mockHappyPath(documentFixture(), '正文')

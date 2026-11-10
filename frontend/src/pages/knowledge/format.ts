@@ -34,6 +34,21 @@ export const statusOptions: { value: DocumentStatus | ''; label: string }[] = [
   { value: 'cancelling', label: statusMeta.cancelling.label },
 ]
 
+/**
+ * 是否还在后台处理中（Phase 6 起导入是异步的）。
+ *
+ * 这三个状态意味着"现在看到的不是最终结果"，页面对它们要轮询；
+ * ready / failed / cancelling 都不再轮询，免得请求永远停不下来。
+ */
+const IN_FLIGHT: DocumentStatus[] = ['pending', 'parsing', 'indexing']
+
+export function isInFlight(status: DocumentStatus): boolean {
+  return IN_FLIGHT.includes(status)
+}
+
+/** 轮询间隔：1s 能让"处理中 → 已解析"的过渡看得见，又不至于把接口打爆。 */
+export const POLL_INTERVAL_MS = 1000
+
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`

@@ -60,9 +60,15 @@ function normalizeDocument(raw: WireDocumentView): DocumentView {
   return { ...raw, collection: raw.collection ?? '', tags: raw.tags ?? [] }
 }
 
-/** 导入响应多一个 existed；旧后端没有这个字段时按"新建"处理。 */
-function normalizeImported(raw: WireDocumentView & { existed?: boolean }): ImportedDocumentView {
-  return { ...normalizeDocument(raw), existed: raw.existed ?? false }
+/**
+ * 导入响应多 existed 与 job_id。
+ * 两者都做缺省兜底：旧后端没有 job_id 时按"没有待等任务"处理（0），
+ * 页面照常显示，不会因为一个整数缺失把整条响应判成非法。
+ */
+function normalizeImported(
+  raw: WireDocumentView & { existed?: boolean; job_id?: number },
+): ImportedDocumentView {
+  return { ...normalizeDocument(raw), existed: raw.existed ?? false, job_id: raw.job_id ?? 0 }
 }
 
 export async function fetchDocuments(
@@ -103,7 +109,7 @@ export async function uploadDocument(
     body.append('tags', meta.tags.join(','))
   }
   return normalizeImported(
-    await apiRequest<WireDocumentView & { existed?: boolean }>('/documents', {
+    await apiRequest<WireDocumentView & { existed?: boolean; job_id?: number }>('/documents', {
       method: 'POST',
       body,
       // 上传比普通请求慢：解析与切分在同一个请求里完成，10s 默认值不够稳。
@@ -131,7 +137,7 @@ export async function createNote(input: {
     body.tags = input.tags
   }
   return normalizeImported(
-    await apiRequest<WireDocumentView & { existed?: boolean }>('/documents/note', {
+    await apiRequest<WireDocumentView & { existed?: boolean; job_id?: number }>('/documents/note', {
       method: 'POST',
       body,
     }),
