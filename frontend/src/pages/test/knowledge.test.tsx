@@ -227,6 +227,46 @@ describe('知识库页面', () => {
     expect(screen.getAllByText('待处理').length).toBeGreaterThan(0)
   })
 
+  // 回归用例：导入提示说"完成后会自动刷新"，那就必须真的自动出现分块。
+  // 之前只有详情在轮询，分块停在旧结果，用户得切走再切回才看得到。
+  it('后台处理完成后自动刷新分块，不需要手动切换文档', async () => {
+    const pending = documentFixture({ id: 12, status: 'pending', chunk_count: 0 })
+    const ready = { ...pending, status: 'ready' as const, chunk_count: 1 }
+    let processed = false
+
+    fetchMock.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      const doc = processed ? ready : pending
+      if (url === '/api/v1/documents?limit=20&offset=0') {
+        return jsonOk(envelope(documentListFixture([doc])))
+      }
+      if (url === '/api/v1/documents/12') {
+        return jsonOk(envelope(doc))
+      }
+      if (url === '/api/v1/documents/12/chunks?limit=100&offset=0') {
+        return jsonOk(
+          envelope(
+            processed
+              ? chunkList([chunkFixture({ content: '轮询拿到的分块内容' })])
+              : { items: [], total: 0, limit: 100, offset: 0 },
+          ),
+        )
+      }
+      return jsonOk({ code: 'NOT_FOUND', message: url }, 404)
+    })
+
+    renderApp('/knowledge')
+
+    expect(await screen.findByText('待处理')).toBeInTheDocument()
+    expect(screen.queryByText(/轮询拿到的分块内容/)).not.toBeInTheDocument()
+
+    // 后台这一刻处理完了；页面应当在下一轮轮询里自己拿到分块。
+    processed = true
+    expect(
+      await screen.findByText(/轮询拿到的分块内容/, undefined, { timeout: 5000 }),
+    ).toBeInTheDocument()
+  })
+
   it('处理中的文档可以取消，请求打到 cancel 接口', async () => {
     const user = userEvent.setup()
     const pending = documentFixture({ id: 11, status: 'pending', chunk_count: 0 })

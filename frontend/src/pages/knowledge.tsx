@@ -82,6 +82,22 @@ export function KnowledgePage() {
     queryKey: documentKeys.chunks(activeId ?? 0),
     queryFn: ({ signal }) => fetchChunks(activeId as number, signal),
     enabled: activeId !== null,
+    // 分块也必须跟着轮询，否则会出现"状态已经变成已解析、分块还是空"的割裂：
+    // 详情与分块是两个请求，只让详情轮询的话，用户的观感就是"说会自动刷新，
+    // 其实得切走再切回"。两个条件任一成立就继续跟：
+    //   1. 文档还在处理中；
+    //   2. 处理完了但分块数和文档记的对不上（差那一拍，再取一次就齐了）。
+    refetchInterval: (q) => {
+      const doc = detailQuery.data
+      if (!doc) {
+        return false
+      }
+      if (isInFlight(doc.status)) {
+        return POLL_INTERVAL_MS
+      }
+      const loaded = q.state.data?.total ?? 0
+      return loaded === doc.chunk_count ? false : POLL_INTERVAL_MS
+    },
   })
 
   const invalidateDocuments = () => {
