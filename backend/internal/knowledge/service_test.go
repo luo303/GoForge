@@ -325,7 +325,7 @@ func TestImportFileMarkdown(t *testing.T) {
 	svc, repo, store := newTestService(1 << 20)
 	text := "# 标题\n\n第一段内容。\n\n## 小节\n\n第二段内容。\n"
 
-	doc, _, err := svc.ImportFile(context.Background(), FileInput{
+	doc, _, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "guide.md",
 		Content:  strings.NewReader(text),
 	})
@@ -384,7 +384,7 @@ func TestImportFileMarkdown(t *testing.T) {
 func TestImportFileRejectsUnsupportedType(t *testing.T) {
 	svc, _, store := newTestService(1 << 20)
 
-	_, _, err := svc.ImportFile(context.Background(), FileInput{
+	_, _, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "slides.pdf",
 		Content:  strings.NewReader("%PDF-1.4"),
 	})
@@ -400,14 +400,14 @@ func TestImportFileRejectsNonUTF8AndEmpty(t *testing.T) {
 	svc, _, store := newTestService(1 << 20)
 	ctx := context.Background()
 
-	if _, _, err := svc.ImportFile(ctx, FileInput{
+	if _, _, err := importFile(ctx, t, svc, FileInput{
 		Filename: "binary.md",
 		Content:  bytes.NewReader([]byte{0xff, 0xfe, 0x00}),
 	}); !errors.Is(err, ErrNotUTF8) {
 		t.Fatalf("non-UTF8 err = %v, want ErrNotUTF8", err)
 	}
 
-	if _, _, err := svc.ImportFile(ctx, FileInput{
+	if _, _, err := importFile(ctx, t, svc, FileInput{
 		Filename: "empty.txt",
 		Content:  strings.NewReader(" \n\n\t\n"),
 	}); !errors.Is(err, ErrEmptyDocument) {
@@ -422,7 +422,7 @@ func TestImportFileRejectsNonUTF8AndEmpty(t *testing.T) {
 func TestImportFileRejectsOversizedFile(t *testing.T) {
 	svc, _, store := newTestService(8)
 
-	_, _, err := svc.ImportFile(context.Background(), FileInput{
+	_, _, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "big.txt",
 		Content:  strings.NewReader("123456789"),
 	})
@@ -434,7 +434,7 @@ func TestImportFileRejectsOversizedFile(t *testing.T) {
 	}
 
 	// 恰好等于上限应当通过：读 limit+1 字节再判断，不能把边界值误判成超限。
-	if _, _, err := svc.ImportFile(context.Background(), FileInput{
+	if _, _, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "exact.txt",
 		Content:  strings.NewReader("12345678"),
 	}); err != nil {
@@ -446,7 +446,7 @@ func TestImportFileRemovesFileWhenPersistFails(t *testing.T) {
 	svc, repo, store := newTestService(1 << 20)
 	repo.createErr = errors.New("insert chunks failed")
 
-	_, _, err := svc.ImportFile(context.Background(), FileInput{
+	_, _, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "note.md",
 		Content:  strings.NewReader("# 标题\n\n正文。\n"),
 	})
@@ -469,7 +469,7 @@ func TestImportReusedFileBecomesIdempotentHit(t *testing.T) {
 	svc, repo, store := newTestService(1 << 20)
 	content := "# 标题\n\n正文。\n"
 
-	first, existed, err := svc.ImportFile(context.Background(), FileInput{
+	first, existed, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "first.md",
 		Content:  strings.NewReader(content),
 	})
@@ -477,7 +477,7 @@ func TestImportReusedFileBecomesIdempotentHit(t *testing.T) {
 		t.Fatalf("first import: existed=%v err=%v", existed, err)
 	}
 
-	second, existed, err := svc.ImportFile(context.Background(), FileInput{
+	second, existed, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "second.md",
 		Content:  strings.NewReader(content),
 	})
@@ -505,7 +505,7 @@ func TestImportNoteDerivesTitleAndStoresContent(t *testing.T) {
 	svc, repo, store := newTestService(1 << 20)
 	content := "# 会议纪要\n\n下周交付。\n"
 
-	doc, _, err := svc.ImportNote(context.Background(), NoteInput{Content: content})
+	doc, _, err := importNote(context.Background(), t, svc, NoteInput{Content: content})
 	if err != nil {
 		t.Fatalf("ImportNote: %v", err)
 	}
@@ -526,7 +526,7 @@ func TestImportNoteDerivesTitleAndStoresContent(t *testing.T) {
 	}
 
 	// 显式标题优先于正文首行。
-	doc2, _, err := svc.ImportNote(context.Background(), NoteInput{
+	doc2, _, err := importNote(context.Background(), t, svc, NoteInput{
 		Title:   "自定义标题",
 		Content: "完全不同的正文。",
 	})
@@ -542,10 +542,10 @@ func TestImportNoteRejectsEmptyAndOversized(t *testing.T) {
 	svc, _, _ := newTestService(4)
 	ctx := context.Background()
 
-	if _, _, err := svc.ImportNote(ctx, NoteInput{Content: "   \n"}); !errors.Is(err, ErrEmptyDocument) {
+	if _, _, err := importNote(ctx, t, svc, NoteInput{Content: "   \n"}); !errors.Is(err, ErrEmptyDocument) {
 		t.Fatalf("empty note err = %v, want ErrEmptyDocument", err)
 	}
-	if _, _, err := svc.ImportNote(ctx, NoteInput{Content: "五个字符"}); !errors.Is(err, ErrTooLarge) {
+	if _, _, err := importNote(ctx, t, svc, NoteInput{Content: "五个字符"}); !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("oversized note err = %v, want ErrTooLarge", err)
 	}
 }
@@ -554,7 +554,7 @@ func TestImportStripsBOMAndKeepsOffsets(t *testing.T) {
 	svc, repo, _ := newTestService(1 << 20)
 	content := "\ufeff# 标题\n\n正文。\n"
 
-	doc, _, err := svc.ImportFile(context.Background(), FileInput{
+	doc, _, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "bom.md",
 		Content:  strings.NewReader(content),
 	})
@@ -587,7 +587,7 @@ func TestGetMissingDocument(t *testing.T) {
 // 分类与标签在入库前被规整：去空白、去重、丢空项，保持输入顺序。
 func TestImportStoresCollectionAndTags(t *testing.T) {
 	svc, _, _ := newTestService(1 << 20)
-	doc, _, err := svc.ImportNote(context.Background(), NoteInput{
+	doc, _, err := importNote(context.Background(), t, svc, NoteInput{
 		Content:    "# 带标签\n\n正文。\n",
 		Collection: "  工作  ",
 		Tags:       []string{" go ", "go", "", "检索"},
@@ -620,7 +620,7 @@ func TestImportRejectsInvalidMetadata(t *testing.T) {
 		{"分类超长", NoteInput{Content: "正文", Collection: strings.Repeat("类", maxCollectionRunes+1)}},
 	}
 	for _, c := range cases {
-		if _, _, err := svc.ImportNote(context.Background(), c.in); !errors.Is(err, ErrInvalidMetadata) {
+		if _, _, err := importNote(context.Background(), t, svc, c.in); !errors.Is(err, ErrInvalidMetadata) {
 			t.Errorf("%s: err = %v, want ErrInvalidMetadata", c.name, err)
 		}
 	}
@@ -635,7 +635,7 @@ func TestListFilters(t *testing.T) {
 		{Content: "c 号", Tags: []string{"go"}},
 	}
 	for _, seed := range seeds {
-		if _, _, err := svc.ImportNote(ctx, seed); err != nil {
+		if _, _, err := importNote(ctx, t, svc, seed); err != nil {
 			t.Fatalf("seed %q: %v", seed.Content, err)
 		}
 	}
@@ -676,7 +676,7 @@ func TestListFilters(t *testing.T) {
 func TestUpdateMetadata(t *testing.T) {
 	svc, _, _ := newTestService(1 << 20)
 	ctx := context.Background()
-	doc, _, err := svc.ImportNote(ctx, NoteInput{Content: "# 原标题\n\n正文。\n"})
+	doc, _, err := importNote(ctx, t, svc, NoteInput{Content: "# 原标题\n\n正文。\n"})
 	if err != nil {
 		t.Fatalf("import: %v", err)
 	}
@@ -718,7 +718,7 @@ func TestUpdateMetadata(t *testing.T) {
 func TestUpdateRejectsInvalidInput(t *testing.T) {
 	svc, _, _ := newTestService(1 << 20)
 	ctx := context.Background()
-	doc, _, err := svc.ImportNote(ctx, NoteInput{Content: "正文"})
+	doc, _, err := importNote(ctx, t, svc, NoteInput{Content: "正文"})
 	if err != nil {
 		t.Fatalf("import: %v", err)
 	}
@@ -740,7 +740,7 @@ func TestListClampsPaging(t *testing.T) {
 	svc, _, _ := newTestService(1 << 20)
 	ctx := context.Background()
 	for i := 0; i < 3; i++ {
-		if _, _, err := svc.ImportNote(ctx, NoteInput{Content: string(rune('a'+i)) + " 号笔记"}); err != nil {
+		if _, _, err := importNote(ctx, t, svc, NoteInput{Content: string(rune('a'+i)) + " 号笔记"}); err != nil {
 			t.Fatalf("seed note %d: %v", i, err)
 		}
 	}
@@ -790,7 +790,7 @@ func TestImportFileIsIdempotent(t *testing.T) {
 	svc, repo, store := newTestService(1 << 20)
 	text := "# 标题\n\n同一份内容。\n"
 
-	first, existed, err := svc.ImportFile(context.Background(), FileInput{
+	first, existed, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "a.md",
 		Content:  strings.NewReader(text),
 	})
@@ -803,7 +803,7 @@ func TestImportFileIsIdempotent(t *testing.T) {
 	firstChunks := len(repo.chunks[first.ID])
 
 	// 第二次用不同的文件名，但内容一致：标题不能因此被改写。
-	second, existed, err := svc.ImportFile(context.Background(), FileInput{
+	second, existed, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "b.md",
 		Content:  strings.NewReader(text),
 	})
@@ -841,7 +841,7 @@ func TestImportFileDuplicateKeepsRewrittenFile(t *testing.T) {
 	svc, _, store := newTestService(1 << 20)
 	text := "# 标题\n\n原文。\n"
 
-	first, _, err := svc.ImportFile(context.Background(), FileInput{
+	first, _, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "a.md",
 		Content:  strings.NewReader(text),
 	})
@@ -850,7 +850,7 @@ func TestImportFileDuplicateKeepsRewrittenFile(t *testing.T) {
 	}
 	store.files = map[string][]byte{} // 模拟原文丢失
 
-	if _, existed, err := svc.ImportFile(context.Background(), FileInput{
+	if _, existed, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "a.md",
 		Content:  strings.NewReader(text),
 	}); err != nil || !existed {
@@ -870,12 +870,12 @@ func TestImportNoteIsIdempotent(t *testing.T) {
 	svc, repo, _ := newTestService(1 << 20)
 	content := "# 会议记录\n\n结论：先做幂等。\n"
 
-	first, existed, err := svc.ImportNote(context.Background(), NoteInput{Content: content})
+	first, existed, err := importNote(context.Background(), t, svc, NoteInput{Content: content})
 	if err != nil || existed {
 		t.Fatalf("first note: existed=%v err=%v", existed, err)
 	}
 
-	second, existed, err := svc.ImportNote(context.Background(), NoteInput{
+	second, existed, err := importNote(context.Background(), t, svc, NoteInput{
 		Title:   "另一个标题",
 		Content: content,
 	})
@@ -892,7 +892,7 @@ func TestImportNoteIsIdempotent(t *testing.T) {
 
 func TestDeleteRemovesDocumentChunksAndFile(t *testing.T) {
 	svc, repo, store := newTestService(1 << 20)
-	doc, _, err := svc.ImportFile(context.Background(), FileInput{
+	doc, _, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "a.md",
 		Content:  strings.NewReader("# 标题\n\n正文。\n"),
 	})
@@ -929,7 +929,7 @@ func TestDeleteMissingDocument(t *testing.T) {
 // 只留一条 warn。这里断言"不报错且文件仍在"，正是为了让这个取舍可见。
 func TestDeleteSucceedsWhenFileRemovalFails(t *testing.T) {
 	svc, repo, store := newTestService(1 << 20)
-	doc, _, err := svc.ImportFile(context.Background(), FileInput{
+	doc, _, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "a.md",
 		Content:  strings.NewReader("# 标题\n\n正文。\n"),
 	})
@@ -952,7 +952,7 @@ func TestDeleteSucceedsWhenFileRemovalFails(t *testing.T) {
 // 重索引从原文重新切分：不是"再切一份追加"，而是整体替换。
 func TestReindexRecomputesChunksFromStoredFile(t *testing.T) {
 	svc, repo, store := newTestService(1 << 20)
-	doc, _, err := svc.ImportFile(context.Background(), FileInput{
+	doc, _, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "a.md",
 		Content:  strings.NewReader("# 旧标题\n\n旧正文。\n"),
 	})
@@ -964,7 +964,7 @@ func TestReindexRecomputesChunksFromStoredFile(t *testing.T) {
 	newText := "# 新标题\n\n新正文第一段。\n\n## 新小节\n\n新正文第二段。\n"
 	store.files[*doc.StoragePath] = []byte(newText)
 
-	updated, err := svc.Reindex(context.Background(), doc.ID)
+	updated, err := reindexNow(context.Background(), t, svc, doc.ID)
 	if err != nil {
 		t.Fatalf("reindex: %v", err)
 	}
@@ -994,7 +994,7 @@ func TestReindexRecomputesChunksFromStoredFile(t *testing.T) {
 // 替换失败时旧分块必须原封不动，否则用户重试前会看到一条空文档。
 func TestReindexKeepsOldChunksWhenReplaceFails(t *testing.T) {
 	svc, repo, _ := newTestService(1 << 20)
-	doc, _, err := svc.ImportFile(context.Background(), FileInput{
+	doc, _, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "a.md",
 		Content:  strings.NewReader("# 标题\n\n正文。\n"),
 	})
@@ -1004,7 +1004,7 @@ func TestReindexKeepsOldChunksWhenReplaceFails(t *testing.T) {
 	before := repo.chunks[doc.ID]
 
 	repo.replaceErr = errors.New("database is down")
-	if _, err := svc.Reindex(context.Background(), doc.ID); err == nil {
+	if _, err := reindexNow(context.Background(), t, svc, doc.ID); err == nil {
 		t.Fatal("expected reindex to fail")
 	}
 	if len(repo.chunks[doc.ID]) != len(before) {
@@ -1014,7 +1014,7 @@ func TestReindexKeepsOldChunksWhenReplaceFails(t *testing.T) {
 
 func TestReindexMissingSource(t *testing.T) {
 	svc, _, store := newTestService(1 << 20)
-	doc, _, err := svc.ImportFile(context.Background(), FileInput{
+	doc, _, err := importFile(context.Background(), t, svc, FileInput{
 		Filename: "a.md",
 		Content:  strings.NewReader("# 标题\n\n正文。\n"),
 	})
@@ -1023,14 +1023,14 @@ func TestReindexMissingSource(t *testing.T) {
 	}
 	delete(store.files, *doc.StoragePath) // 原文被手工删掉
 
-	if _, err := svc.Reindex(context.Background(), doc.ID); !errors.Is(err, ErrSourceMissing) {
+	if _, err := reindexNow(context.Background(), t, svc, doc.ID); !errors.Is(err, ErrSourceMissing) {
 		t.Fatalf("err = %v, want ErrSourceMissing", err)
 	}
 }
 
 func TestReindexMissingDocument(t *testing.T) {
 	svc, _, _ := newTestService(1 << 20)
-	if _, err := svc.Reindex(context.Background(), 42); !errors.Is(err, ErrNotFound) {
+	if _, err := reindexNow(context.Background(), t, svc, 42); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 }
@@ -1038,13 +1038,13 @@ func TestReindexMissingDocument(t *testing.T) {
 // 笔记没有文件，重索引读的是 documents.content。
 func TestReindexNoteUsesStoredContent(t *testing.T) {
 	svc, repo, _ := newTestService(1 << 20)
-	doc, _, err := svc.ImportNote(context.Background(), NoteInput{
+	doc, _, err := importNote(context.Background(), t, svc, NoteInput{
 		Content: "# 标题\n\n正文。\n",
 	})
 	if err != nil {
 		t.Fatalf("import note: %v", err)
 	}
-	updated, err := svc.Reindex(context.Background(), doc.ID)
+	updated, err := reindexNow(context.Background(), t, svc, doc.ID)
 	if err != nil {
 		t.Fatalf("reindex: %v", err)
 	}
@@ -1103,4 +1103,57 @@ func TestStartImportEnqueuesThenProcesses(t *testing.T) {
 	if done.ChunkCount == 0 {
 		t.Error("processing should write chunks")
 	}
+}
+
+// 下面三个 helper 模拟"任务已受理、worker 立刻跑完"。
+//
+// 测试要断言的是业务结果，不是调度过程——调度由 job 包与 worker 自己的用例覆盖。
+// 把两步拼在这里，既避免每个用例重复写 Start + Process，也让"服务层只有两段"
+// 这个事实在测试里保持一致：不再有"同步导入"这条平行路径可走。
+func importFile(ctx context.Context, t *testing.T, svc *Service, in FileInput) (*Document, bool, error) {
+	t.Helper()
+	res, err := svc.StartFileImport(ctx, in)
+	if err != nil {
+		return nil, false, err
+	}
+	if res.Existed {
+		return res.Document, true, nil
+	}
+	return finishImport(ctx, t, svc, res)
+}
+
+func importNote(ctx context.Context, t *testing.T, svc *Service, in NoteInput) (*Document, bool, error) {
+	t.Helper()
+	res, err := svc.StartNoteImport(ctx, in)
+	if err != nil {
+		return nil, false, err
+	}
+	if res.Existed {
+		return res.Document, true, nil
+	}
+	return finishImport(ctx, t, svc, res)
+}
+
+func reindexNow(ctx context.Context, t *testing.T, svc *Service, id int64) (*Document, error) {
+	t.Helper()
+	if _, err := svc.StartReindex(ctx, id); err != nil {
+		return nil, err
+	}
+	if err := svc.ProcessReindex(ctx, id); err != nil {
+		return nil, err
+	}
+	return svc.Get(ctx, id)
+}
+
+// finishImport 跑执行段并读回最终状态。
+func finishImport(ctx context.Context, t *testing.T, svc *Service, res *ImportResult) (*Document, bool, error) {
+	t.Helper()
+	if err := svc.ProcessImport(ctx, res.Document.ID); err != nil {
+		return nil, false, err
+	}
+	doc, err := svc.Get(ctx, res.Document.ID)
+	if err != nil {
+		return nil, false, err
+	}
+	return doc, false, nil
 }

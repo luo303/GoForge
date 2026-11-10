@@ -312,50 +312,6 @@ func (s *Service) startImport(ctx context.Context, doc *Document, saved *platfor
 	return nil, err
 }
 
-// ImportFile 在请求内完成导入：StartFileImport + 立即 ProcessImport。
-//
-// 存在的唯一理由是过渡：HTTP 层还返回 201、测试还断言"函数返回时已有分块"。
-// 下一笔把 handler 切到 202 后，这个方法连同一个提交周期内的测试一起删掉——
-// 同步与异步两条路径长期并存，会出现"改了异步忘了改同步"的隐性 bug。
-func (s *Service) ImportFile(ctx context.Context, in FileInput) (*Document, bool, error) {
-	res, err := s.StartFileImport(ctx, in)
-	if err != nil {
-		return nil, false, err
-	}
-	if res.Existed {
-		return res.Document, true, nil
-	}
-	if err := s.ProcessImport(ctx, res.Document.ID); err != nil {
-		return nil, false, err
-	}
-	// 重新读一次：chunk_count 与 status 都由数据库写入，
-	// 返回内存里的旧值会让调用方看到"导入了但块数是 0"。
-	doc, err := s.repo.Get(ctx, res.Document.ID)
-	if err != nil {
-		return nil, false, err
-	}
-	return doc, false, nil
-}
-
-// ImportNote 是 StartNoteImport 的同步封装，理由同 ImportFile。
-func (s *Service) ImportNote(ctx context.Context, in NoteInput) (*Document, bool, error) {
-	res, err := s.StartNoteImport(ctx, in)
-	if err != nil {
-		return nil, false, err
-	}
-	if res.Existed {
-		return res.Document, true, nil
-	}
-	if err := s.ProcessImport(ctx, res.Document.ID); err != nil {
-		return nil, false, err
-	}
-	doc, err := s.repo.Get(ctx, res.Document.ID)
-	if err != nil {
-		return nil, false, err
-	}
-	return doc, false, nil
-}
-
 // Get 读取文档详情。
 func (s *Service) Get(ctx context.Context, id int64) (*Document, error) {
 	return s.repo.Get(ctx, id)
@@ -469,23 +425,6 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 	return nil
 }
 
-// Reindex 用当前的分块规则重新切分一份已有文档。
-//
-// 存在的意义是"规则会变"：切分粒度、标题识别、未来的语言相关处理都可能在
-// 后续阶段调整，已经入库的文档不应该只能靠重新上传才能用上新规则。
-// 原文取自存储（文件）或 documents.content（笔记），不依赖客户端再传一次。
-//
-// 顺序是先算完、再一次事务替换：算的途中失败什么都不改，
-// 替换的途中失败事务回滚，旧分块完整保留。
-func (s *Service) Reindex(ctx context.Context, id int64) (*Document, error) {
-	if err := s.ProcessReindex(ctx, id); err != nil {
-		return nil, err
-	}
-	// 重新读一次而不是手工改 doc.ChunkCount：chunk_count 与 updated_at
-	// 都由数据库写入，返回内存里的旧值会让前端看到"重索引了但数字没变"。
-	return s.repo.Get(ctx, id)
-}
-
 // StartReindex 受理一次重索引：置 indexing + 建任务，返回 job_id。
 //
 // 与导入不同的是这里不检查原文是否可得：文件在 MinIO 里，读一次要几毫秒到几百毫秒，
@@ -519,7 +458,12 @@ func (s *Service) StartReindex(ctx context.Context, id int64) (*ImportResult, er
 	return &ImportResult{Document: doc, JobID: queued.ID}, nil
 }
 
-// ProcessReindex 是重索引任务的执行段。
+// ProcessReindex 是重索引任务的执行段：用当前的分块规则重新切分一份已有文档。
+//
+// 存在的意义是"规则会变"：切分粒度、标题识别、未来的语言相关处理都可能在
+// 后续阶段调整，已经入库的文档不应该只能靠重新上传才能用上新规则
+// （重新上传会被内容哈希的幂等挡住，根本不会重切）。
+// 原文取自存储（文件）或 documents.content（笔记），不依赖客户端再传一次。
 //
 // 顺序是先算完、再一次事务替换：算的途中失败什么都不改，
 // 替换的途中失败事务回滚，旧分块完整保留。

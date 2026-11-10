@@ -218,7 +218,7 @@ func TestIdempotentImportIntegration(t *testing.T) {
 	ctx := context.Background()
 	text := "# 幂等\n\n同一份内容只应该入库一次。\n"
 
-	first, existed, err := svc.ImportFile(ctx, FileInput{
+	first, existed, err := importFile(ctx, t, svc, FileInput{
 		Filename: "a.md",
 		Content:  strings.NewReader(text),
 	})
@@ -226,7 +226,7 @@ func TestIdempotentImportIntegration(t *testing.T) {
 		t.Fatalf("first import: existed=%v err=%v", existed, err)
 	}
 
-	second, existed, err := svc.ImportFile(ctx, FileInput{
+	second, existed, err := importFile(ctx, t, svc, FileInput{
 		Filename: "b.md",
 		Content:  strings.NewReader(text),
 	})
