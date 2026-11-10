@@ -128,7 +128,10 @@ func TestUpDownUpIntegration(t *testing.T) {
 		t.Fatalf("version changed after no-op up: %d", st.Version)
 	}
 
-	// down：回滚后版本归零。
+	// down 的语义是"回滚最近一个"（与 CLI 帮助、README 一致），所以这里逐个回滚到 0。
+	// 原来只调一次就断言归零，在只有一个迁移时恰好成立；迁移数增加后必然失败，
+	// 而这条用例要求 MINDOS_TEST_DSN，平时不跑就发现不了。
+	before, _ := runner.Version(ctx)
 	if err := runner.Down(ctx); err != nil {
 		t.Fatalf("Down: %v", err)
 	}
@@ -136,8 +139,21 @@ func TestUpDownUpIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Version after down: %v", err)
 	}
+	if st.Version != before.Version-1 {
+		t.Fatalf("one down moved version %d → %d, want exactly one step back", before.Version, st.Version)
+	}
+
+	// 剩下的逐个回滚，验证每个 down 脚本都能真的把结构拆干净。
+	for st.Version > 0 {
+		if err := runner.Down(ctx); err != nil {
+			t.Fatalf("Down at version %d: %v", st.Version, err)
+		}
+		if st, err = runner.Version(ctx); err != nil {
+			t.Fatalf("Version after down: %v", err)
+		}
+	}
 	if st.Version != 0 {
-		t.Fatalf("after down version = %d, want 0", st.Version)
+		t.Fatalf("after rolling back all, version = %d, want 0", st.Version)
 	}
 
 	// 再 up 回到最新（空库 up→down→up 的完整循环）。
