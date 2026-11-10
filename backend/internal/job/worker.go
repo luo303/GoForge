@@ -29,13 +29,15 @@ type store interface {
 	Succeed(ctx context.Context, id int64, workerID string) error
 	Fail(ctx context.Context, id int64, workerID, code, message string) error
 	Release(ctx context.Context, id int64, workerID string) error
+	RequeueExpiredLeases(ctx context.Context, grace time.Duration) (int64, error)
 }
 
 // 默认值。生产装配时会被配置覆盖，这里只是让零值 Options 也能安全运行。
 const (
-	defaultConcurrency  = 1
-	defaultLease        = 30 * time.Second
-	defaultPollInterval = 500 * time.Millisecond
+	defaultConcurrency     = 1
+	defaultLease           = 30 * time.Second
+	defaultPollInterval    = 500 * time.Millisecond
+	defaultRecoverInterval = 30 * time.Second
 	// 租约不能太短：心跳间隔是 lease/3，太短会让"网络抖一下"就丢租约。
 	minLease = 3 * time.Second
 )
@@ -56,6 +58,9 @@ type Options struct {
 	// Phase 6 用它换简单：轮询不需要额外组件，代价是空闲时有极轻的数据库压力。
 	// Phase 16 会改成 MQ 唤醒，但那时也只是"少轮询几次"，任务语义不变。
 	PollInterval time.Duration
+	// RecoverInterval 是补扫间隔：把租约过期的 running 任务收回队列。
+	// 它是"不出现永远 running"的唯一保险，不能设成 0 关掉。
+	RecoverInterval time.Duration
 }
 
 // Worker 是进程内的任务执行者。
@@ -68,6 +73,7 @@ type Worker struct {
 	id        string
 	lease     time.Duration
 	poll      time.Duration
+	recover   time.Duration
 	workers   int
 	handlers  map[Kind]HandlerFunc
 	handlersM sync.RWMutex
@@ -87,6 +93,9 @@ func NewWorker(st store, log *zap.Logger, opts Options) *Worker {
 	if opts.PollInterval <= 0 {
 		opts.PollInterval = defaultPollInterval
 	}
+	if opts.RecoverInterval <= 0 {
+		opts.RecoverInterval = defaultRecoverInterval
+	}
 	if opts.WorkerID == "" {
 		opts.WorkerID = "worker"
 	}
@@ -96,6 +105,7 @@ func NewWorker(st store, log *zap.Logger, opts Options) *Worker {
 		id:       opts.WorkerID,
 		lease:    opts.Lease,
 		poll:     opts.PollInterval,
+		recover:  opts.RecoverInterval,
 		workers:  opts.Concurrency,
 		handlers: make(map[Kind]HandlerFunc),
 	}
@@ -132,6 +142,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		zap.Int("concurrency", w.workers),
 		zap.Duration("lease", w.lease),
 		zap.Duration("poll_interval", w.poll),
+		zap.Duration("recover_interval", w.recover),
 	)
 
 	var wg sync.WaitGroup
@@ -143,12 +154,50 @@ func (w *Worker) Run(ctx context.Context) error {
 		}(i)
 	}
 
+	// 补扫单独一条 goroutine：它做的事与执行任务无关，
+	// 也不该占用并发名额（否则 worker 一多就没人补扫了）。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		w.recoverLoop(ctx)
+	}()
+
 	<-ctx.Done()
 	// 等所有 loop 退出：它们手里可能还有正在跑的任务，
 	// 必须等这些任务把状态写好，进程才能真的结束。
 	wg.Wait()
 	w.log.Info("job worker stopped", zap.String("worker_id", w.id))
 	return nil
+}
+
+// recoverLoop 周期性把租约过期的任务收回队列。
+//
+// 启动时先跑一次：进程刚拉起时最需要它——上一任就是在这里崩的，
+// 它手里的任务还停在 running，等一个完整周期才开始收拾太慢。
+func (w *Worker) recoverLoop(ctx context.Context) {
+	w.recoverOnce(ctx)
+
+	ticker := time.NewTicker(w.recover)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.recoverOnce(ctx)
+		}
+	}
+}
+
+func (w *Worker) recoverOnce(ctx context.Context) {
+	n, err := w.store.RequeueExpiredLeases(ctx, w.lease)
+	if err != nil {
+		w.log.Warn("requeue expired jobs failed", zap.Error(err))
+		return
+	}
+	if n > 0 {
+		w.log.Info("requeued expired jobs", zap.Int64("count", n))
+	}
 }
 
 // loop 是一个领取循环。

@@ -24,6 +24,8 @@ type fakeStore struct {
 	failMsg   map[int64]string
 	renewErr  error
 	claimErrs []error // 依次返回的错误，用完后正常领取
+	recovered int     // RequeueExpiredLeases 被调用的次数
+	requeued  int64   // 每次返回的回收条数
 }
 
 func newFakeStore(jobs ...*Job) *fakeStore {
@@ -77,6 +79,13 @@ func (f *fakeStore) Release(ctx context.Context, id int64, workerID string) erro
 	defer f.mu.Unlock()
 	f.released = append(f.released, id)
 	return nil
+}
+
+func (f *fakeStore) RequeueExpiredLeases(ctx context.Context, grace time.Duration) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recovered++
+	return f.requeued, nil
 }
 
 func (f *fakeStore) counts() (claimed, succeeded, released int) {
@@ -241,6 +250,21 @@ func TestWorkerStopsOnLeaseLostWithoutWritingState(t *testing.T) {
 		t.Fatalf("expected no state write, got succeeded=%v failed=%v released=%v",
 			st.succeeded, st.failed, st.released)
 	}
+}
+
+func TestWorkerRecoversExpiredLeasesOnStart(t *testing.T) {
+	st := newFakeStore()
+	st.requeued = 2
+
+	stop, done := runWorker(t, st, Options{WorkerID: "w1", Lease: 3 * time.Second, PollInterval: 10 * time.Millisecond}, nil)
+	defer func() { stop(); <-done }()
+
+	// 启动就要扫一次：上一任就是在启动前崩的，等一个完整周期太慢。
+	waitFor(t, "recovery pass on start", func() bool {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return st.recovered >= 1
+	})
 }
 
 func TestWorkerKeepsRunningWhenClaimFails(t *testing.T) {

@@ -216,6 +216,33 @@ WHERE id = ? AND worker_id = ? AND status = 'running'`, id, workerID)
 	return nil
 }
 
+// RequeueExpiredLeases 把租约过期的 running 任务放回队列，返回处理条数。
+//
+// 为什么需要它：Claim 只挑 status = 'queued' 的任务。进程被 kill -9 之后，
+// 手里那条任务停在 running、租约到期也不会自己变回 queued——没有补扫，
+// 它就会永远 running（正是退出标准里点名要避免的状态）。
+//
+// 为什么不在 Claim 里顺手接管过期任务：
+//   - 领取 SQL 会变复杂，而且"接管"这件事没有任何痕迹，排查时看不出发生过；
+//   - 补扫可以独立跑、独立测、独立记日志（一次回收多少条、哪些 id）。
+//
+// grace 是在租约到期之后再多等的时间：机器时钟微小漂移、数据库与 worker 之间的
+// 响应延迟都会让"刚好到期"的判断变得可疑，多等一会儿能避免把还活着的任务抢走。
+//
+// attempts 不回退：进程是在执行中死掉的，这次尝试确实发生了，
+// 与优雅停止（Release，我们自己叫停）区别就在于此。
+func (r *Repository) RequeueExpiredLeases(ctx context.Context, grace time.Duration) (int64, error) {
+	result := r.db.WithContext(ctx).Exec(`
+UPDATE jobs SET status = 'queued', worker_id = NULL, lease_expires_at = NULL,
+       run_after = now(), updated_at = now()
+WHERE status = 'running' AND lease_expires_at IS NOT NULL
+  AND lease_expires_at < now() - make_interval(secs => ?)`, grace.Seconds())
+	if result.Error != nil {
+		return 0, fmt.Errorf("requeue expired jobs: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
 // Get 读一条任务，供接口与测试使用。
 func (r *Repository) Get(ctx context.Context, id int64) (*Job, error) {
 	var found Job

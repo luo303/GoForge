@@ -288,6 +288,77 @@ func TestFinishIntegration(t *testing.T) {
 	})
 }
 
+func TestRequeueExpiredLeasesIntegration(t *testing.T) {
+	db := setupJobDB(t)
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	t.Run("租约过期的任务被收回队列且保留尝试次数", func(t *testing.T) {
+		mustEnqueue(t, repo, 40, "document:40:import")
+		claimed, err := repo.Claim(ctx, "worker-dead", testLease)
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		// 模拟 worker 被 kill -9：状态停在 running，租约早已到期。
+		if err := db.WithContext(ctx).Exec(
+			"UPDATE jobs SET lease_expires_at = now() - interval '10 minutes' WHERE id = ?",
+			claimed.ID).Error; err != nil {
+			t.Fatalf("expire lease: %v", err)
+		}
+
+		n, err := repo.RequeueExpiredLeases(ctx, testLease)
+		if err != nil {
+			t.Fatalf("requeue: %v", err)
+		}
+		if n < 1 {
+			t.Fatalf("requeued = %d, want at least 1", n)
+		}
+
+		back, err := repo.Get(ctx, claimed.ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if back.Status != StatusQueued {
+			t.Errorf("status = %s, want queued", back.Status)
+		}
+		// 与优雅停止不同：这次尝试确实发生过（进程是在执行中死的），要计入 attempts。
+		if back.Attempts != 1 {
+			t.Errorf("attempts = %d, want 1 kept", back.Attempts)
+		}
+
+		// 收回后必须能被重新领走，否则"恢复"只是换了个显示状态。
+		again, err := repo.Claim(ctx, "worker-alive", testLease)
+		if err != nil {
+			t.Fatalf("claim after requeue: %v", err)
+		}
+		if again.ID != claimed.ID {
+			t.Fatalf("claimed job %d, want %d", again.ID, claimed.ID)
+		}
+	})
+
+	t.Run("租约未过期的任务不会被抢走", func(t *testing.T) {
+		mustEnqueue(t, repo, 41, "document:41:import")
+		claimed, err := repo.Claim(ctx, "worker-alive", testLease)
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		n, err := repo.RequeueExpiredLeases(ctx, testLease)
+		if err != nil {
+			t.Fatalf("requeue: %v", err)
+		}
+		if n != 0 {
+			t.Fatalf("requeued = %d, want 0 for a live lease", n)
+		}
+		still, err := repo.Get(ctx, claimed.ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if still.Status != StatusRunning {
+			t.Errorf("status = %s, want running", still.Status)
+		}
+	})
+}
+
 func TestEnqueueDedupeIntegration(t *testing.T) {
 	db := setupJobDB(t)
 	repo := NewRepository(db)
