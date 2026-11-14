@@ -336,6 +336,7 @@ npm run build
 3. 单队列、无优先级：`document.import` 与 `document.reindex` 排同一条队。需要优先级时要拆队列或加表字段。
 4. 同文档并发仍靠 `tasks_active_uniq` 部分唯一索引挡住，`msg_key` 目前只用于排查与按对象查历史，没有做分区消费。
 5. `outbox` 与 `consumed_messages` 只增不减的时间窗是 `REAPER_RETENTION`（默认 7 天），清理是分批的，积压很多时要多轮才删净。
+6. **broker 只在启动时建连**：中途重启需要重启进程才能接上。期间受理照常返回 202，消息安全停在 outbox（`ErrQueueUnavailable` 不消耗重试次数、不判死），恢复并重启进程后自动补发。自动重连留给 P16。
 
 **故障验证**（隔离库 `:18082`，`REAPER_INTERVAL=5s`）：
 
