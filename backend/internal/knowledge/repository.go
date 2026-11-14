@@ -94,12 +94,8 @@ func (r *Repository) CreateWithJob(ctx context.Context, doc *Document, j *job.Jo
 		if j == nil {
 			return nil
 		}
-		// document_id 依赖自增主键，只能在插入文档之后回填。
-		// 让调用方自己先猜 id 再写 payload 是行不通的。
-		j.Payload["document_id"] = doc.ID
-		if err := tx.Create(j).Error; err != nil {
-			return err
-		}
+		// jobs 那一行已停止写入：消费链路走 outbox，旧的 jobs 表只剩历史数据。
+		// 参数保留是为了不动业务层签名与调用点，删除 job 包时一起清理。
 		return appendTaskAndOutbox(ctx, tx, doc.ID, string(j.Kind))
 	})
 	return translateError("create document with job", err)
@@ -145,10 +141,7 @@ func (r *Repository) MarkIndexingWithJob(ctx context.Context, documentID int64, 
 		if result.RowsAffected == 0 {
 			return gorm.ErrRecordNotFound
 		}
-		j.Payload["document_id"] = documentID
-		if err := tx.Create(j).Error; err != nil {
-			return err
-		}
+		// 同上：不再写 jobs，只写 task 与 outbox。
 		return appendTaskAndOutbox(ctx, tx, documentID, string(j.Kind))
 	})
 	return translateError("mark indexing with job", err)

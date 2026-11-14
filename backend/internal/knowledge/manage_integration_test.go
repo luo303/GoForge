@@ -343,12 +343,13 @@ func TestDualWriteTaskAndOutboxIntegration(t *testing.T) {
 		t.Fatalf("create with job: %v", err)
 	}
 
+	// 旧 jobs 表已停止写入：消费链路只走 outbox，这一行残留会被清理。
 	var jobs int64
 	if err := db.Table("jobs").Where("dedupe_key = ?", key).Count(&jobs).Error; err != nil {
 		t.Fatalf("count jobs: %v", err)
 	}
-	if jobs != 1 {
-		t.Errorf("jobs = %d, want 1", jobs)
+	if jobs != 0 {
+		t.Errorf("jobs = %d, want 0 after switching to outbox", jobs)
 	}
 
 	var taskID int64
