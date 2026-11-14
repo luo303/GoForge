@@ -301,7 +301,54 @@ npm run build
 
 - **演练中修掉的两个真实缺陷**：① 原先取消直接写 `failed`，若 worker 刚好写完分块，会留下"失败但有分块"的半状态；改为运行中只标 `cancelling`，终态由 worker 停下后回调写，回调发现分块已存在则保留成果置 `ready`。② 原先 MinIO 不可用被记成 `handler_error` / `process_failed`，看不出是存储问题；新增 `ErrStorageUnavailable` 与 `storage_unavailable` 码，并让任务表复用同一码。
 - **门禁**：后端 `go build ./...` / `go vet ./...` / `go test -race -count=1 ./...` 全绿；带 `MINDOS_TEST_DSN` 时真实库集成用例通过（job 包新增退避、取消、接管；knowledge 包新增两段式、失败原因、取消收尾）。前端 `lint` / `test`（41 用例）/ `build` 全绿。
-- **已知限制**：① worker 只在进程内，多实例靠租约互斥而不是分区，规模上去后需要按 kind 分队列；② 空闲时仍按 `JOB_POLL_INTERVAL`（默认 500ms）轮询，Phase 16 换成 MQ 唤醒；③ 按 `payload->>'document_id'` 取消会全表扫 jsonb，单用户量级可接受，任务表变大后需要加表达式索引；④ kill -9 演练中任务恰好已完成（`queued` 状态被杀），"执行中死亡"的真实接管由僵尸任务那一条覆盖；⑤ 取消与完成赛跑时，若内容已写完则保留成果（`ready`），此时任务记 `cancelled`、文档记 `ready`，两者语义不同但都如实。
+- **已知限制**（2026-11-10 当时的状态，已被下方「架构调整」取代，保留作历史记录）：① worker 只在进程内，多实例靠租约互斥而不是分区，规模上去后需要按 kind 分队列；② 空闲时仍按 `JOB_POLL_INTERVAL`（默认 500ms）轮询，Phase 16 换成 MQ 唤醒；③ 按 `payload->>'document_id'` 取消会全表扫 jsonb，单用户量级可接受，任务表变大后需要加表达式索引；④ kill -9 演练中任务恰好已完成（`queued` 状态被杀），"执行中死亡"的真实接管由僵尸任务那一条覆盖；⑤ 取消与完成赛跑时，若内容已写完则保留成果（`ready`），此时任务记 `cancelled`、文档记 `ready`，两者语义不同但都如实。
+
+### 2026-11-14 架构调整：outbox + RabbitMQ 提前落地，jobs 表已删除
+
+上面那套"表当队列 + 进程内 worker + 租约心跳"被整体推翻，P16 的核心部分提前到这里。理由不是它坏了，而是**它把两件生命周期完全不同的事放在了一张表里**：
+
+| 关注点 | 该活多久 | 该由谁管 |
+|---|---|---|
+| 进度与历史（这文档处理到哪一步、失败原因是什么） | 长期，要能查、要留审计 | `tasks` 表 |
+| 投递（这条消息发出去没有、重试几次） | 很短，发完就该删 | `outbox` 表 |
+
+`jobs` 表同时扮这两个角色，于是删不掉、查不清，还得为"发过的消息"维护补扫。拆开之后各自的规则简单得多。
+
+**新链路（三条，缺一不可）**
+
+```
+受理  事务写 documents(pending) + tasks(pending) + outbox(待发)  → 202 + message_id
+投递  relay 每 200ms 扫 outbox 待发 → RabbitMQ             → outbox.status=1
+执行  消费者按 topic 分发 → 更新 tasks 状态 → 写 documents → 标记已消费
+兜底  reaper 每 30s 对账：卡住的 task 重投，过期消息清理
+```
+
+**删掉的东西**：`internal/job` 整个包（worker 循环、条件领取、租约续约、心跳、退避重试、补扫，实现与测试各约 1100 行）、`jobs` 表（迁移 `0007`）、`JOB_LEASE` / `JOB_POLL_INTERVAL` / `JOB_RECOVER_INTERVAL` 三项配置。
+
+**保留下来的语义**：重试上限 3 次、退避 3s·2ⁿ 封顶 5 分钟、永久错误不占重试名额（改为 `knowledge.IsPermanent` + 消费端提前收尾）、取消分"排队中直接取消"与"运行中标记取消中"两条、终态由执行方写而不是请求方抢先写。
+
+**契约变化**：受理响应 `job_id`（内部自增）→ `message_id`（uuid）。消息编号跨进程稳定、消费端用它去重、日志里能直接对上。
+
+**新增的已知限制**（替代原来那五条）：
+
+1. 容忍"至少一次"：消息可能重复投递，靠 `tasks.MarkRunning` 的条件更新（`WHERE status='pending'`）做执行闸门，所以处理函数必须可重跑。
+2. 消费端崩溃留下的 `running` 任务，broker 不会重投（消息已 ack），只能靠 `reaper` 在 `REAPER_STALE_AFTER`（默认 2 分钟）之后捞回——最长延迟就是这两个参数之和。
+3. 单队列、无优先级：`document.import` 与 `document.reindex` 排同一条队。需要优先级时要拆队列或加表字段。
+4. 同文档并发仍靠 `tasks_active_uniq` 部分唯一索引挡住，`msg_key` 目前只用于排查与按对象查历史，没有做分区消费。
+5. `outbox` 与 `consumed_messages` 只增不减的时间窗是 `REAPER_RETENTION`（默认 7 天），清理是分批的，积压很多时要多轮才删净。
+
+**故障验证**（隔离库 `:18082`，`REAPER_INTERVAL=5s`）：
+
+| 场景 | 观察 |
+|---|---|
+| 正常导入 | `202` + `message_id` → `tasks succeeded` → 文档 `ready`，队列 0 积压 |
+| 重索引 | `202` + 新 `message_id` → `indexing` → `ready` |
+| 原文指向不存在对象 | 文档 `failed/source_missing`，任务 `failed/source_missing`，`attempts=0`（永久错误未占重试） |
+| 手造 `running` 且 5 分钟未动 | `reaper` 重投 1 次 → `succeeded/attempts=2` |
+| 导入在途取消 | 文档 `failed/cancelled`，任务 `cancelled` |
+| 清理边界 | 只删"已投递且过期"；待发与投递失败的一条不删 |
+
+**门禁**：后端 `build` / `vet` / 全量 `test -race`（含 DSN 集成）全绿，新增 `reaper` 包的 5 个集成用例；前端 `tsc` / `lint` / 42 用例全绿。
 
 ## Phase 7 Embedding 与向量索引
 
@@ -514,25 +561,27 @@ npm run build
 
 ## Phase 16 MQ 与后台可靠执行
 
-**目标**：在已有 jobs 真相模型上增加 RabbitMQ 唤醒与后台 workflow，不推翻前期任务语义。
+**目标**：在已落地的 outbox + MQ 链路上补齐可靠投递的运维面：死信可视化、队列观测、后台 workflow。
 
-**范围**：outbox_events、relay、MQ 消费者、幂等与重投、死信、后台只读 workflow、队列状态与设置展示。
+> 2026-11-14 起，outbox、relay、RabbitMQ 消费者、幂等去重、失败重投、卡住任务兜底已经随 P6 一起落地（见 P6 章节的「架构调整」）。本阶段不再是"接入 MQ"，而是"把已有的 MQ 链路做得可观测、可运维，并承载长任务"。
+
+**范围**：死信与人工重投、队列与积压状态展示、后台 workflow 运行入口（不随 SSE/HTTP 断连取消）、多实例消费的分区策略。
 
 **提交拆分**
-1. `feat: 实现事务 Outbox 与投递中继`
-2. `feat: 接入 RabbitMQ 任务派发`
-3. `feat: 实现幂等消费与失败重投`
-4. `feat: 实现死信与队列状态观测`
-5. `feat: 实现后台 workflow 运行入口`
-6. `test: 覆盖消息丢失重复与 broker 重启`
+1. `feat: 死信记录与人工重投入口`
+2. `feat: 队列积压与投递延迟观测`
+3. `feat: 实现后台 workflow 运行入口`
+4. `feat: 按 msg_key 分区消费（多实例场景）`
+5. `test: 覆盖 broker 重启、消息丢失、重复投递`
 
 **质量验证**
-- 业务提交成功但 MQ 不可用时有 outbox 补投；消息丢失靠 jobs 补扫兜底。
+- broker 停机期间业务仍可受理（消息躺在 outbox 待发），恢复后自动补投。
 - 同一消息重复投递不重复执行副作用；broker 重启后任务最终可完成。
-- 死信可查看原因并人工重投；relay/consumer 停止时不丢未确认消息。
-- 后台 workflow 不随 SSE/HTTP 断连取消，与前台 react 的生命周期明确区分。
+- 投递连续失败达到上限的消息进入死信，可查看原因并人工重投。
+- relay / consumer 停止时不丢未确认消息（现有实现一律 ack，靠 tasks 对账兜底，需补测这条路径）。
+- 后台 workflow 不随 SSE/HTTP 断连取消，与前台交互的生命周期明确区分。
 
-**退出标准**：文档入库与后台 workflow 都走统一可靠任务链路；DB、MQ、进程分别故障时均有恢复验证。
+**退出标准**：文档入库与后台 workflow 都走统一可靠任务链路；DB、MQ、进程分别故障时均有恢复验证，且失败都能在页面上解释。
 
 ## Phase 17 Action 领域与任务管理
 
@@ -674,7 +723,7 @@ npm run build
 - **P8 先于 P9**：检索质量未达标时不能做 RAG，否则无法区分“搜错”与“答错”。
 - **P10 先于 P11–12**：先有人工可修订的真相数据，再接自动提炼与召回。
 - **P13 先于 P14–15**：最小对话闭环稳定后，才增加工具、预算、审批与恢复。
-- **P16 复用 P6**：MQ 是增强唤醒与后台执行，不替代 jobs，不重写任务状态机。
+- **P16 建立在已落地的链路上**：outbox + MQ 已在 P6 完成，P16 补的是死信、观测、多实例分区与后台 workflow，不重写任务状态机。
 - **P6 不占 `/tasks`**：系统后台作业的状态嵌在知识页；`/tasks` 留给 P17 的个人目标/计划/待办，两者不混用同一页面。
 - **P17 先于 P18**：Action 自身规则正确后，Agent 才能通过 service 安全操作。
 - **P19 放在真实对话之后**：用 P13–18 产生的样本调上下文，不提前做无效优化。

@@ -16,13 +16,13 @@
 | 多格式文档要能被语义召回 | 解析 → 切分 → embedding → 向量与全文混合检索 | 幂等入库、分块策略、RRF 融合、引用定位 |
 | 记忆会重复、冲突、过期 | 显式提炼 + 版本链 + 合并 | 相似度阈值、supersede 链、来源追溯 |
 | Agent 不能失控、不能烧钱、要能中断恢复 | 步数 / token / 超时三重预算 + checkpoint | Eino ADK Runner、审批门、事件全量落库 |
-| 长任务不能与 HTTP 生命周期绑死 | jobs 表 + RabbitMQ 派发 + 幂等消费 | 抢占领取、重试与死信、断连取消 |
+| 长任务不能与 HTTP 生命周期绑死 | outbox + RabbitMQ 派发 + tasks 对账 | 死信重投、积压观测、断连取消 |
 
 **单用户是硬边界**：不建 `users` 表、不做认证与租户隔离。多用户与云端是后置阶段；提前引入 `owner_id`、登录、RLS 都算越界。
 
 技术主线：Go + Gin + GORM + PostgreSQL 16（pgvector）+ RabbitMQ + Redis（按需）+ Eino ADK；前端 React + TypeScript + Vite + Tailwind + shadcn/ui。
 
-**当前进度：Phase 1–6 已完成（2026-11-10），下一步 Phase 7 Embedding 与向量索引。** 原文只存 MinIO；导入/重索引已异步化（jobs 表 + 进程内 worker + 租约 + 退避重试 + 取消 + 崩溃补扫），尚无向量与检索。阶段粒度自 2026-11-10 起为"一个阶段一个功能、做完整做可靠"，完成标准见 `docs/plan.md` §2。设计见 `docs/design/overview.md`。
+**当前进度：Phase 1–6 已完成（2026-11-14 重构任务链路），下一步 Phase 7 Embedding 与向量索引。** 原文只存 MinIO；导入/重索引已异步化（事务写 outbox → RabbitMQ → 消费者更新 tasks，reaper 兜底重投与清理），尚无向量与检索。阶段粒度自 2026-11-10 起为"一个阶段一个功能、做完整做可靠"，完成标准见 `docs/plan.md` §2。设计见 `docs/design/overview.md`。
 
 ## 2. 仓库结构与命令
 
