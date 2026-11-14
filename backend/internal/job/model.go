@@ -134,6 +134,9 @@ type Job struct {
 	RunAfter       time.Time  `gorm:"not null" json:"run_after"`
 	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty"`
 	WorkerID       *string    `gorm:"type:text" json:"-"` // 内部排查用，不对外暴露
+	// PublishedAt 是最后一次投递到队列的时间，nil 表示还没发出去。
+	// 它让 jobs 表同时充当 outbox：不用另建一张"待发件箱"再对账。
+	PublishedAt *time.Time `json:"published_at,omitempty"`
 
 	CreatedAt  time.Time  `json:"created_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`

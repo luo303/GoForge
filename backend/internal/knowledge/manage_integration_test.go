@@ -215,8 +215,10 @@ func TestIdempotentImportIntegration(t *testing.T) {
 	// 若这里也要求装 MinIO，跑一次数据库集成测试就得启两个容器。
 	store := newFakeStore()
 	repo := NewRepository(db)
-	// 取消能力来自 job 仓储：任务表属于 job 包，文档仓储不该重复实现一遍任务 SQL。
-	svc := NewService(repo, store, job.NewRepository(db), 1<<20, nil)
+	// 任务能力来自 job.Bus：队列传 nil——这个用例只验证幂等链路，
+	// broker 不可用本来就是合法状态（投递退化，任务留在表里）。
+	bus := job.NewBus(job.NewRepository(db), nil, nil)
+	svc := NewService(repo, store, bus, 1<<20, nil)
 	ctx := context.Background()
 	text := "# 幂等\n\n同一份内容只应该入库一次。\n"
 

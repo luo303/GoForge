@@ -90,11 +90,15 @@ type documentRepository interface {
 	MarkReady(ctx context.Context, documentID int64) error
 }
 
-// jobCanceler 是"取消某个业务对象未完成任务"的能力，由 job.Repository 实现。
+// jobBus 是本模块需要任务系统的全部能力：唤醒与取消。
 //
-// 定义在消费方（本包）而不是直接用 job.Repository：service 只需要这一个方法，
-// 依赖窄接口能让测试替身少写六个空方法，也让"knowledge 只用 job 的哪部分"一目了然。
-type jobCanceler interface {
+// 定义在消费方（本包）而不是直接用 job.Repository + job.Notifier：
+// service 只用两个方法，依赖窄接口能让测试替身少写一堆空方法，
+// 也让"knowledge 到底用了任务系统的哪部分"一目了然。
+type jobBus interface {
+	// Notify 投递一条已落库的任务（投递失败由补投兜底，不影响业务结果）。
+	Notify(ctx context.Context, jobID int64) error
+	// RequestCancel 取消某个业务对象未完成的任务。
 	RequestCancel(ctx context.Context, documentID int64) (jobID int64, kind job.Kind, status job.Status, err error)
 }
 
@@ -111,9 +115,10 @@ type fileStore interface {
 // Service 编排导入流程：校验 → 解析 → 切分 → 落盘 → 落库。
 type Service struct {
 	repo documentRepository
-	// jobs 只用于"取消进行中的处理"。受理任务走 repository 的同事务方法，
-	// 那里需要把文档与任务一起写，走 job.Repository 反而要跨两个事务。
-	jobs           jobCanceler
+	// jobs 负责"落库之后叫醒 worker"与"取消进行中的处理"。
+	// 建任务仍然走 repository 的同事务方法：文档与任务必须一起写，
+	// 走 job.Repository 会变成两个事务。
+	jobs           jobBus
 	store          fileStore
 	maxUploadBytes int64
 	log            *zap.Logger
@@ -125,7 +130,7 @@ type Service struct {
 // log 允许为 nil（测试里常见）：此时退化成不记录。业务逻辑本身不依赖日志，
 // 但"删库成功、删文件失败"这种只能记一笔的情况需要它，所以不做成可选参数
 // 之外的另一套 API。
-func NewService(repo documentRepository, store fileStore, jobs jobCanceler, maxUploadBytes int64, log *zap.Logger) *Service {
+func NewService(repo documentRepository, store fileStore, jobs jobBus, maxUploadBytes int64, log *zap.Logger) *Service {
 	if maxUploadBytes <= 0 {
 		maxUploadBytes = 10 << 20
 	}
@@ -419,6 +424,9 @@ func (s *Service) startImport(ctx context.Context, doc *Document, saved *platfor
 
 	err := s.repo.CreateWithJob(ctx, doc, queued)
 	if err == nil {
+		// 落库之后才叫醒：顺序反过来会让 worker 领到一个还不存在的任务。
+		// 投递失败不影响本次响应——任务已在表里，补投会重发。
+		s.notify(ctx, queued.ID)
 		return &ImportResult{Document: doc, JobID: queued.ID}, nil
 	}
 	if errors.Is(err, ErrDuplicate) {
@@ -582,8 +590,23 @@ func (s *Service) StartReindex(ctx context.Context, id int64) (*ImportResult, er
 		}
 		return nil, err
 	}
+	s.notify(ctx, queued.ID)
 	doc.Status = StatusIndexing
 	return &ImportResult{Document: doc, JobID: queued.ID}, nil
+}
+
+// notify 尝试叫醒 worker，失败只记 warn。
+//
+// 不把错误返回给调用方是刻意的：任务已经落库，投递失败只意味着"晚一点执行"，
+// 不是"这次操作失败"。让 HTTP 接口因为 MQ 抖动返回 500，反而会误导用户重传。
+func (s *Service) notify(ctx context.Context, jobID int64) {
+	if jobID == 0 || s.jobs == nil {
+		return
+	}
+	if err := s.jobs.Notify(ctx, jobID); err != nil {
+		s.log.Warn("notify job queue failed",
+			zap.Int64("job_id", jobID), zap.Error(err))
+	}
 }
 
 // ProcessReindex 是重索引任务的执行段：用当前的分块规则重新切分一份已有文档。

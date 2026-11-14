@@ -150,6 +150,44 @@ RETURNING *`
 	return &claimed, nil
 }
 
+// MarkPublished 记录一次成功投递。
+//
+// 只更新 published_at，不改状态：投递成功不等于任务被领走，
+// 中间可能隔很久（消费者没起、消息丢了）。把它当"最后一次喊过的时间"用。
+func (r *Repository) MarkPublished(ctx context.Context, id int64) error {
+	if err := r.db.WithContext(ctx).Exec(
+		`UPDATE jobs SET published_at = now(), updated_at = now() WHERE id = ?`, id).Error; err != nil {
+		return fmt.Errorf("mark job %d published: %w", id, err)
+	}
+	return nil
+}
+
+// Undelivered 返回需要（重新）投递的任务 id。
+//
+// 三种情况都靠它兜住：
+//  1. 事务提交了、投递前进程崩了 → published_at 为 NULL；
+//  2. 投递时 broker 不可用 → 同上，事后补发；
+//  3. 投递成功但消息丢了 → published_at 很旧，超过 staleAfter 重发。
+//
+// 用 id 列表而不是整行：投递只需要"叫醒哪个 id"，payload 让消费者回表读。
+func (r *Repository) Undelivered(ctx context.Context, staleAfter time.Duration, limit int) ([]int64, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var ids []int64
+	err := r.db.WithContext(ctx).Raw(`
+SELECT id FROM jobs
+WHERE status = 'queued'
+  AND run_after <= now()
+  AND (published_at IS NULL OR published_at < now() - make_interval(secs => ?))
+ORDER BY run_after, id
+LIMIT ?`, staleAfter.Seconds(), limit).Scan(&ids).Error
+	if err != nil {
+		return nil, fmt.Errorf("list undelivered jobs: %w", err)
+	}
+	return ids, nil
+}
+
 // Heartbeat 续约并回报任务当前状态。
 //
 // 一次查询干两件事，因为这两件事必须在同一时刻成立：续约成功说明"任务还是我的"，

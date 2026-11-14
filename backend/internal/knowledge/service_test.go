@@ -27,6 +27,18 @@ type fakeRepo struct {
 	replaceErr error
 	// jobs 记录本次测试里创建过的任务，供"受理后是否入队"这类断言使用。
 	jobs []*job.Job
+	// notified 记录被"叫醒"过的任务 id；notifyErr 用来模拟 broker 不可用。
+	notified  []int64
+	notifyErr error
+}
+
+// Notify 复刻"投递到队列"。假仓储只记录，不真的发消息。
+func (f *fakeRepo) Notify(_ context.Context, jobID int64) error {
+	if f.notifyErr != nil {
+		return f.notifyErr
+	}
+	f.notified = append(f.notified, jobID)
+	return nil
 }
 
 func newFakeRepo() *fakeRepo {
@@ -1394,5 +1406,65 @@ func TestProcessImportTaskReportsStorageUnavailable(t *testing.T) {
 	// 任务表要记同一个码：两张表说的不是同一件事，排查时就得再猜一次。
 	if got := job.ErrorCode(err); got != "storage_unavailable" {
 		t.Errorf("job error code = %q, want storage_unavailable", got)
+	}
+}
+
+// 落库之后必须叫醒 worker，否则任务要等下一轮补投才被执行。
+func TestStartImportNotifiesQueue(t *testing.T) {
+	ctx := context.Background()
+	svc, repo, _ := newTestService(1 << 20)
+
+	res, err := svc.StartNoteImport(ctx, NoteInput{Content: "# 叫醒\n\n正文。\n"})
+	if err != nil {
+		t.Fatalf("start note import: %v", err)
+	}
+	if len(repo.notified) != 1 || repo.notified[0] != res.JobID {
+		t.Fatalf("notified = %v, want [%d]", repo.notified, res.JobID)
+	}
+}
+
+// 队列不可用时，受理本身必须仍然成功：任务已经在表里，
+// 投递失败只是延迟，让 HTTP 返回 500 会误导用户重传。
+func TestImportSucceedsWhenQueueUnavailable(t *testing.T) {
+	ctx := context.Background()
+	svc, repo, _ := newTestService(1 << 20)
+	repo.notifyErr = errors.New("dial tcp: connection refused")
+
+	res, err := svc.StartNoteImport(ctx, NoteInput{Content: "# 队列挂了\n\n正文。\n"})
+	if err != nil {
+		t.Fatalf("import should succeed without the queue, got %v", err)
+	}
+	if res.JobID == 0 {
+		t.Error("job should still be created")
+	}
+	doc, err := svc.Get(ctx, res.Document.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if doc.Status != StatusPending {
+		t.Errorf("status = %s, want pending", doc.Status)
+	}
+}
+
+// 重索引同样要叫醒：这条路径与导入分开实现，容易漏掉其中一个。
+func TestStartReindexNotifiesQueue(t *testing.T) {
+	ctx := context.Background()
+	svc, repo, _ := newTestService(1 << 20)
+
+	res, err := svc.StartNoteImport(ctx, NoteInput{Content: "# 标题\n\n正文。\n"})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if _, _, err := finishImport(ctx, t, svc, res); err != nil {
+		t.Fatalf("process import: %v", err)
+	}
+	before := len(repo.notified)
+
+	reindex, err := svc.StartReindex(ctx, res.Document.ID)
+	if err != nil {
+		t.Fatalf("start reindex: %v", err)
+	}
+	if len(repo.notified) != before+1 || repo.notified[before] != reindex.JobID {
+		t.Fatalf("notified = %v, want one more entry for job %d", repo.notified, reindex.JobID)
 	}
 }

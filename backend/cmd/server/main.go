@@ -150,20 +150,20 @@ func run() error {
 	// 与 MinIO 的处理不同，理由在于职责：队列只是"叫醒"，任务状态在 jobs 表里，
 	// 连不上就退化成轮询（Phase 6 的做法）。MQ 维护期间服务照常可用，
 	// 只是任务延迟从毫秒回到 500ms——这比"MQ 挂了整个服务起不来"合理。
-	queue, err := platform.OpenRabbit(platform.RabbitOptions{
+	rabbit, err := platform.OpenRabbit(platform.RabbitOptions{
 		URL:      cfg.Rabbit.URL(),
 		Queue:    cfg.Rabbit.Queue,
 		Prefetch: cfg.Rabbit.Prefetch,
 	}, log.Named("rabbit"))
 	if err != nil {
-		log.Warn("rabbitmq unavailable, task delivery falls back to polling", zap.Error(err))
-		queue = nil
+		log.Warn("rabbitmq unavailable, task delivery falls back to sweeper", zap.Error(err))
+		rabbit = nil
 	} else {
 		log.Info("job queue ready",
 			zap.String("queue", cfg.Rabbit.Queue), zap.Int("prefetch", cfg.Rabbit.Prefetch))
 		// 注册在这里、worker 之后才执行：defer 后进先出，
 		// 意味着先停 worker（把任务收尾），再关连接。
-		defer func() { _ = queue.Close() }()
+		defer func() { _ = rabbit.Close() }()
 	}
 
 	system := handler.NewSystemHandler(
@@ -199,10 +199,18 @@ func run() error {
 	// worker 需要它来领取任务，两者共用同一个对象。
 	jobRepo := job.NewRepository(db)
 
+	// broker 不可用时传 typed-nil 之外的"没有队列"：Notifier 会明确报错，
+	// 由补投扫描接管，而不是在 nil 指针上 panic。
+	var busQueue job.Queue
+	if rabbit != nil {
+		busQueue = rabbit
+	}
+	jobBus := job.NewBus(jobRepo, busQueue, log.Named("job"))
+
 	knowledgeSvc := knowledge.NewService(
 		knowledge.NewRepository(db),
 		store,
-		jobRepo,
+		jobBus,
 		cfg.Storage.MaxUploadBytes,
 		log.Named("knowledge"),
 	)
