@@ -22,12 +22,92 @@ import (
 // ErrQueueClosed 表示连接或 channel 已经关闭，调用方应当重建。
 var ErrQueueClosed = errors.New("rabbitmq: connection closed")
 
-// TaskEnvelope 是队列消息体。
-//
-// 只放任务 id：payload 已经在表里，重复放进消息会出现"消息里的 payload
-// 和表里不一致"的第二份真相。消息越小，重投成本也越低。
+// TaskEnvelope 是旧版消息体（只带 job_id），保留给仍在轮询的 worker。
 type TaskEnvelope struct {
 	JobID int64 `json:"job_id"`
+}
+
+// Envelope 是 outbox 消息的完整信封。
+//
+// 与旧 TaskEnvelope 的区别：消息自带 message_id（消费端去重）、topic（路由）
+// 与 msg_key（保序），消费端不再需要回表取这些元信息。
+type Envelope struct {
+	MessageID string          `json:"message_id"`
+	Topic     string          `json:"topic"`
+	MsgKey    string          `json:"msg_key"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+// PublishEnvelope 投递一条 outbox 消息。
+//
+// 用 MessageId 作为 AMQP 层的消息 id：broker 侧可见，消费端也用同一个值去重，
+// 排查"这条消息为什么被跳过"时不必两边对号。
+func (r *Rabbit) PublishEnvelope(ctx context.Context, env Envelope) error {
+	body, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("marshal envelope: %w", err)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return ErrQueueClosed
+	}
+	return r.channel.PublishWithContext(ctx, "", r.opts.Queue, false, false, amqp.Publishing{
+		ContentType:  "application/json",
+		DeliveryMode: amqp.Persistent,
+		MessageId:    env.MessageID,
+		Timestamp:    time.Now().UTC(),
+		Body:         body,
+	})
+}
+
+// ConsumeEnvelopes 阻塞消费信封格式的消息，直到 ctx 取消或连接断开。
+//
+// ack 语义与旧的 Consume 相同：**一律 ack**。重试不是靠 nack 重投，
+// 而是由消费端在失败时写一条新的 outbox 消息（新的 message_id、推迟的 available_at），
+// 这样退避与次数都能被持久化，broker 侧不需要延迟队列插件。
+func (r *Rabbit) ConsumeEnvelopes(ctx context.Context, handle func(context.Context, Envelope) error) error {
+	ch, err := r.conn.Channel()
+	if err != nil {
+		return fmt.Errorf("open consumer channel: %w", err)
+	}
+	defer func() { _ = ch.Close() }()
+
+	if err := ch.Qos(r.opts.Prefetch, 0, false); err != nil {
+		return fmt.Errorf("set qos: %w", err)
+	}
+	deliveries, err := ch.Consume(r.opts.Queue, "", false, false, false, false, nil)
+	if err != nil {
+		return fmt.Errorf("consume %q: %w", r.opts.Queue, err)
+	}
+
+	r.log.Info("outbox consumer started",
+		zap.String("queue", r.opts.Queue), zap.Int("prefetch", r.opts.Prefetch))
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case d, ok := <-deliveries:
+			if !ok {
+				return ErrQueueClosed
+			}
+			var env Envelope
+			if err := json.Unmarshal(d.Body, &env); err != nil || env.MessageID == "" {
+				r.log.Warn("dropping malformed envelope", zap.Int("body_len", len(d.Body)), zap.Error(err))
+				_ = d.Reject(false)
+				continue
+			}
+			if err := handle(ctx, env); err != nil {
+				r.log.Warn("handle envelope failed",
+					zap.String("message_id", env.MessageID), zap.String("topic", env.Topic), zap.Error(err))
+			}
+			if err := d.Ack(false); err != nil {
+				r.log.Warn("ack envelope failed", zap.String("message_id", env.MessageID), zap.Error(err))
+			}
+		}
+	}
 }
 
 // RabbitOptions 是连接与拓扑参数。
