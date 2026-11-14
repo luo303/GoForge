@@ -375,6 +375,12 @@ func (s *Service) classify(err error) error {
 	}
 }
 
+// ErrorCode 是 errorCode 的导出版本，供消费端把失败原因写进 tasks.error_code。
+//
+// 两个地方要用同一个映射：文档表和任务表记的必须是同一个码，
+// 否则排查时要在两份分类之间猜。
+func ErrorCode(err error) string { return errorCode(err) }
+
 // errorCode 把错误翻译成稳定的机器可读代码，写进 documents.error_code。
 //
 // 用固定字符串而不是错误文案：文案会改、会翻译，前端与排查脚本不该跟着变。

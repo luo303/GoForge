@@ -90,6 +90,26 @@ func (r *Repository) Reschedule(ctx context.Context, id int64, delay time.Durati
 	return nil
 }
 
+// RescheduleByMessageID 把"已投递但执行失败"的消息重新排队。
+//
+// 按 message_id 而不是主键定位：消费端手里只有信封，没有表内 id。
+// 同时把 published_at 清空——不清的话它会被误判成"早已投递、无人认领"。
+func (r *Repository) RescheduleByMessageID(ctx context.Context, messageID string, delay time.Duration, reason string) error {
+	err := r.db.WithContext(ctx).Model(&Message{}).
+		Where("message_id = ?", messageID).
+		Updates(map[string]any{
+			"status":       StatusPending,
+			"attempts":     gorm.Expr("attempts + 1"),
+			"available_at": time.Now().UTC().Add(delay),
+			"last_error":   reason,
+			"published_at": nil,
+		}).Error
+	if err != nil {
+		return fmt.Errorf("reschedule outbox message %s: %w", messageID, err)
+	}
+	return nil
+}
+
 // GiveUp 把消息标成失败：重试次数用尽，需要人工看过。
 func (r *Repository) GiveUp(ctx context.Context, id int64, reason string) error {
 	err := r.db.WithContext(ctx).Model(&Message{}).Where("id = ?", id).

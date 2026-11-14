@@ -6,11 +6,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,14 +20,17 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/luo303/mindos/backend/internal/config"
+	"github.com/luo303/mindos/backend/internal/dispatch"
 	"github.com/luo303/mindos/backend/internal/handler"
 	"github.com/luo303/mindos/backend/internal/job"
 	"github.com/luo303/mindos/backend/internal/knowledge"
 	"github.com/luo303/mindos/backend/internal/logging"
 	"github.com/luo303/mindos/backend/internal/middleware"
 	"github.com/luo303/mindos/backend/internal/migrate"
+	"github.com/luo303/mindos/backend/internal/outbox"
 	"github.com/luo303/mindos/backend/internal/platform"
 	"github.com/luo303/mindos/backend/internal/router"
+	"github.com/luo303/mindos/backend/internal/task"
 	"github.com/luo303/mindos/backend/migrations"
 )
 
@@ -215,64 +220,99 @@ func run() error {
 		log.Named("knowledge"),
 	)
 
-	// 后台任务执行器（Phase 6）：与 HTTP 同一个进程，但生命周期单独管理。
+	// —— 异步链路：outbox → RabbitMQ → 消费者 ——
 	//
-	// 它不持有队列——队列就是 jobs 表。所以这里重启、崩溃、多开一个实例，
-	// 看到的都是同一份任务，不存在"队列要同步"这种事。
-	workerID := workerIDFromProcess()
-	worker := job.NewWorker(jobRepo, log.Named("job"), job.Options{
-		WorkerID:        workerID,
-		Concurrency:     cfg.Job.Workers,
-		Lease:           cfg.Job.Lease,
-		PollInterval:    cfg.Job.PollInterval,
-		RecoverInterval: cfg.Job.RecoverInterval,
-		// 任务被取消后由 worker 通知业务方写终态：取消是异步生效的，
-		// 只有 worker 知道"真的停下来了"这个时刻。
-		OnCancelled: func(ctx context.Context, j *job.Job) {
-			docID, err := j.DocumentID()
-			if err != nil {
-				log.Warn("cancelled job without document id", zap.Int64("job_id", j.ID), zap.Error(err))
-				return
-			}
-			if err := knowledgeSvc.SettleCancelled(ctx, docID, j.Kind == knowledge.KindDocumentReindex); err != nil {
-				log.Warn("settle cancelled document failed",
-					zap.Int64("job_id", j.ID), zap.Int64("document_id", docID), zap.Error(err))
-			}
-		},
-	})
-	// 任务类型 → 处理函数的注册写在装配层：这是唯一知道"有哪些模块"的地方，
-	// 业务包之间因此不需要互相 import（knowledge 不认识 memory，也不认识 agent）。
-	worker.Register(knowledge.KindDocumentImport, func(ctx context.Context, j *job.Job) error {
-		docID, err := j.DocumentID()
-		if err != nil {
-			return job.Permanent(err)
-		}
-		return knowledgeSvc.ProcessImportTask(ctx, docID, j.Attempts, j.MaxAttempts)
-	})
-	worker.Register(knowledge.KindDocumentReindex, func(ctx context.Context, j *job.Job) error {
-		docID, err := j.DocumentID()
-		if err != nil {
-			return job.Permanent(err)
-		}
-		return knowledgeSvc.ProcessReindexTask(ctx, docID, j.Attempts, j.MaxAttempts)
-	})
+	// 三段各管一件事：relay 把表里的待发消息送出去，consumer 收到消息后干活
+	// 并更新 tasks，补扫负责收拾"消息丢了"的残局。
+	outboxRepo := outbox.NewRepository(db)
+	taskRepo := task.NewRepository(db)
 
-	workerCtx, stopWorker := context.WithCancel(ctx)
-	workerDone := make(chan struct{})
-	go func() {
-		defer close(workerDone)
-		_ = worker.Run(workerCtx)
-	}()
-	// 退出顺序很重要：先让 worker 停（把手上任务的终态写完），再关数据库。
-	// defer 后进先出，这一句注册在 ClosePostgres 之后，所以先执行。
+	consumer := dispatch.NewConsumer(dispatch.NewSQLStore(outboxRepo), log.Named("dispatch"), 3)
+	handle := func(reindex bool) dispatch.Handler {
+		return func(ctx context.Context, env platform.Envelope) error {
+			var p struct {
+				DocumentID int64 `json:"document_id"`
+				TaskID     int64 `json:"task_id"`
+			}
+			if err := json.Unmarshal(env.Payload, &p); err != nil || p.DocumentID == 0 || p.TaskID == 0 {
+				return fmt.Errorf("bad envelope payload: %w", err)
+			}
+
+			doc, err := knowledgeSvc.Get(ctx, p.DocumentID)
+			if err != nil {
+				return err
+			}
+			// 用户已经点了取消：不执行，直接按取消收尾。
+			if doc.Status == knowledge.StatusCancelling {
+				_ = taskRepo.MarkCancelled(ctx, p.TaskID)
+				return knowledgeSvc.SettleCancelled(ctx, p.DocumentID, reindex)
+			}
+
+			// 条件更新是执行幂等闸门：重复投递时只有一个实例能推进到 running。
+			started, err := taskRepo.MarkRunning(ctx, p.TaskID)
+			if err != nil {
+				return err
+			}
+			if !started {
+				return nil
+			}
+
+			var runErr error
+			if reindex {
+				runErr = knowledgeSvc.ProcessReindex(ctx, p.DocumentID)
+			} else {
+				runErr = knowledgeSvc.ProcessImport(ctx, p.DocumentID)
+			}
+			if runErr == nil {
+				return taskRepo.MarkSucceeded(ctx, p.TaskID)
+			}
+
+			// 还有机会就放回 pending，让下一次投递能再次推进；次数用尽才写失败终态。
+			// 这里的 3 与 dispatch 的重试上限保持一致（同一个配置将来抽出来）。
+			if env.Attempt+1 >= 3 {
+				return taskRepo.MarkFailed(ctx, p.TaskID, knowledge.ErrorCode(runErr), runErr.Error())
+			}
+			if err := taskRepo.MarkPending(ctx, p.TaskID); err != nil {
+				log.Warn("reset task to pending failed", zap.Int64("task_id", p.TaskID), zap.Error(err))
+			}
+			return runErr
+		}
+	}
+	consumer.Register(string(knowledge.KindDocumentImport), handle(false))
+	consumer.Register(string(knowledge.KindDocumentReindex), handle(true))
+
+	relay := outbox.NewRelay(outboxRepo, relayPublisher{rabbit: rabbit}, log.Named("relay"), outbox.RelayOptions{})
+
+	asyncCtx, stopAsync := context.WithCancel(ctx)
+	var asyncWG sync.WaitGroup
+	asyncWG.Add(1)
+	go func() { defer asyncWG.Done(); relay.Run(asyncCtx) }()
+	if rabbit != nil {
+		for i := 0; i < cfg.Job.Workers; i++ {
+			asyncWG.Add(1)
+			go func() {
+				defer asyncWG.Done()
+				for asyncCtx.Err() == nil {
+					if err := rabbit.ConsumeEnvelopes(asyncCtx, consumer.Handle); err != nil && asyncCtx.Err() == nil {
+						log.Warn("outbox consumer stopped, reconnecting", zap.Error(err))
+						select {
+						case <-asyncCtx.Done():
+						case <-time.After(time.Second):
+						}
+					}
+				}
+			}()
+		}
+	}
+	// 退出顺序：先停消费（不再接新消息），再等手上处理完，最后关连接与数据库。
 	defer func() {
-		stopWorker()
+		stopAsync()
+		done := make(chan struct{})
+		go func() { asyncWG.Wait(); close(done) }()
 		select {
-		case <-workerDone:
+		case <-done:
 		case <-time.After(cfg.App.ShutdownTimeout):
-			// 有 handler 不响应取消时会走到这里。记 warn 而不是阻塞退出：
-			// 卡死在这个 defer 里，用户看到的是"服务杀不掉"。
-			log.Warn("job worker did not stop before shutdown timeout",
+			log.Warn("async workers did not stop before shutdown timeout",
 				zap.Duration("timeout", cfg.App.ShutdownTimeout))
 		}
 	}()
@@ -337,4 +377,27 @@ func run() error {
 
 	log.Info("mindos stopped")
 	return nil
+}
+
+// relayPublisher 把 platform.Rabbit 适配成 outbox.Queue。
+//
+// 适配放在 main 而不是任一包里：两边都不该认识对方的类型，
+// 装配层是唯一合理的位置。
+type relayPublisher struct{ rabbit *platform.Rabbit }
+
+func (p relayPublisher) Publish(ctx context.Context, m outbox.Message) error {
+	if p.rabbit == nil {
+		return fmt.Errorf("rabbitmq is not available")
+	}
+	payload, err := json.Marshal(map[string]any(m.Payload))
+	if err != nil {
+		return fmt.Errorf("marshal outbox payload: %w", err)
+	}
+	return p.rabbit.PublishEnvelope(ctx, platform.Envelope{
+		MessageID: m.MessageID,
+		Topic:     m.Topic,
+		MsgKey:    m.MsgKey,
+		Payload:   payload,
+		Attempt:   m.Attempts,
+	})
 }
