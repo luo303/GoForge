@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
 
@@ -21,11 +20,6 @@ import (
 
 // ErrQueueClosed 表示连接或 channel 已经关闭，调用方应当重建。
 var ErrQueueClosed = errors.New("rabbitmq: connection closed")
-
-// TaskEnvelope 是旧版消息体（只带 job_id），保留给仍在轮询的 worker。
-type TaskEnvelope struct {
-	JobID int64 `json:"job_id"`
-}
 
 // Envelope 是 outbox 消息的完整信封。
 //
@@ -67,8 +61,8 @@ func (r *Rabbit) PublishEnvelope(ctx context.Context, env Envelope) error {
 
 // ConsumeEnvelopes 阻塞消费信封格式的消息，直到 ctx 取消或连接断开。
 //
-// ack 语义与旧的 Consume 相同：**一律 ack**。重试不是靠 nack 重投，
-// 而是由消费端在失败时写一条新的 outbox 消息（新的 message_id、推迟的 available_at），
+// ack 语义：**一律 ack**。重试不是靠 nack 重投，
+// 而是由消费端在失败时把 outbox 里那条消息重新排期（available_at 推后、attempts+1），
 // 这样退避与次数都能被持久化，broker 侧不需要延迟队列插件。
 func (r *Rabbit) ConsumeEnvelopes(ctx context.Context, handle func(context.Context, Envelope) error) error {
 	ch, err := r.conn.Channel()
@@ -167,86 +161,6 @@ func OpenRabbit(opts RabbitOptions, log *zap.Logger) (*Rabbit, error) {
 	}
 
 	return &Rabbit{conn: conn, channel: ch, opts: opts, log: log}, nil
-}
-
-// Publish 投递一条"有新任务"的消息。
-//
-// 返回错误时调用方**不需要回滚业务事务**：任务已经在表里，补扫会重投。
-// 这正是"表是真相、消息只是提醒"的好处——投递失败退化成延迟，不是丢数据。
-func (r *Rabbit) Publish(ctx context.Context, jobID int64) error {
-	body, err := json.Marshal(TaskEnvelope{JobID: jobID})
-	if err != nil {
-		return fmt.Errorf("marshal task envelope: %w", err)
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return ErrQueueClosed
-	}
-	return r.channel.PublishWithContext(ctx, "", r.opts.Queue, false, false, amqp.Publishing{
-		ContentType:  "application/json",
-		DeliveryMode: amqp.Persistent,
-		MessageId:    strconv.FormatInt(jobID, 10),
-		Timestamp:    time.Now().UTC(),
-		Body:         body,
-	})
-}
-
-// Consume 阻塞消费，直到 ctx 取消或连接断开（返回错误）。
-//
-// ack 策略：**一律 ack**，包括 handler 失败的情况。原因不是偷懒——
-// handler 失败时任务状态与退避时间已经写进表里，重投只会让同一个 id
-// 反复被领走；而真正需要"再来一次"的情形由补扫按 run_after 重新发布。
-// 毒消息（消息体解析不出来）同理：nack 重投会无限循环。
-func (r *Rabbit) Consume(ctx context.Context, handle func(context.Context, int64) error) error {
-	ch, err := r.conn.Channel()
-	if err != nil {
-		return fmt.Errorf("open consumer channel: %w", err)
-	}
-	defer func() { _ = ch.Close() }()
-
-	if err := ch.Qos(r.opts.Prefetch, 0, false); err != nil {
-		return fmt.Errorf("set qos: %w", err)
-	}
-
-	deliveries, err := ch.Consume(r.opts.Queue, "", false, false, false, false, nil)
-	if err != nil {
-		return fmt.Errorf("consume %q: %w", r.opts.Queue, err)
-	}
-
-	r.log.Info("queue consumer started",
-		zap.String("queue", r.opts.Queue), zap.Int("prefetch", r.opts.Prefetch))
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case d, ok := <-deliveries:
-			if !ok {
-				// channel 被关闭（broker 重启、网络中断），交给上层重连。
-				return ErrQueueClosed
-			}
-
-			var env TaskEnvelope
-			if err := json.Unmarshal(d.Body, &env); err != nil || env.JobID == 0 {
-				r.log.Warn("dropping malformed job message",
-					zap.Int("body_len", len(d.Body)), zap.Error(err))
-				_ = d.Reject(false)
-				continue
-			}
-
-			if err := handle(ctx, env.JobID); err != nil {
-				// 注意：这里记日志而不是 nack。重试由表驱动，见函数注释。
-				r.log.Warn("handle job message failed",
-					zap.Int64("job_id", env.JobID), zap.Error(err))
-			}
-			if err := d.Ack(false); err != nil {
-				r.log.Warn("ack job message failed",
-					zap.Int64("job_id", env.JobID), zap.Error(err))
-			}
-		}
-	}
 }
 
 // Healthy 报告连接是否还活着，供 /readyz 使用。

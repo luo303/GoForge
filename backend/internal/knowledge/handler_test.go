@@ -435,10 +435,10 @@ func TestReindexEndpoint(t *testing.T) {
 		map[string]string{"content": "# 标题\n\n第一段。\n\n## 小节\n\n第二段。\n"}); rec.Code != http.StatusAccepted {
 		t.Fatalf("create status = %d", rec.Code)
 	}
-	// 重索引本身还是同步的（下一笔才切），但前提是文档已经处理完。
+	// 先让文档处理完，否则重索引会撞"同文档只能有一个未完成任务"。
 	processPending(t, svc, repo)
 
-	// 重索引也是异步的：202 + job_id，文档先置 indexing。
+	// 重索引也是异步的：202 + message_id，文档先置 indexing。
 	rec, env := doJSON(t, e, http.MethodPost, "/api/v1/documents/1/reindex", nil)
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202, body = %s", rec.Code, rec.Body.String())

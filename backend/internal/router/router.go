@@ -57,7 +57,7 @@ func Register(e *gin.Engine, deps Deps) {
 	v1.GET("/system/status", deps.System.Status)
 	v1.GET("/settings", deps.Settings.Get)
 
-	// 知识：Phase 4 是同步导入，成功直接 201 返回文档（Phase 6 起改为 202 + job_id）；
+	// 知识：导入与重索引都是异步受理，返回 202 + message_id（Phase 6）；
 	// 同内容重复导入返回 200 + existed=true（Phase 5）。
 	v1.POST("/documents", deps.Knowledge.CreateFile)
 	v1.POST("/documents/note", deps.Knowledge.CreateNote)

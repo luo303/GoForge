@@ -511,7 +511,7 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 	return nil
 }
 
-// StartReindex 受理一次重索引：置 indexing + 建任务，返回 job_id。
+// StartReindex 受理一次重索引：置 indexing + 建任务，返回 message_id。
 //
 // 与导入不同的是这里不检查原文是否可得：文件在 MinIO 里，读一次要几毫秒到几百毫秒，
 // 放在请求里等于把外部依赖的延迟加到接口上。原文缺失由 worker 报 ErrSourceMissing，
