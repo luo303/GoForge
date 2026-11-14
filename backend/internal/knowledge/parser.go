@@ -16,7 +16,7 @@ import (
 	"strings"
 )
 
-// 支持的 MIME 类型。Phase 5 会补 application/pdf 与 text/html。
+// 支持的 MIME 类型。application/pdf 与 text/html 暂不支持。
 const (
 	MIMEMarkdown = "text/markdown"
 	MIMEText     = "text/plain"

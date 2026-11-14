@@ -18,11 +18,11 @@
 | Agent 不能失控、不能烧钱、要能中断恢复 | 步数 / token / 超时三重预算 + checkpoint | Eino ADK Runner、审批门、事件全量落库 |
 | 长任务不能与 HTTP 生命周期绑死 | outbox + RabbitMQ 派发 + tasks 对账 | 死信重投、积压观测、断连取消 |
 
-**单用户是硬边界**：不建 `users` 表、不做认证与租户隔离。多用户与云端是后置阶段；提前引入 `owner_id`、登录、RLS 都算越界。
+**单用户是硬边界**：不建 `users` 表、不做认证与租户隔离。多用户与云端属于后置能力；提前引入 `owner_id`、登录、RLS 都算越界。
 
 技术主线：Go + Gin + GORM + PostgreSQL 16（pgvector）+ RabbitMQ + Redis（按需）+ Eino ADK；前端 React + TypeScript + Vite + Tailwind + shadcn/ui。
 
-**当前进度：Phase 1–6 已完成（2026-11-14 重构任务链路），下一步 Phase 7 Embedding 与向量索引。** 原文只存 MinIO；导入/重索引已异步化（事务写 outbox → RabbitMQ → 消费者更新 tasks，reaper 兜底重投与清理），尚无向量与检索。阶段粒度自 2026-11-10 起为"一个阶段一个功能、做完整做可靠"，完成标准见 `docs/plan.md` §2。设计见 `docs/design/overview.md`。
+**当前状态（2026-11-14）：文档入库与异步任务链路已完成并验证。** 原文只存 MinIO；导入/重索引经事务写 outbox → RabbitMQ → 消费端更新 tasks，reaper 兜底重投与清理，尚无向量与检索。**不预设路线**：接下来做什么由使用者决定，已做过的事、设计取舍与已知限制见 `docs/history.md`，设计见 `docs/design/overview.md`。
 
 ## 2. 仓库结构与命令
 
@@ -48,7 +48,7 @@ Windows 侧编辑器经 UNC 读取会有延迟，**以 WSL 内 `go build` 输出
 | `go vet ./...` | 静态检查 |
 | `go test -race -count=1 ./...` | 单元测试（必须带 `-race`） |
 | `go run ./cmd/server` | 启动服务（读取 `backend/.env`） |
-| `go run ./cmd/migrate up` | 执行数据库迁移（Phase 2 起） |
+| `go run ./cmd/migrate up` | 执行数据库迁移 |
 | `go build -o bin/mindos ./cmd/server` | 编译可执行文件 |
 | `docker compose --env-file backend/.env -f deployments/docker-compose.yml up -d` | 启动基础设施（在仓库根执行） |
 
@@ -97,7 +97,7 @@ agent  → 各模块 service（受控读写）      worker → 各模块 service
 9. **资源必须关闭、goroutine 必须有退出路径**：连接池、`resp.Body`、`sql.Rows`、上传文件打开即 `defer Close()`；后台 goroutine 靠 `ctx.Done()` 退出并自带 `defer recover()`。
 10. **Agent 三重上限**：`max_steps`、token 预算、整体超时，缺一不允许合并。
 11. **工具调用必须留痕**：每次调用写 `tool_audits`；写类工具必须过审批门。
-12. **阶段收尾门槛**：后端 `go build ./...` + `go vet ./...` + `go test -race ./...` 全绿；前端 `npm run lint` + `test` + `build` 全绿；该阶段端到端验证跑通。
+12. **改动收尾门槛**：后端 `go build ./...` + `go vet ./...` + `go test -race ./...` 全绿；前端 `npm run lint` + `test` + `build` 全绿；端到端验证跑通。
 
 ## 5. Never（明确禁止）
 
@@ -121,7 +121,7 @@ agent  → 各模块 service（受控读写）      worker → 各模块 service
 - 不提交 `.env`、真实密码、模型 API Key、加密密钥。
 - 不引入 Makefile / 构建脚本 / 任务运行器，不引入微服务拆分、Service Mesh、复杂部署平台：一律 `go`、`npm`、`docker compose` 原生命令。
 - 不为凑代码量增加功能；一个提交只做一个主题。
-- 不在未经确认的情况下重构已完成阶段的结构。
+- 不在未经确认的情况下重构已完成功能的结构。
 
 **Agent 层面**
 - 不允许"模型说完了就执行"：写操作一律生成审批请求，人确认后才落库。
@@ -190,10 +190,10 @@ agent  → 各模块 service（受控读写）      worker → 各模块 service
 
 ## 10. 当前已知问题（待修，勿遗忘）
 
-当前无登记未修问题。Phase 1 已关闭：panic 请求访问日志丢失、配置类型错误静默回退。新问题按“位置 / 影响 / 处理时机”追加到本节。
+当前无登记未修问题。早期已关闭：panic 请求访问日志丢失、配置类型错误静默回退。新问题按“位置 / 影响 / 处理时机”追加到本节。
 
-## 11. 阶段路线
+## 11. 迭代方式
 
-Phase 1–3 工程基线 ｜ Phase 4–9 Knowledge ｜ Phase 10–12 Memory ｜ Phase 13–16 Agent ｜ Phase 17–18 Action ｜ Phase 19 Context ｜ Phase 20 Insights ｜ Phase 21 产品化
+**不预设路线**：做什么、先做什么由使用者决定，文档里不排阶段计划。
 
-**跨阶段铁律：不设置工期，质量优先。一个阶段只做一个功能并做完整，阶段结束时可编译、可启动，且专项测试、故障演练、文档与验收记录全部完成；宁可暂停，不留半成品，不留只有 API 没有界面的阶段。**
+**一次改动做完整**：功能范围内一次做全（含空态、加载态、失败态），收尾时可编译、可启动、可验证；质量优先，不设工期，宁可暂停，不留半成品，不留只有 API 没有界面的成果。

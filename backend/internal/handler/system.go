@@ -120,8 +120,8 @@ func (h *SystemHandler) checkVector(ctx context.Context) DependencyStatus {
 	}
 }
 
-// checkStorage 检查对象存储。这项在 Phase 4 之前不存在——
-// 当时原文落本地磁盘，磁盘几乎不会"连不上"；换成 MinIO 后它成了
+// checkStorage 检查对象存储。原文落本地磁盘时没有这项检查——
+// 磁盘几乎不会"连不上"；换成 MinIO 后它成了
 // 会独立坏掉的外部依赖，而且坏掉的表现是"上传/重索引 500"，
 // 不在这里单独报出来，就只能靠翻日志猜。
 func (h *SystemHandler) checkStorage(ctx context.Context) DependencyStatus {

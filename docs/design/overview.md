@@ -323,7 +323,7 @@ Eino 的 `CheckPointStore` 接口就是 `Set/Get(ctx, key, []byte)`，状态用 
 | `profile` | 身份、背景、偏好 | 主力栈是 Node.js，正在转 Go | 对话 |
 | `semantic` | 长期有效的事实与结论 | 认为 GORM 链式 API 比泛型 API 更适合本项目 | 对话 / 文档 |
 | `episodic` | 带时间的历史事件 | 10 月完成过一次 PostgreSQL 迁移演练 | 对话 / 任务 |
-| `project` | 项目背景与进展 | MindOS 当前处于 Phase 8，知识检索已能用 | 任务 / 文档 |
+| `project` | 项目背景与进展 | MindOS 当前处于早期，文档入库已能用 | 任务 / 文档 |
 
 ### 7.2 为什么必须"显式提炼"
 
@@ -505,9 +505,9 @@ draft ──用户确认──> approved ──开始执行──> active ──
 
 | 方法 | 路径 | 说明 | 阶段 |
 |---|---|---|---|
-| POST | `/documents` | 文件上传（multipart）；P4 同步，P6 起 202 返回 document 与 job_id | P4 / P6 |
+| POST | `/documents` | 文件上传（multipart）；202 返回 document 与 message_id | P4 / P6 |
 | POST | `/documents/note` | 新建笔记（JSON 正文） | P4 |
-| POST | `/documents/web` | 按 URL 抓取导入（已移出主线，见 `docs/plan.md` 后置增强） | 后置 |
+| POST | `/documents/web` | 按 URL 抓取导入（未实现，见 `docs/history.md` 第 4 节） | 后置 |
 | GET | `/documents` | 列表，分页 `limit` / `offset`；P5 起按 `collection` / `tag` / `status` 筛选，`q` 全文搜索随 P8 接入 | P4 / P5 |
 | GET | `/documents/:id` | 详情，含分块数量与状态 | P4 |
 | PATCH | `/documents/:id` | 更新 `collection` / `tags` 等元数据，不触发重切 | P5 |

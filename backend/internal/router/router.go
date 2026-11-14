@@ -24,8 +24,8 @@ type Deps struct {
 	// Knowledge 是知识模块（文档入库与分块）。
 	Knowledge *knowledge.Handler
 
-	// 后续阶段在这里扩展：
-	//   Chat *chat.Handler（Phase 13 起）
+	// 后续模块在这里扩展，例如：
+	//   Chat *chat.Handler
 }
 
 // Register 把路由注册到已经挂好全局中间件的 engine 上。
@@ -57,8 +57,8 @@ func Register(e *gin.Engine, deps Deps) {
 	v1.GET("/system/status", deps.System.Status)
 	v1.GET("/settings", deps.Settings.Get)
 
-	// 知识：导入与重索引都是异步受理，返回 202 + message_id（Phase 6）；
-	// 同内容重复导入返回 200 + existed=true（Phase 5）。
+	// 知识：导入与重索引都是异步受理，返回 202 + message_id；
+	// 同内容重复导入返回 200 + existed=true。
 	v1.POST("/documents", deps.Knowledge.CreateFile)
 	v1.POST("/documents/note", deps.Knowledge.CreateNote)
 	v1.GET("/documents", deps.Knowledge.List)

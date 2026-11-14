@@ -75,7 +75,7 @@ func (c DBConfig) DSN() string {
 }
 
 // RedisConfig 描述 Redis 连接。单用户本地场景暂不依赖 Redis，
-// 只有缓存/限流成为真实瓶颈时才接线（见 docs/plan.md 的顺序约束）。
+// 只有缓存/限流成为真实瓶颈时才接线（理由见 docs/history.md 第 4 节）。
 type RedisConfig struct {
 	Addr     string
 	Password string
@@ -84,7 +84,7 @@ type RedisConfig struct {
 }
 
 // IsLLMConfigured 报告 LLM 是否已配置到"可用"程度。
-// Phase 9 才会真正调用模型；这里只回答"配了没有"，供 /settings 与 /system/status 展示，
+// 真正调用模型时会用到；这里只回答"配了没有"，供 /settings 与 /system/status 展示，
 // 未配置是合法状态（用户可能还没填 Key），不算启动错误。
 func (c *Config) IsLLMConfigured() bool {
 	return c.LLM.APIBase != "" && c.LLM.APIKey != "" && c.LLM.Model != ""
@@ -116,7 +116,7 @@ type MinIOConfig struct {
 }
 
 // LLMConfig 描述对话模型接入参数（OpenAI 兼容接口）。
-// 三个字段要么全配、要么全空；本阶段只做读取与校验，调用在 Phase 9 接入。
+// 三个字段要么全配、要么全空；这里只做读取与校验，调用尚未接入。
 type LLMConfig struct {
 	APIBase string // 例如 https://api.openai.com/v1
 	APIKey  string // 只从环境变量读，禁止入库、禁止进日志
@@ -401,7 +401,7 @@ func (c *Config) validate() error {
 // validateModelConfig 检查模型配置的"全配或全空"规则。
 //
 // 三个字段配了一半（例如只填了 Key 没填 Model）说明配置过程被中断，
-// 调用模型时才会暴露——那是 Phase 1 确立的"填错了带病启动"的同类问题，
+// 调用模型时才会暴露——那是项目早期确立的"填错了带病启动"的同类问题，
 // 所以在启动时就拒绝。全部为空是合法的：用户可能还没准备模型。
 func validateModelConfig(prefix, apiBase, apiKey, model string) []error {
 	set := map[string]bool{

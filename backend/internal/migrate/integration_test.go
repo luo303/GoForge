@@ -15,7 +15,7 @@ import (
 	"github.com/luo303/mindos/backend/migrations"
 )
 
-// 本文件是真实 PostgreSQL 集成测试，覆盖 Phase 2 的质量门槛：
+// 本文件是真实 PostgreSQL 集成测试，覆盖迁移的质量门槛：
 // up → down → up、重复 up 幂等、dirty 中断识别与 force 恢复。
 //
 // 运行方式：先启动 compose，再设置指向"postgres 维护库"的连接串：
@@ -23,7 +23,7 @@ import (
 //	MINDOS_TEST_DSN="host=localhost port=5432 user=mindos password=mindos_dev_password dbname=postgres sslmode=disable"
 //	go test -race -count=1 -run Integration ./internal/migrate/
 //
-// 未设置该变量时全部跳过（CI 之外不强制有数据库），但 Phase 2 验收必须实测通过。
+// 未设置该变量时全部跳过（CI 之外不强制有数据库），但迁移验收必须实测通过。
 // 测试会创建 mindos_migrate_test_<随机> 数据库并在结束时 DROP，不碰开发库。
 
 const testDSNEnv = "MINDOS_TEST_DSN"

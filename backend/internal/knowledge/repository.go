@@ -32,8 +32,8 @@ func NewRepository(db *gorm.DB) *Repository {
 
 // documentColumns 是列表与详情读取的列。
 //
-// 故意不含 source_url 与 error_*：前者属于已移出主线的网页抓取，
-// 后者要到 Phase 6 才有写入方；现在读出来只会得到零值。
+// 不含 source_url：网页抓取已移出主线。error_* 必须带上——
+// 缺了它详情页就读不到失败原因，用户只能去翻日志。
 // 列名集中在这里，避免多个方法各自写一份字符串。
 var documentColumns = []string{
 	"id", "title", "source_type", "mime", "size_bytes", "content_hash",

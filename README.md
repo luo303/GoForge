@@ -14,14 +14,14 @@ MindOS 是一个单用户、本地优先的 AI 个人工作空间：文档、网
 
 ## 能力概览
 
-| 模块 | 做什么 | 阶段 |
+| 模块 | 做什么 | 状态 |
 |---|---|---|
-| Knowledge | 文档/笔记入库、解析、切分、向量化、混合检索、带引用问答 | Phase 4–9 |
-| Memory | 四类长期记忆（画像/事实/经历/项目）的提炼、去重合并、召回 | Phase 10–12 |
-| Agent | Eino ADK 运行时、工具调用、预算闸门、checkpoint、人工审批、事件回放 | Phase 13–16 |
-| Action | 目标 → 计划 → 任务三级结构，依赖与进度，Agent 拆解 + 人工确认 | Phase 17–18 |
-| Context | 分段 token 预算、记忆与知识编排、历史摘要压缩 | Phase 19 |
-| Insights | 周期总结、学习进度、知识关联发现 | Phase 20 |
+| Knowledge | 文档/笔记入库、解析、切分、管理、异步任务链路；向量化、混合检索、带引用问答待做 | 部分实现 |
+| Memory | 四类长期记忆（画像/事实/经历/项目）的提炼、去重合并、召回 | 未开始 |
+| Agent | Eino ADK 运行时、工具调用、预算闸门、checkpoint、人工审批、事件回放 | 未开始 |
+| Action | 目标 → 计划 → 任务三级结构，依赖与进度，Agent 拆解 + 人工确认 | 未开始 |
+| Context | 分段 token 预算、记忆与知识编排、历史摘要压缩 | 未开始 |
+| Insights | 周期总结、学习进度、知识关联发现 | 未开始 |
 
 ## 技术栈
 
@@ -43,7 +43,7 @@ MindOS 是一个单用户、本地优先的 AI 个人工作空间：文档、网
 mindos/
 ├── backend/                 Go 服务（module: github.com/luo303/mindos/backend）
 │   ├── cmd/server/          进程入口：装配与启停
-│   ├── cmd/migrate/         SQL 迁移执行（Phase 2）
+│   ├── cmd/migrate/         SQL 迁移执行
 │   ├── internal/
 │   │   ├── config/          配置加载与校验
 │   │   ├── logging/         zap 初始化
@@ -59,17 +59,17 @@ mindos/
 │   │   ├── insight/         周期总结与分析
 │   │   ├── job/ worker/     异步任务与消费
 │   │   ├── handler/ router/ 协议层与路由表
-│   └── migrations/          SQL 迁移（Phase 2 起）
+│   └── migrations/          SQL 迁移
 ├── frontend/                React 应用（Vite + TS + Tailwind + shadcn/ui）
 │   ├── src/api/             统一 API 客户端、错误模型、接口类型
 │   ├── src/app/             路由表、应用外壳、模块元数据
 │   ├── src/pages/           六页 + 404
 │   └── src/components/ui/   shadcn/ui 基础组件
 ├── deployments/             PostgreSQL(pgvector) / RabbitMQ / Redis compose
-└── docs/                    设计、计划
+└── docs/                    设计与开发记录
 ```
 
-依赖单向：`router → <module>/handler → <module>/service → <module>/repository → <module>/model`；`agent` 与 `worker` 复用模块 service，不经过 HTTP 层。当前代码覆盖 Phase 1–3：后端迁移与系统状态接口、前端六页骨架与只读设置页。
+依赖单向：`router → <module>/handler → <module>/service → <module>/repository → <module>/model`；跨模块只调对方 service，不直接碰其 repository 与 model。当前实现覆盖 Knowledge 模块（文档入库、管理与异步任务链路）、迁移与系统状态接口、前端六页骨架。
 
 ## 快速开始
 
@@ -84,7 +84,7 @@ docker compose --env-file backend/.env -f deployments/docker-compose.yml up -d
 
 # 3. 执行迁移并启动服务
 cd backend
-go run ./cmd/migrate up          # Phase 2 起可用
+go run ./cmd/migrate up          # 执行迁移
 go run ./cmd/server
 
 # 4. 前端（另开终端，在仓库根目录）
@@ -171,7 +171,7 @@ docker compose --env-file backend/.env -f deployments/docker-compose.yml down -v
 
 ### 常见迁移错误
 
-- `migrate: query schema_migrations: sql: no rows in result set`：空库首次迁移时表还不存在。已在 Phase 2 修复（按“未初始化”处理），若再遇到说明代码被回退。
+- `migrate: query schema_migrations: sql: no rows in result set`：空库首次迁移时表还不存在。已修复（按“未初始化”处理），若再遇到说明代码被回退。
 - `ping postgres 127.0.0.1:5432/mindos: ...`：库没起或 `.env` 的连接参数不对，先 `docker compose ... ps` 再看 `logs postgres`。
 - `migrate: dirty at version N`：见上一节。
 
@@ -181,24 +181,14 @@ docker compose --env-file backend/.env -f deployments/docker-compose.yml down -v
 |---|---|
 | [AGENTS.md](AGENTS.md) | 开发准入约定：模块边界、硬约束、禁止事项、Git 规范 |
 | [docs/design/overview.md](docs/design/overview.md) | 领域模型、检索与记忆机制、Agent 运行时、API 清单 |
-| [docs/plan.md](docs/plan.md) | Phase 1–21：范围、提交拆分、分层测试、故障验证、退出标准 |
+| [docs/history.md](docs/history.md) | 开发记录：已完成的能力、设计取舍、故障演练结果、已知限制 |
 | [frontend/README.md](frontend/README.md) | 前端开发约定、目录结构、测试写法 |
 
-## 路线图
+## 当前状态
 
-| 阶段 | 内容 | 状态 |
-|---|---|---|
-| Phase 0 | 服务骨架（配置、日志、中间件、健康检查、优雅关闭） | 已完成 |
-| Phase 1–3 | 工程基线：缺陷纠偏、迁移与系统状态、前端工程骨架 | 已完成 |
-| Phase 4–9 | Knowledge：文本入库、文档管理、异步任务、向量、混合检索、RAG | Phase 4 已完成；P5 进行中 |
-| Phase 10–12 | Memory：人工管理、提炼与冲突治理、召回质量 | 待开始 |
-| Phase 13–16 | Agent：最小对话、工具与预算、审批恢复、MQ 与后台执行 | 待开始 |
-| Phase 17–18 | Action：任务领域、AI 计划与审批闭环 | 待开始 |
-| Phase 19 | Context：分段预算、摘要压缩、长对话质量 | 待开始 |
-| Phase 20 | Insights：真实统计、周期总结与学习分析 | 待开始 |
-| Phase 21 | 产品化：全栈部署、端到端回归、备份恢复、长期运行 | 待开始 |
+已完成：工程基线（配置、日志、中间件、探针、优雅关闭）、数据库迁移与系统状态、前端骨架、文本文档入库（Markdown / TXT / 笔记）、文档管理（幂等导入、删除、重索引、分类与标签筛选）、异步任务链路（事务写 outbox → RabbitMQ → 消费端更新 tasks，含退避重试、取消、崩溃恢复与兜底对账）。
 
-> 不设置工期。每个 Phase 的专项测试、故障验证和文档全部完成后才进入下一阶段；详细范围见 [docs/plan.md](docs/plan.md)。
+**不设路线图**：接下来做什么由使用者决定，不预先排期。已经做过的事、当时的设计取舍与已知限制记在 [docs/history.md](docs/history.md)。
 
 ## 贡献
 
