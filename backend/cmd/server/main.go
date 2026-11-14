@@ -401,17 +401,23 @@ type relayPublisher struct{ rabbit *platform.Rabbit }
 
 func (p relayPublisher) Publish(ctx context.Context, m outbox.Message) error {
 	if p.rabbit == nil {
-		return fmt.Errorf("rabbitmq is not available")
+		// 启动时没连上 broker：这是"通道不可用"，不是这条消息的问题。
+		// 用哨兵错误让它走上"暂停等待"而不是"消耗重试次数"。
+		return fmt.Errorf("%w: no broker connection", outbox.ErrQueueUnavailable)
 	}
 	payload, err := json.Marshal(map[string]any(m.Payload))
 	if err != nil {
 		return fmt.Errorf("marshal outbox payload: %w", err)
 	}
-	return p.rabbit.PublishEnvelope(ctx, platform.Envelope{
+	err = p.rabbit.PublishEnvelope(ctx, platform.Envelope{
 		MessageID: m.MessageID,
 		Topic:     m.Topic,
 		MsgKey:    m.MsgKey,
 		Payload:   payload,
 		Attempt:   m.Attempts,
 	})
+	if errors.Is(err, platform.ErrQueueClosed) {
+		return fmt.Errorf("%w: %v", outbox.ErrQueueUnavailable, err)
+	}
+	return err
 }

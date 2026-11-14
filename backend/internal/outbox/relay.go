@@ -6,10 +6,25 @@ package outbox
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
 )
+
+// ErrQueueUnavailable 表示投递通道本身不可用（连接没建起来、broker 挂了）。
+//
+// 必须与"这条消息发不出去"区分开：通道不可用时如果照常消耗重试次数，
+// 一次几十秒的 broker 抖动就能把攒了几分钟的消息全部打成"放弃"，
+// 而且这些消息再也不会被自动重试。
+var ErrQueueUnavailable = errors.New("outbox: queue unavailable")
+
+// queueUnavailableRetry 是通道不可用时的重试间隔。
+//
+// 比正常轮询（200ms）长得多：没有通道，转得再快也发不出去，
+// 只会把日志刷满。5 秒足够在 broker 恢复后很快接上。
+const queueUnavailableRetry = 5 * time.Second
 
 // store 是 relay 需要的仓储能力，定义在消费方便于测试替身。
 type store interface {
@@ -77,6 +92,17 @@ func (r *Relay) Run(ctx context.Context) {
 
 	for {
 		if _, err := r.Drain(ctx); err != nil && ctx.Err() == nil {
+			if errors.Is(err, ErrQueueUnavailable) {
+				// 没有通道时不必按正常节奏重试，也不必每轮记一条 warn：
+				// 广播一条日志，然后按 5 秒节奏等 broker 回来。
+				r.log.Warn("outbox relay paused: queue unavailable", zap.Error(err))
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(queueUnavailableRetry):
+				}
+				continue
+			}
 			r.log.Warn("outbox relay drain failed", zap.Error(err))
 		}
 		select {
@@ -103,6 +129,11 @@ func (r *Relay) Drain(ctx context.Context) (int, error) {
 	for i := range msgs {
 		m := &msgs[i]
 		if err := r.queue.Publish(ctx, *m); err != nil {
+			// 通道不可用：这一批都发不出去，没必要逐条试、更不能逐条消耗重试次数。
+			// 直接返回，由 Run 降频等待。消息保持"待发"，什么都没变。
+			if errors.Is(err, ErrQueueUnavailable) {
+				return sent, fmt.Errorf("%w: %v", ErrQueueUnavailable, err)
+			}
 			// 投递失败：还有次数就退避重排，否则标死。
 			// 这里不改业务实体状态——任务没发出去，业务本来就还没开始执行。
 			next := m.Attempts + 1

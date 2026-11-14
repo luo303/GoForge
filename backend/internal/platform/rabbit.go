@@ -50,13 +50,23 @@ func (r *Rabbit) PublishEnvelope(ctx context.Context, env Envelope) error {
 	if r.closed {
 		return ErrQueueClosed
 	}
-	return r.channel.PublishWithContext(ctx, "", r.opts.Queue, false, false, amqp.Publishing{
+	err = r.channel.PublishWithContext(ctx, "", r.opts.Queue, false, false, amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		MessageId:    env.MessageID,
 		Timestamp:    time.Now().UTC(),
 		Body:         body,
 	})
+	if err != nil {
+		// broker 重启会把 channel 关掉，但 closed 标志还是 false。
+		// 把这类错误统一包成 ErrQueueClosed：上层据此判断"通道没了"，
+		// 而不是当成"这条消息有问题"去消耗它的重试次数。
+		if errors.Is(err, amqp.ErrClosed) {
+			return fmt.Errorf("%w: %v", ErrQueueClosed, err)
+		}
+		return err
+	}
+	return nil
 }
 
 // ConsumeEnvelopes 阻塞消费信封格式的消息，直到 ctx 取消或连接断开。

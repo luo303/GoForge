@@ -3,6 +3,7 @@ package outbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -150,5 +151,48 @@ func TestRelayIsNoopWithoutQueue(t *testing.T) {
 	sent, err := r.Drain(context.Background())
 	if err != nil || sent != 0 {
 		t.Fatalf("drain = %d, %v; want 0, nil", sent, err)
+	}
+}
+
+// 通道不可用（broker 没连上、连接被关）时不能消耗消息的重试次数。
+// 否则一次几十秒的抖动就会把攒了几分钟的消息全部打成"放弃"，
+// 而且放弃之后它们再也不会被自动重试。
+func TestRelayDoesNotBurnAttemptsWhenQueueIsDown(t *testing.T) {
+	st := &fakeStore{pending: []Message{{ID: 7, Topic: "document.import"}}}
+	q := &fakeQueue{err: fmt.Errorf("%w: no broker connection", ErrQueueUnavailable)}
+
+	r := NewRelay(st, q, nil, RelayOptions{})
+	sent, err := r.Drain(context.Background())
+
+	if !errors.Is(err, ErrQueueUnavailable) {
+		t.Fatalf("error = %v, want ErrQueueUnavailable", err)
+	}
+	if sent != 0 {
+		t.Errorf("sent = %d, want 0", sent)
+	}
+	// 关键：既没重排、也没判死，消息保持原样等待通道恢复。
+	if len(st.resched) != 0 || len(st.givenUp) != 0 {
+		t.Errorf("rescheduled = %v givenUp = %v, want both empty", st.resched, st.givenUp)
+	}
+	// 通道坏了就不该逐条试：一条就够判断整批都发不出去。
+	if q.calls != 1 {
+		t.Errorf("publish calls = %d, want 1 (stop the batch early)", q.calls)
+	}
+}
+
+// 真正的"这条消息发不出去"仍要退避重排，别把两种情况混为一谈。
+// 单条失败不算 Drain 的错误：同一批里的其它消息还要继续发。
+func TestRelayReschedulesOnMessageError(t *testing.T) {
+	st := &fakeStore{pending: []Message{{ID: 8, Topic: "document.import"}}}
+	q := &fakeQueue{err: errors.New("queue not found")}
+
+	if _, err := NewRelay(st, q, nil, RelayOptions{}).Drain(context.Background()); err != nil {
+		t.Fatalf("drain error = %v, want nil (single failure is not a batch failure)", err)
+	}
+	if len(st.resched) != 1 || st.resched[0] != 8 {
+		t.Errorf("rescheduled = %v, want [8]", st.resched)
+	}
+	if len(st.givenUp) != 0 {
+		t.Errorf("givenUp = %v, want none on first failure", st.givenUp)
 	}
 }
