@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,6 +120,7 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("DB_PASSWORD", "test-password")
 	t.Setenv("MINIO_ACCESS_KEY", "mindos")
 	t.Setenv("MINIO_SECRET_KEY", "test-secret")
+	t.Setenv("RABBITMQ_PASSWORD", "test-password")
 	// 不设 MINIO_BUCKET：它的默认值 mindos 本身就非空，能满足必填校验，
 	// 留给用例自己断言默认值。
 }
@@ -357,5 +359,35 @@ func TestValidate(t *testing.T) {
 				t.Fatalf("error %q does not include %s", err, tc.want)
 			}
 		})
+	}
+}
+
+// 密码里带 @ : / 这类字符时，拼字符串会得到一个连不上的地址。
+// 用 net/url 组装后必须能原样解回来。
+func TestRabbitConfigURLRoundTrip(t *testing.T) {
+	cfg := RabbitConfig{
+		Host: "localhost", Port: 5672,
+		User: "mindos", Password: "p@ss:word/x",
+		VHost: "/", Queue: "mindos.jobs",
+	}
+
+	u, err := url.Parse(cfg.URL())
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	if u.Scheme != "amqp" || u.Host != "localhost:5672" || u.Path != "/" {
+		t.Errorf("address = %s://%s%s", u.Scheme, u.Host, u.Path)
+	}
+	if u.User.Username() != "mindos" {
+		t.Errorf("user = %q", u.User.Username())
+	}
+	if pw, _ := u.User.Password(); pw != "p@ss:word/x" {
+		t.Errorf("password round trip = %q", pw)
+	}
+
+	// 非根 vhost 要落到 path 上，否则会连到默认 vhost 而不是配置的那个。
+	cfg.VHost = "mindos"
+	if u, _ := url.Parse(cfg.URL()); u.Path != "/mindos" {
+		t.Errorf("vhost path = %q, want /mindos", u.Path)
 	}
 }

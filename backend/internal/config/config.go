@@ -9,6 +9,8 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -30,6 +32,7 @@ type Config struct {
 	Embedding EmbeddingConfig
 	Agent     AgentConfig
 	Job       JobConfig
+	Rabbit    RabbitConfig
 }
 
 // AppConfig 控制 HTTP 服务本身。
@@ -154,6 +157,36 @@ type JobConfig struct {
 	RecoverInterval time.Duration
 }
 
+// RabbitConfig 描述任务队列的连接与拓扑。
+//
+// 只有一条队列、一个 direct 交换机，路由键固定为 "job"：任务类型是表里的
+// kind 字段区分的，不需要按类型拆队列。拆队列要等到"某类任务需要独立并发
+// 或独立优先级"的时候，现在拆只会让拓扑比代码更难维护。
+type RabbitConfig struct {
+	Host     string
+	Port     int
+	User     string
+	Password string
+	VHost    string
+	Queue    string
+	// Prefetch 是单个消费者最多预取多少条未确认消息。
+	// 设成和 worker 并发数一致：取多了只会在内存里堆着，还会让取消/停止变慢。
+	Prefetch int
+}
+
+// URL 组装 AMQP 连接串。用 net/url 而不是字符串拼接：
+// 密码里出现 @ : / 之类的字符时，拼字符串会得到一个连不上的地址。
+func (c RabbitConfig) URL() string {
+	host := net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
+	u := url.URL{
+		Scheme: "amqp",
+		User:   url.UserPassword(c.User, c.Password),
+		Host:   host,
+		Path:   "/" + strings.TrimPrefix(c.VHost, "/"),
+	}
+	return u.String()
+}
+
 // IsDev 用于在开发环境输出更详细的错误信息。
 func (c *Config) IsDev() bool { return c.App.Env == "dev" }
 
@@ -222,12 +255,22 @@ func Load() (*Config, error) {
 			TokenBudget: reader.integer64("AGENT_TOKEN_BUDGET", 200000),
 			RunTimeout:  reader.duration("AGENT_RUN_TIMEOUT", 5*time.Minute),
 		},
-		Job: JobConfig{
-			Workers:         reader.integer("JOB_WORKERS", 2),
-			Lease:           reader.duration("JOB_LEASE", 30*time.Second),
-			PollInterval:    reader.duration("JOB_POLL_INTERVAL", 500*time.Millisecond),
-			RecoverInterval: reader.duration("JOB_RECOVER_INTERVAL", 30*time.Second),
-		},
+	}
+	cfg.Job = JobConfig{
+		Workers:         reader.integer("JOB_WORKERS", 2),
+		Lease:           reader.duration("JOB_LEASE", 30*time.Second),
+		PollInterval:    reader.duration("JOB_POLL_INTERVAL", 500*time.Millisecond),
+		RecoverInterval: reader.duration("JOB_RECOVER_INTERVAL", 30*time.Second),
+	}
+	cfg.Rabbit = RabbitConfig{
+		Host:     reader.text("RABBITMQ_HOST", "localhost"),
+		Port:     reader.integer("RABBITMQ_PORT", 5672),
+		User:     reader.text("RABBITMQ_USER", "mindos"),
+		Password: reader.text("RABBITMQ_PASSWORD", ""),
+		VHost:    reader.text("RABBITMQ_VHOST", "/"),
+		Queue:    reader.text("RABBITMQ_QUEUE", "mindos.jobs"),
+		// 预取数与并发数一致：取多了只会在内存里堆着，停止时也更慢。
+		Prefetch: reader.integer("RABBITMQ_PREFETCH", cfg.Job.Workers),
 	}
 
 	if err := reader.err(); err != nil {
@@ -322,6 +365,21 @@ func (c *Config) validate() error {
 	}
 	if c.Job.RecoverInterval <= 0 {
 		errs = append(errs, errors.New("JOB_RECOVER_INTERVAL must be greater than 0"))
+	}
+	if strings.TrimSpace(c.Rabbit.Host) == "" {
+		errs = append(errs, errors.New("RABBITMQ_HOST is required"))
+	}
+	if c.Rabbit.Port < 1 || c.Rabbit.Port > 65535 {
+		errs = append(errs, fmt.Errorf("RABBITMQ_PORT must be between 1 and 65535, got %d", c.Rabbit.Port))
+	}
+	if c.Rabbit.User == "" || c.Rabbit.Password == "" {
+		errs = append(errs, errors.New("RABBITMQ_USER and RABBITMQ_PASSWORD are required"))
+	}
+	if strings.TrimSpace(c.Rabbit.Queue) == "" {
+		errs = append(errs, errors.New("RABBITMQ_QUEUE is required"))
+	}
+	if c.Rabbit.Prefetch < 1 || c.Rabbit.Prefetch > 256 {
+		errs = append(errs, fmt.Errorf("RABBITMQ_PREFETCH must be between 1 and 256, got %d", c.Rabbit.Prefetch))
 	}
 	// errors.Join 是 Go 1.20 加入的：把多个错误合成一个，报错时一次看全。
 	return errors.Join(errs...)
