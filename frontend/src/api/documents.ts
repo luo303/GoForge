@@ -61,14 +61,18 @@ function normalizeDocument(raw: WireDocumentView): DocumentView {
 }
 
 /**
- * 导入响应多 existed 与 job_id。
- * 两者都做缺省兜底：旧后端没有 job_id 时按"没有待等任务"处理（0），
- * 页面照常显示，不会因为一个整数缺失把整条响应判成非法。
+ * 导入响应多 existed 与 message_id。
+ * 两者都做缺省兜底：旧后端没有 message_id 时按"没有待等消息"处理（空串），
+ * 页面照常显示，不会因为一个字段缺失把整条响应判成非法。
  */
 function normalizeImported(
-  raw: WireDocumentView & { existed?: boolean; job_id?: number },
+  raw: WireDocumentView & { existed?: boolean; message_id?: string },
 ): ImportedDocumentView {
-  return { ...normalizeDocument(raw), existed: raw.existed ?? false, job_id: raw.job_id ?? 0 }
+  return {
+    ...normalizeDocument(raw),
+    existed: raw.existed ?? false,
+    message_id: raw.message_id ?? '',
+  }
 }
 
 export async function fetchDocuments(
@@ -109,10 +113,11 @@ export async function uploadDocument(
     body.append('tags', meta.tags.join(','))
   }
   return normalizeImported(
-    await apiRequest<WireDocumentView & { existed?: boolean; job_id?: number }>('/documents', {
+    await apiRequest<WireDocumentView & { existed?: boolean; message_id?: string }>('/documents', {
       method: 'POST',
       body,
-      // 上传比普通请求慢：解析与切分在同一个请求里完成，10s 默认值不够稳。
+      // 上传要落盘到 MinIO，比普通请求慢；解析与切分已经搬进消费端，
+      // 所以不需要为它们留时间，但对象存储抖动时 10s 默认值仍不够稳。
       timeoutMs: 60_000,
     }),
   )
@@ -137,7 +142,7 @@ export async function createNote(input: {
     body.tags = input.tags
   }
   return normalizeImported(
-    await apiRequest<WireDocumentView & { existed?: boolean; job_id?: number }>('/documents/note', {
+    await apiRequest<WireDocumentView & { existed?: boolean; message_id?: string }>('/documents/note', {
       method: 'POST',
       body,
     }),
@@ -155,17 +160,11 @@ export function deleteDocument(id: number): Promise<{ id: number }> {
 }
 
 /**
- * 发起重新切分。
- *
- * Phase 6 起是异步的：返回 202 + job_id，文档先置 indexing，分块由 worker 重算。
- * 所以不再给 60s 超时——请求里只剩"建任务"这一步。
- */
-/**
  * 取消进行中的处理。
  *
  * 返回 200 + 文档当前状态：排队中的任务已被置为 cancelled，运行中的已置为
- * cancelling（等 worker 心跳发现后停手）。所以调用方拿到的状态可能仍是"进行中"，
- * 页面靠轮询自然过渡到终态。
+ * cancelling（等消费端在执行前或收尾时看到）。所以调用方拿到的状态可能仍是
+ * "进行中"，页面靠轮询自然过渡到终态。
  */
 export async function cancelProcessing(id: number): Promise<DocumentView> {
   return normalizeDocument(
@@ -173,9 +172,15 @@ export async function cancelProcessing(id: number): Promise<DocumentView> {
   )
 }
 
+/**
+ * 发起重新切分。
+ *
+ * 异步：返回 202 + message_id，文档先置 indexing，分块由消费端重算。
+ * 所以不给 60s 超时——请求里只剩"建任务与消息"这一步。
+ */
 export async function reindexDocument(id: number): Promise<ImportedDocumentView> {
   return normalizeImported(
-    await apiRequest<WireDocumentView & { existed?: boolean; job_id?: number }>(
+    await apiRequest<WireDocumentView & { existed?: boolean; message_id?: string }>(
       `/documents/${id}/reindex`,
       { method: 'POST' },
     ),

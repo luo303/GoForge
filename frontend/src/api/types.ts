@@ -95,10 +95,10 @@ export type DocumentView = {
 export type ImportedDocumentView = DocumentView & {
   existed: boolean
   /**
-   * 排队中的任务 id（Phase 6 起）。
-   * 幂等命中时为 0：没有新建任务，也就没有要等的东西。
+   * 本次受理写入 outbox 的消息编号（uuid）。
+   * 幂等命中时为空串：没有新建消息，也就没有要等的东西。
    */
-  job_id: number
+  message_id: string
 }
 
 /** 列表筛选条件。空串表示不过滤，省掉调用方处理 undefined 的分支。 */

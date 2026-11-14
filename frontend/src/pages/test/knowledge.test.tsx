@@ -201,7 +201,10 @@ describe('知识库页面', () => {
       const url = String(input)
       if (url === '/api/v1/documents' && init?.method === 'POST') {
         // 202 的含义：受理成功，但内容还没处理。
-        return jsonOk(envelope({ ...pendingDoc, existed: false, job_id: 7 }), 202)
+        return jsonOk(
+          envelope({ ...pendingDoc, existed: false, message_id: 'msg-202' }),
+          202,
+        )
       }
       if (url === '/api/v1/documents?limit=20&offset=0') {
         return jsonOk(envelope(documentListFixture([pendingDoc])))
