@@ -106,8 +106,9 @@ func TestHandleGivesUpAtMaxAttempts(t *testing.T) {
 		return errors.New("bad content")
 	})
 
-	// payload 里带 attempt=2，表示这已经是第三次尝试。
-	env := envOf("m4", "document.import", `{"document_id":1,"attempt":2}`)
+	// 信封上 attempt=2，表示这已经是第三次尝试。
+	env := envOf("m4", "document.import", `{"document_id":1}`)
+	env.Attempt = 2
 	if err := c.Handle(context.Background(), env); err == nil {
 		t.Fatal("expected error")
 	}

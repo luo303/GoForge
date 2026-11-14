@@ -36,6 +36,9 @@ type Envelope struct {
 	Topic     string          `json:"topic"`
 	MsgKey    string          `json:"msg_key"`
 	Payload   json.RawMessage `json:"payload"`
+	// Attempt 是"第几次投递"，由 relay 从 outbox.attempts 填入。
+	// 放在信封上而不是 payload 里：它是消息元数据，业务参数不该被塞进重试计数。
+	Attempt int `json:"attempt"`
 }
 
 // PublishEnvelope 投递一条 outbox 消息。

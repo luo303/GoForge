@@ -6,7 +6,6 @@ package dispatch
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -25,7 +24,11 @@ type Store interface {
 	Consumed(ctx context.Context, messageID string) (bool, error)
 	// MarkConsumed 记录处理完成（含"确定不重试"的放弃）。
 	MarkConsumed(ctx context.Context, messageID, topic string) error
-	// Retry 追加一条新的 outbox 消息用于退避重试。
+	// Retry 把原消息重新排队：status 回到待发送、available_at 推迟、attempts +1。
+	//
+	// 实现方应当**更新原行**而不是插入新行：message_id 保持稳定，
+	// 消费端去重语义才正确（同一条任务重试几次都是同一条消息），
+	// 表也不会因为重试而膨胀。历史留在 attempts 与 last_error 上。
 	Retry(ctx context.Context, env platform.Envelope, delay time.Duration, reason string) error
 }
 
@@ -91,7 +94,8 @@ func (c *Consumer) Handle(ctx context.Context, env platform.Envelope) error {
 	}
 
 	if err := handler(ctx, env); err != nil {
-		attempt := attemptOf(env) + 1
+		// 次数来自信封（relay 从 outbox.attempts 填），不读 payload。
+		attempt := env.Attempt + 1
 		if attempt >= c.maxAttempts {
 			c.log.Error("message failed after retries, giving up",
 				zap.String("topic", env.Topic), zap.String("message_id", env.MessageID),
@@ -117,20 +121,6 @@ func (c *Consumer) Handle(ctx context.Context, env platform.Envelope) error {
 
 // ErrUnknownTopic 表示没有为该 topic 注册处理函数。
 var ErrUnknownTopic = fmt.Errorf("dispatch: unknown topic")
-
-// attemptOf 从 payload 里读重试次数。
-//
-// 复用 payload 的顶层字段而不是另加一列：重试消息本身就是一条新消息，
-// 把"第几次"带上就够了；payload 是业务参数，业务不该关心这个键。
-func attemptOf(env platform.Envelope) int {
-	var meta struct {
-		Attempt int `json:"attempt"`
-	}
-	if len(env.Payload) > 0 {
-		_ = json.Unmarshal(env.Payload, &meta)
-	}
-	return meta.Attempt
-}
 
 // retryBackoff 与任务执行失败的退避保持一致：3s 起、指数增长、封顶 5 分钟。
 func retryBackoff(attempt int) time.Duration {
