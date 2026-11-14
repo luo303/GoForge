@@ -6,12 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/luo303/mindos/backend/internal/job"
 	"github.com/luo303/mindos/backend/internal/platform"
+	"github.com/luo303/mindos/backend/internal/task"
 )
 
 // fakeRepo 是内存版仓储。Service 依赖的是接口，所以这里不需要数据库。
@@ -25,20 +26,74 @@ type fakeRepo struct {
 	nextID     int64
 	createErr  error
 	replaceErr error
-	// jobs 记录本次测试里创建过的任务，供"受理后是否入队"这类断言使用。
-	jobs []*job.Job
-	// notified 记录被"叫醒"过的任务 id；notifyErr 用来模拟 broker 不可用。
-	notified  []int64
-	notifyErr error
+	// tasks 与 service 共用同一份任务状态：受理时写入、取消时读取，
+	// 分成两个对象就会出现"仓储写了一条、taskStore 看不到"的假象。
+	tasks *fakeTasks
 }
 
-// Notify 复刻"投递到队列"。假仓储只记录，不真的发消息。
-func (f *fakeRepo) Notify(_ context.Context, jobID int64) error {
-	if f.notifyErr != nil {
-		return f.notifyErr
+// fakeTasks 复刻 tasks 表里本模块用到的两个动作。
+//
+// 只实现 Active 与 CancelPending：service 对任务表只有这两处依赖，
+// 替身跟着窄接口走，多写的方法意味着接口可能比实际需要更宽。
+type fakeTasks struct {
+	items  []*task.Task
+	nextID int64
+}
+
+// add 模拟"受理时写一条 pending 任务"。
+func (f *fakeTasks) add(kind string, documentID int64) *task.Task {
+	f.nextID++
+	t := &task.Task{
+		ID:         f.nextID,
+		Type:       kind,
+		TargetType: task.TargetDocument,
+		TargetID:   documentID,
+		Status:     task.StatusPending,
 	}
-	f.notified = append(f.notified, jobID)
-	return nil
+	f.items = append(f.items, t)
+	return t
+}
+
+func (f *fakeTasks) Active(_ context.Context, targetType string, targetID int64) (*task.Task, error) {
+	for i := len(f.items) - 1; i >= 0; i-- {
+		t := f.items[i]
+		if t.TargetType != targetType || t.TargetID != targetID {
+			continue
+		}
+		if t.Status == task.StatusPending || t.Status == task.StatusRunning {
+			return t, nil
+		}
+	}
+	return nil, task.ErrNotFound
+}
+
+func (f *fakeTasks) CancelPending(_ context.Context, id int64) (bool, error) {
+	for _, t := range f.items {
+		if t.ID != id {
+			continue
+		}
+		// 只有 pending 能被抢到：running 说明消费端已经领走，
+		// 与真实实现的"条件更新影响 0 行"行为一致。
+		if t.Status != task.StatusPending {
+			return false, nil
+		}
+		t.Status = task.StatusCancelled
+		return true, nil
+	}
+	return false, nil
+}
+
+// completeFor 模拟消费端把该文档的活跃任务跑完。
+//
+// 这一步在真实系统里由 dispatch 的消费端写，不在 service 里——
+// 但测试要在"处理已完成"之后继续排新任务，必须有人把上一条收掉，
+// 否则会撞"同一文档只能有一个未完成任务"的唯一索引。
+func (f *fakeTasks) completeFor(documentID int64) {
+	for _, t := range f.items {
+		if t.TargetID == documentID && t.Status == task.StatusPending {
+			t.Status = task.StatusSucceeded
+		}
+	}
 }
 
 func newFakeRepo() *fakeRepo {
@@ -46,6 +101,7 @@ func newFakeRepo() *fakeRepo {
 		docs:      map[int64]*Document{},
 		chunks:    map[int64][]Chunk{},
 		hashIndex: map[string]int64{},
+		tasks:     &fakeTasks{},
 	}
 }
 
@@ -74,21 +130,15 @@ func (f *fakeRepo) CreateWithChunks(_ context.Context, doc *Document, chunks []C
 	return nil
 }
 
-// CreateWithJob 复刻"同一事务里写待处理文档与任务"。
+// CreateWithTask 复刻"同一事务里写待处理文档、任务与消息"。
 // 先走 CreateWithChunks（零分块），保证唯一索引冲突的行为与真实仓储一致。
-func (f *fakeRepo) CreateWithJob(_ context.Context, doc *Document, j *job.Job) error {
+func (f *fakeRepo) CreateWithTask(_ context.Context, doc *Document, kind string) (string, error) {
 	if err := f.CreateWithChunks(context.Background(), doc, nil); err != nil {
-		return err
+		return "", err
 	}
-	if j != nil {
-		j.ID = int64(len(f.jobs) + 1)
-		if j.Payload == nil {
-			j.Payload = job.Payload{}
-		}
-		j.Payload["document_id"] = doc.ID
-		f.jobs = append(f.jobs, j)
-	}
-	return nil
+	f.tasks.add(kind, doc.ID)
+	// 真实实现在插入时就生成 uuid；替身只要保证非空且互不相同。
+	return "msg-" + strconv.FormatInt(doc.ID, 10), nil
 }
 
 // FinishImport 复刻"替换分块 + 置 ready"，两件事在真实实现里是同一事务。
@@ -107,65 +157,30 @@ func (f *fakeRepo) FinishImport(_ context.Context, documentID int64, chunks []Ch
 	doc.ChunkCount = len(chunks)
 	doc.Status = StatusReady
 	doc.UpdatedAt = time.Now().UTC()
-	// 处理完成也意味着该文档身上的任务结束了：真实实现里这一步由 worker
-	// 写回 succeeded，假仓储没有 worker，就在这里收尾，
-	// 否则"处理完之后还能不能再排一条"的行为会与真实实现不一致。
-	for _, j := range f.jobs {
-		if !j.Status.Active() {
-			continue
-		}
-		if id, ok := j.Payload["document_id"].(int64); ok && id == documentID {
-			j.Status = job.StatusSucceeded
-		}
-	}
+	// 任务的 succeeded 由消费端写，service 不碰——替身也不该替它收尾，
+	// 否则"执行段不写任务状态"这条契约在测试里就看不见了。
 	return nil
 }
 
-// MarkIndexingWithJob 复刻"置 indexing + 建任务"与部分唯一索引的去重行为：
-// 真实库靠 (kind, dedupe_key) where status in (queued,running) 挡住重复排队，
-// 假仓储不模拟的话，ErrReindexRunning 分支永远不会被走到。
-func (f *fakeRepo) MarkIndexingWithJob(_ context.Context, documentID int64, j *job.Job) error {
+// MarkIndexingWithTask 复刻"置 indexing + 建任务"与部分唯一索引的去重行为：
+// 真实库靠 (type, target_type, target_id) where status in (pending,running)
+// 挡住重复排队，假仓储不模拟的话，ErrReindexRunning 分支永远不会被走到。
+func (f *fakeRepo) MarkIndexingWithTask(_ context.Context, documentID int64, kind string) (string, error) {
 	doc, ok := f.docs[documentID]
 	if !ok {
-		return ErrNotFound
+		return "", ErrNotFound
 	}
-	for _, existing := range f.jobs {
-		if existing.Kind != KindDocumentReindex || !existing.Status.Active() {
+	for _, t := range f.tasks.items {
+		if t.TargetID != documentID {
 			continue
 		}
-		if existing.DedupeKey != nil && j.DedupeKey != nil && *existing.DedupeKey == *j.DedupeKey {
-			return ErrDuplicate
+		if t.Status == task.StatusPending || t.Status == task.StatusRunning {
+			return "", ErrDuplicate
 		}
 	}
 	doc.Status = StatusIndexing
-	j.ID = int64(len(f.jobs) + 1)
-	if j.Payload == nil {
-		j.Payload = job.Payload{}
-	}
-	j.Payload["document_id"] = documentID
-	f.jobs = append(f.jobs, j)
-	return nil
-}
-
-// RequestCancel 复刻"取消该文档未完成任务"：排队的直接 cancelled，
-// 跑着的转 cancelling 等 worker 收手。
-func (f *fakeRepo) RequestCancel(_ context.Context, documentID int64) (int64, job.Kind, job.Status, error) {
-	for i := len(f.jobs) - 1; i >= 0; i-- {
-		j := f.jobs[i]
-		if !j.Status.Active() {
-			continue
-		}
-		if id, ok := j.Payload["document_id"].(int64); !ok || id != documentID {
-			continue
-		}
-		if j.Status == job.StatusQueued {
-			j.Status = job.StatusCancelled
-		} else {
-			j.Status = job.StatusCancelling
-		}
-		return j.ID, j.Kind, j.Status, nil
-	}
-	return 0, "", "", job.ErrNoJob
+	f.tasks.add(kind, documentID)
+	return "msg-" + strconv.FormatInt(int64(len(f.tasks.items)), 10), nil
 }
 
 // MarkCancelling 复刻"取消中"这个中间态。
@@ -389,9 +404,9 @@ func (f *fakeStore) Remove(_ context.Context, relPath string) error {
 
 func newTestService(maxUploadBytes int64) (*Service, *fakeRepo, *fakeStore) {
 	repo, store := newFakeRepo(), newFakeStore()
-	// fakeRepo 同时充当 jobCanceler：假仓储里本来就维护着任务列表，
-	// 再拆一个替身只会让"任务跟着文档变化"这件事分成两处维护。
-	return NewService(repo, store, repo, maxUploadBytes, nil), repo, store
+	// 任务状态由 repo.tasks 持有：受理时写入、取消时读取，
+	// 两个替身共享同一份数据，才能复刻"同一条任务"的真实关系。
+	return NewService(repo, store, repo.tasks, maxUploadBytes, nil), repo, store
 }
 
 func TestImportFileMarkdown(t *testing.T) {
@@ -1145,8 +1160,8 @@ func TestStartImportEnqueuesThenProcesses(t *testing.T) {
 	if res.Existed {
 		t.Fatal("first import should not be treated as existing")
 	}
-	if res.JobID == 0 {
-		t.Fatal("a job should be enqueued for the new document")
+	if res.MessageID == "" {
+		t.Fatal("a message should be enqueued for the new document")
 	}
 	if res.Document.Status != StatusPending {
 		t.Errorf("status = %s, want pending", res.Document.Status)
@@ -1154,12 +1169,12 @@ func TestStartImportEnqueuesThenProcesses(t *testing.T) {
 	if res.Document.ChunkCount != 0 {
 		t.Errorf("chunk_count = %d, want 0 before processing", res.Document.ChunkCount)
 	}
-	if len(repo.jobs) != 1 || repo.jobs[0].Kind != KindDocumentImport {
-		t.Fatalf("enqueued jobs = %v, want one %s", repo.jobs, KindDocumentImport)
+	if len(repo.tasks.items) != 1 || repo.tasks.items[0].Type != KindDocumentImport {
+		t.Fatalf("enqueued tasks = %v, want one %s", repo.tasks.items, KindDocumentImport)
 	}
-	// 任务必须指向刚建好的文档，否则 worker 不知道该处理谁。
-	if got := repo.jobs[0].Payload["document_id"]; got != res.Document.ID {
-		t.Errorf("job payload document_id = %v, want %d", got, res.Document.ID)
+	// 任务必须指向刚建好的文档，否则消费端不知道该处理谁。
+	if got := repo.tasks.items[0].TargetID; got != res.Document.ID {
+		t.Errorf("task target_id = %d, want %d", got, res.Document.ID)
 	}
 
 	// 执行阶段：真实运行时由 worker 调用，这里直接调，避免测试依赖轮询时间。
@@ -1224,68 +1239,16 @@ func finishImport(ctx context.Context, t *testing.T, svc *Service, res *ImportRe
 	if err := svc.ProcessImport(ctx, res.Document.ID); err != nil {
 		return nil, false, err
 	}
+	// 真实路径里任务终态由消费端写。测试要模拟"整条链路跑完"，
+	// 就得有人把这条任务收掉，否则后续重索引会撞唯一索引。
+	if ft, ok := svc.tasks.(*fakeTasks); ok {
+		ft.completeFor(res.Document.ID)
+	}
 	doc, err := svc.Get(ctx, res.Document.ID)
 	if err != nil {
 		return nil, false, err
 	}
 	return doc, false, nil
-}
-
-// 不可恢复的错误（原文丢失）即使还有重试次数，也应该立刻把文档标成失败：
-// 重试三次拿到的是同一个结果，只会延迟用户看到错误。
-func TestProcessImportTaskMarksFinalFailure(t *testing.T) {
-	ctx := context.Background()
-	repo := newFakeRepo()
-	// 既没有 storage_path 也没有 content：sourceText 必然报 ErrSourceMissing。
-	doc := &Document{
-		ID: 1, Title: "孤儿文档", MIME: MIMEMarkdown,
-		ContentHash: "deadbeef", SourceType: SourceFile, Status: StatusPending,
-	}
-	repo.docs[1] = doc
-	repo.nextID = 1
-	svc := NewService(repo, newFakeStore(), repo, 1<<20, nil)
-
-	err := svc.ProcessImportTask(ctx, 1, 1, 3)
-	if !errors.Is(err, ErrSourceMissing) {
-		t.Fatalf("error = %v, want ErrSourceMissing", err)
-	}
-	if doc.Status != StatusFailed {
-		t.Errorf("status = %s, want failed", doc.Status)
-	}
-	if doc.ErrorCode == nil || *doc.ErrorCode != "source_missing" {
-		t.Errorf("error_code = %v, want source_missing", doc.ErrorCode)
-	}
-	if doc.ErrorMessage == nil || *doc.ErrorMessage == "" {
-		t.Error("error_message should keep a human readable reason")
-	}
-}
-
-// 可恢复的错误（存储暂时不可用）不该标红：任务还会重试，
-// 文档此时显示"失败"会和正在排队重试的任务互相矛盾。
-func TestProcessImportTaskKeepsPendingOnRetryableError(t *testing.T) {
-	ctx := context.Background()
-	repo := newFakeRepo()
-	path := "documents/abc"
-	doc := &Document{
-		ID: 2, Title: "正常文档", MIME: MIMEMarkdown, ContentHash: "cafebabe",
-		SourceType: SourceFile, StoragePath: &path, Status: StatusPending,
-	}
-	repo.docs[2] = doc
-	repo.nextID = 2
-	store := newFakeStore()
-	store.readErr = errors.New("minio: connection reset")
-	svc := NewService(repo, store, repo, 1<<20, nil)
-
-	err := svc.ProcessImportTask(ctx, 2, 1, 3)
-	if err == nil {
-		t.Fatal("expected an error from a failing read")
-	}
-	if doc.Status != StatusPending {
-		t.Errorf("status = %s, want pending while retries remain", doc.Status)
-	}
-	if doc.ErrorCode != nil {
-		t.Errorf("error_code = %v, want nil before final failure", doc.ErrorCode)
-	}
 }
 
 // 取消导入：文档没成，标 failed 并写明原因；再取消一次返回"没有可取消的处理"。
@@ -1352,18 +1315,18 @@ func TestCancelProcessingRunningMarksCancelling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start note import: %v", err)
 	}
-	// 模拟 worker 已经把任务领走。
-	repo.jobs[0].Status = job.StatusRunning
+	// 模拟消费端已经把任务领走。
+	repo.tasks.items[0].Status = task.StatusRunning
 
 	doc, err := svc.CancelProcessing(ctx, res.Document.ID)
 	if err != nil {
 		t.Fatalf("cancel: %v", err)
 	}
 	if doc.Status != StatusCancelling {
-		t.Errorf("status = %s, want cancelling while the job is still running", doc.Status)
+		t.Errorf("status = %s, want cancelling while the task is still running", doc.Status)
 	}
 
-	// worker 停下后回调写终态。
+	// 消费端停下后回调写终态。
 	if err := svc.SettleCancelled(ctx, res.Document.ID, false); err != nil {
 		t.Fatalf("settle cancelled: %v", err)
 	}
@@ -1376,9 +1339,9 @@ func TestCancelProcessingRunningMarksCancelling(t *testing.T) {
 	}
 }
 
-// 存储不可用与原文丢失必须区分：前者重试或恢复 MinIO 后能好，后者只能重新导入。
-// 重试次数用尽时落库的错误码要能把这两件事分开。
-func TestProcessImportTaskReportsStorageUnavailable(t *testing.T) {
+// MarkProcessingFailed 是消费端在"确定不再重试"时调用的收尾：
+// 码要写进文档，用户才能在详情页看到可读的原因。
+func TestMarkProcessingFailedWritesCode(t *testing.T) {
 	ctx := context.Background()
 	repo := newFakeRepo()
 	path := "documents/abc"
@@ -1390,27 +1353,46 @@ func TestProcessImportTaskReportsStorageUnavailable(t *testing.T) {
 	repo.nextID = 3
 	store := newFakeStore()
 	store.readErr = errors.New("dial tcp: connection refused")
-	svc := NewService(repo, store, repo, 1<<20, nil)
+	svc := NewService(repo, store, repo.tasks, 1<<20, nil)
 
-	// attempts == max：这次之后不再重试。
-	err := svc.ProcessImportTask(ctx, 3, 3, 3)
-	if !errors.Is(err, ErrStorageUnavailable) {
-		t.Fatalf("error = %v, want ErrStorageUnavailable", err)
+	// 真实路径是消费端跑 ProcessImport 失败后再调它，这里直接验证收尾效果。
+	runErr := svc.ProcessImport(ctx, 3)
+	if runErr == nil {
+		t.Fatal("expected an error from a failing read")
+	}
+	if err := svc.MarkProcessingFailed(ctx, 3, runErr); err != nil {
+		t.Fatalf("mark failed: %v", err)
 	}
 	if doc.Status != StatusFailed {
-		t.Errorf("status = %s, want failed after retries exhausted", doc.Status)
+		t.Errorf("status = %s, want failed", doc.Status)
 	}
+	// 存储不可用必须与原文丢失区分：前者恢复 MinIO 就好，后者只能重新导入。
 	if doc.ErrorCode == nil || *doc.ErrorCode != "storage_unavailable" {
 		t.Errorf("error_code = %v, want storage_unavailable", doc.ErrorCode)
 	}
-	// 任务表要记同一个码：两张表说的不是同一件事，排查时就得再猜一次。
-	if got := job.ErrorCode(err); got != "storage_unavailable" {
+	// 任务表用同一个映射：两处记的码不一致时，排查要在两份分类之间猜。
+	if got := ErrorCode(runErr); got != "storage_unavailable" {
 		t.Errorf("job error code = %q, want storage_unavailable", got)
 	}
 }
 
-// 落库之后必须叫醒 worker，否则任务要等下一轮补投才被执行。
-func TestStartImportNotifiesQueue(t *testing.T) {
+// 永久错误不该占满重试次数：消费端用 IsPermanent 提前收尾。
+func TestIsPermanentClassifiesUnrecoverableErrors(t *testing.T) {
+	permanent := []error{ErrUnsupportedType, ErrEmptyDocument, ErrNotUTF8, ErrInvalidMetadata, ErrSourceMissing, ErrNotFound}
+	for _, err := range permanent {
+		if !IsPermanent(err) {
+			t.Errorf("%v should be treated as permanent", err)
+		}
+	}
+	// 存储暂时不可用是可恢复的：恢复 MinIO 或网络之后重试就能成功。
+	if IsPermanent(ErrStorageUnavailable) {
+		t.Error("storage unavailable must stay retryable")
+	}
+}
+
+// 受理要返回消息编号：前端的"已受理，正在后台解析"提示靠它追踪，
+// 空编号等于告诉用户"我收下了但不知道收的是什么"。
+func TestStartImportReturnsMessageID(t *testing.T) {
 	ctx := context.Background()
 	svc, repo, _ := newTestService(1 << 20)
 
@@ -1418,36 +1400,16 @@ func TestStartImportNotifiesQueue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start note import: %v", err)
 	}
-	if len(repo.notified) != 1 || repo.notified[0] != res.JobID {
-		t.Fatalf("notified = %v, want [%d]", repo.notified, res.JobID)
+	if res.MessageID == "" {
+		t.Fatal("message id should be returned to the caller")
+	}
+	if len(repo.tasks.items) != 1 || repo.tasks.items[0].Type != KindDocumentImport {
+		t.Fatalf("tasks = %v, want one %s", repo.tasks.items, KindDocumentImport)
 	}
 }
 
-// 队列不可用时，受理本身必须仍然成功：任务已经在表里，
-// 投递失败只是延迟，让 HTTP 返回 500 会误导用户重传。
-func TestImportSucceedsWhenQueueUnavailable(t *testing.T) {
-	ctx := context.Background()
-	svc, repo, _ := newTestService(1 << 20)
-	repo.notifyErr = errors.New("dial tcp: connection refused")
-
-	res, err := svc.StartNoteImport(ctx, NoteInput{Content: "# 队列挂了\n\n正文。\n"})
-	if err != nil {
-		t.Fatalf("import should succeed without the queue, got %v", err)
-	}
-	if res.JobID == 0 {
-		t.Error("job should still be created")
-	}
-	doc, err := svc.Get(ctx, res.Document.ID)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if doc.Status != StatusPending {
-		t.Errorf("status = %s, want pending", doc.Status)
-	}
-}
-
-// 重索引同样要叫醒：这条路径与导入分开实现，容易漏掉其中一个。
-func TestStartReindexNotifiesQueue(t *testing.T) {
+// 重索引与导入是两条独立的重载路径，容易只改一条。
+func TestStartReindexReturnsMessageID(t *testing.T) {
 	ctx := context.Background()
 	svc, repo, _ := newTestService(1 << 20)
 
@@ -1458,13 +1420,16 @@ func TestStartReindexNotifiesQueue(t *testing.T) {
 	if _, _, err := finishImport(ctx, t, svc, res); err != nil {
 		t.Fatalf("process import: %v", err)
 	}
-	before := len(repo.notified)
+	before := len(repo.tasks.items)
 
 	reindex, err := svc.StartReindex(ctx, res.Document.ID)
 	if err != nil {
 		t.Fatalf("start reindex: %v", err)
 	}
-	if len(repo.notified) != before+1 || repo.notified[before] != reindex.JobID {
-		t.Fatalf("notified = %v, want one more entry for job %d", repo.notified, reindex.JobID)
+	if reindex.MessageID == "" {
+		t.Fatal("reindex should also return a message id")
+	}
+	if len(repo.tasks.items) != before+1 || repo.tasks.items[before].Type != KindDocumentReindex {
+		t.Fatalf("tasks = %v, want one more %s", repo.tasks.items, KindDocumentReindex)
 	}
 }

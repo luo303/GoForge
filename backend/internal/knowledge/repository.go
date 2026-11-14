@@ -16,7 +16,6 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/luo303/mindos/backend/internal/job"
 	"github.com/luo303/mindos/backend/internal/outbox"
 	"github.com/luo303/mindos/backend/internal/task"
 )
@@ -77,48 +76,47 @@ func (r *Repository) CreateWithChunks(ctx context.Context, doc *Document, chunks
 	return translateError("create document", err)
 }
 
-// CreateWithJob 在同一个事务里写入"待处理文档"与它的任务。
+// CreateWithTask 在同一个事务里写入"待处理文档"与其任务、消息。
 //
 // 为什么要一个事务：异步化以后，导入被拆成"建记录 + 后台处理"两步。
 // 如果先建文档再建任务，中间失败会留下一条永远 pending、又没人处理的记录；
 // 反过来则是任务指向一个不存在的文档。两者都是需要人工介入的脏状态。
 //
-// j 为 nil 表示这次不需要任务（当前没有这种调用，保留是为了让"同步写入"的
-// 调试路径不必另写一个方法）。
-func (r *Repository) CreateWithJob(ctx context.Context, doc *Document, j *job.Job) error {
+// 返回 message_id：受理响应要告诉前端"这条消息的编号"，它由 outbox 在插入时生成。
+func (r *Repository) CreateWithTask(ctx context.Context, doc *Document, kind string) (string, error) {
 	doc.ChunkCount = 0
+	var messageID string
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(doc).Error; err != nil {
 			return err
 		}
-		if j == nil {
-			return nil
-		}
-		// jobs 那一行已停止写入：消费链路走 outbox，旧的 jobs 表只剩历史数据。
-		// 参数保留是为了不动业务层签名与调用点，删除 job 包时一起清理。
-		return appendTaskAndOutbox(ctx, tx, doc.ID, string(j.Kind))
+		var err error
+		messageID, err = appendTaskAndOutbox(ctx, tx, doc.ID, kind)
+		return err
 	})
-	return translateError("create document with job", err)
+	return messageID, translateError("create document with task", err)
 }
 
-// appendTaskAndOutbox 是过渡期的双写：同一次受理写三条记录。
+// appendTaskAndOutbox 在一次受理里写两条记录，返回消息编号。
 //
-//	jobs    —— 旧 worker 消费用，第 3 步删除
 //	tasks   —— 进度真相（跨重启、要给页面查）
 //	outbox  —— 投递通道（发完即弃，定时清理）
 //
 // 放在仓储而不是业务层的原因：task_id 与 document_id 都依赖自增主键，
 // 必须插入之后才能回填进 outbox 的 payload，业务层拿不到这个中间态。
-func appendTaskAndOutbox(ctx context.Context, tx *gorm.DB, documentID int64, kind string) error {
+func appendTaskAndOutbox(ctx context.Context, tx *gorm.DB, documentID int64, kind string) (string, error) {
 	t := task.New(kind, documentID)
 	if err := task.AppendTx(ctx, tx, t); err != nil {
-		return err
+		return "", err
 	}
 	msg := outbox.New(kind, strconv.FormatInt(documentID, 10), map[string]any{
 		"document_id": documentID,
 		"task_id":     t.ID,
 	})
-	return outbox.AppendTx(ctx, tx, msg)
+	if err := outbox.AppendTx(ctx, tx, msg); err != nil {
+		return "", err
+	}
+	return msg.MessageID, nil
 }
 
 // MarkIndexingWithJob 在同一个事务里把文档置为 indexing 并建一条重索引任务。
@@ -126,9 +124,10 @@ func appendTaskAndOutbox(ctx context.Context, tx *gorm.DB, documentID int64, kin
 // 为什么要事务：只改状态不建任务，页面会永远停在"索引中"；只建任务不改状态，
 // 用户看不出已经在排队。两件事要么一起成立，要么都不成立。
 //
-// 同一文档已有未完成的重索引任务时，任务插入会撞部分唯一索引并返回 ErrDuplicate，
+// 同一文档已有未完成的任务时，任务插入会撞部分唯一索引并返回 ErrDuplicate，
 // 整个事务回滚——状态也不会被动过，保持原样。
-func (r *Repository) MarkIndexingWithJob(ctx context.Context, documentID int64, j *job.Job) error {
+func (r *Repository) MarkIndexingWithTask(ctx context.Context, documentID int64, kind string) (string, error) {
+	var messageID string
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&Document{}).Where("id = ?", documentID).
 			Updates(map[string]any{
@@ -141,10 +140,11 @@ func (r *Repository) MarkIndexingWithJob(ctx context.Context, documentID int64, 
 		if result.RowsAffected == 0 {
 			return gorm.ErrRecordNotFound
 		}
-		// 同上：不再写 jobs，只写 task 与 outbox。
-		return appendTaskAndOutbox(ctx, tx, documentID, string(j.Kind))
+		var err error
+		messageID, err = appendTaskAndOutbox(ctx, tx, documentID, kind)
+		return err
 	})
-	return translateError("mark indexing with job", err)
+	return messageID, translateError("mark indexing with task", err)
 }
 
 // MarkFailed 把文档标记为处理失败，并留下可解释的原因。

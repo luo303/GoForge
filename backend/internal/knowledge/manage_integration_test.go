@@ -6,10 +6,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/luo303/mindos/backend/internal/job"
 	"github.com/luo303/mindos/backend/internal/platform"
+	"github.com/luo303/mindos/backend/internal/task"
 )
 
 // 本文件覆盖 Phase 5 的文档管理能力在**真实 PostgreSQL** 上的行为：
@@ -215,10 +214,8 @@ func TestIdempotentImportIntegration(t *testing.T) {
 	// 若这里也要求装 MinIO，跑一次数据库集成测试就得启两个容器。
 	store := newFakeStore()
 	repo := NewRepository(db)
-	// 任务能力来自 job.Bus：队列传 nil——这个用例只验证幂等链路，
-	// broker 不可用本来就是合法状态（投递退化，任务留在表里）。
-	bus := job.NewBus(job.NewRepository(db), nil, nil)
-	svc := NewService(repo, store, bus, 1<<20, nil)
+	// 取消能力来自 tasks 表：这个用例只验证幂等链路，传真仓储即可。
+	svc := NewService(repo, store, task.NewRepository(db), 1<<20, nil)
 	ctx := context.Background()
 	text := "# 幂等\n\n同一份内容只应该入库一次。\n"
 
@@ -281,19 +278,7 @@ func TestReindexTaskIntegration(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	key := "document:" + strconv.FormatInt(doc.ID, 10) + ":reindex"
-	makeJob := func() *job.Job {
-		return &job.Job{
-			Kind:        KindDocumentReindex,
-			Status:      job.StatusQueued,
-			DedupeKey:   &key,
-			Payload:     job.Payload{},
-			MaxAttempts: 3,
-			RunAfter:    time.Now().UTC(),
-		}
-	}
-
-	if err := repo.MarkIndexingWithJob(ctx, doc.ID, makeJob()); err != nil {
+	if _, err := repo.MarkIndexingWithTask(ctx, doc.ID, KindDocumentReindex); err != nil {
 		t.Fatalf("mark indexing: %v", err)
 	}
 	indexing, err := repo.Get(ctx, doc.ID)
@@ -305,7 +290,7 @@ func TestReindexTaskIntegration(t *testing.T) {
 	}
 
 	// 部分唯一索引兜底：同一文档第二条未完成的重索引任务被拒。
-	if err := repo.MarkIndexingWithJob(ctx, doc.ID, makeJob()); !errors.Is(err, ErrDuplicate) {
+	if _, err := repo.MarkIndexingWithTask(ctx, doc.ID, KindDocumentReindex); !errors.Is(err, ErrDuplicate) {
 		t.Fatalf("second mark indexing error = %v, want ErrDuplicate", err)
 	}
 
@@ -321,40 +306,25 @@ func TestReindexTaskIntegration(t *testing.T) {
 	}
 }
 
-// 过渡期双写：一次受理要同时留下 jobs（旧 worker 消费）、tasks（进度真相）、
-// outbox（投递通道）三条记录，且 task_id 要出现在 outbox 的 payload 里，
-// 否则消费端没法回表更新进度。
-func TestDualWriteTaskAndOutboxIntegration(t *testing.T) {
+// 一次受理要在同一个事务里留下 tasks（进度真相）与 outbox（投递通道），
+// 且 outbox 的 payload 要带 task_id——消费端靠它回表更新进度。
+func TestCreateWithTaskIntegration(t *testing.T) {
 	db := setupKnowledgeDB(t)
 	repo := NewRepository(db)
 	ctx := context.Background()
 
-	doc := newIntegrationDocument("双写验证")
-	key := "document:dual:import"
-	j := &job.Job{
-		Kind:        KindDocumentImport,
-		Status:      job.StatusQueued,
-		DedupeKey:   &key,
-		Payload:     job.Payload{},
-		MaxAttempts: 3,
-		RunAfter:    time.Now().UTC(),
+	doc := newIntegrationDocument("受理写入验证")
+	messageID, err := repo.CreateWithTask(ctx, doc, KindDocumentImport)
+	if err != nil {
+		t.Fatalf("create with task: %v", err)
 	}
-	if err := repo.CreateWithJob(ctx, doc, j); err != nil {
-		t.Fatalf("create with job: %v", err)
-	}
-
-	// 旧 jobs 表已停止写入：消费链路只走 outbox，这一行残留会被清理。
-	var jobs int64
-	if err := db.Table("jobs").Where("dedupe_key = ?", key).Count(&jobs).Error; err != nil {
-		t.Fatalf("count jobs: %v", err)
-	}
-	if jobs != 0 {
-		t.Errorf("jobs = %d, want 0 after switching to outbox", jobs)
+	if messageID == "" {
+		t.Fatal("message id should be generated and returned to the caller")
 	}
 
 	var taskID int64
 	if err := db.Table("tasks").
-		Where("type = ? AND target_type = ? AND target_id = ?", string(KindDocumentImport), "document", doc.ID).
+		Where("type = ? AND target_type = ? AND target_id = ?", KindDocumentImport, "document", doc.ID).
 		Pluck("id", &taskID).Error; err != nil {
 		t.Fatalf("load task: %v", err)
 	}
@@ -372,5 +342,16 @@ func TestDualWriteTaskAndOutboxIntegration(t *testing.T) {
 	}
 	if !strings.Contains(payload, strconv.FormatInt(taskID, 10)) {
 		t.Errorf("outbox payload = %s, want task id %d inside", payload, taskID)
+	}
+
+	// 返回给调用方的 message_id 必须与落库的是同一条，
+	// 否则前端拿到的编号在日志里查不到。
+	var stored string
+	if err := db.Raw("SELECT message_id::text FROM outbox WHERE msg_key = ? ORDER BY id DESC LIMIT 1",
+		strconv.FormatInt(doc.ID, 10)).Scan(&stored).Error; err != nil {
+		t.Fatalf("load message id: %v", err)
+	}
+	if stored != messageID {
+		t.Errorf("stored message_id = %s, returned %s", stored, messageID)
 	}
 }

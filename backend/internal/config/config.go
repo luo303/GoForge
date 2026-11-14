@@ -32,6 +32,7 @@ type Config struct {
 	Embedding EmbeddingConfig
 	Agent     AgentConfig
 	Job       JobConfig
+	Reaper    ReaperConfig
 	Rabbit    RabbitConfig
 }
 
@@ -139,22 +140,32 @@ type AgentConfig struct {
 	RunTimeout  time.Duration // 单次运行整体超时
 }
 
-// JobConfig 是后台任务执行器的参数（Phase 6）。
+// JobConfig 是后台任务链路的运行参数。
 //
 // 放在启动配置里而不是数据库：这些是"这台机器/这个部署跑多快"的运维修量，
 // 不属于业务数据。改它需要重启，也正好让人停下来想清楚要不要调。
+//
+// 租约、轮询、补扫三项已经随"表当队列"一起删掉了：现在消息经 outbox 投递，
+// 领没领到由 broker 的 prefetch 决定，卡住的任务由 reaper 兜底。
 type JobConfig struct {
-	// Workers 是单进程内并发执行的任务数。
-	// 不是越大越好：每个任务都在读 MinIO、写 PostgreSQL，
+	// Workers 是单进程内并发消费的消息数。
+	// 不是越大越好：每条消息都在读 MinIO、写 PostgreSQL，
 	// 并发上去以后瓶颈会从 CPU 移到连接池。
 	Workers int
-	// Lease 是任务租约长度。心跳频率是 Lease/3；
-	// 它同时决定"进程崩了以后多久能被别人接手"。
-	Lease time.Duration
-	// PollInterval 是没活干时的轮询间隔。Phase 16 换成 MQ 唤醒后它只影响兜底扫描。
-	PollInterval time.Duration
-	// RecoverInterval 是补扫间隔，负责把租约过期的任务收回队列。
-	RecoverInterval time.Duration
+}
+
+// ReaperConfig 是兜底扫描的参数。
+//
+// 它解决的是"消息已 ack、消费端却崩了"这种 broker 管不到的情况：
+// 任务停在 running，队列里什么都没有，只能靠定时比对 tasks 与 outbox 把它捞回来。
+type ReaperConfig struct {
+	// Interval 是扫描间隔。
+	Interval time.Duration
+	// StaleAfter 是"多久没动过算卡住"。太短会把正在跑的任务误判成卡住，
+	// 所以它必须显著大于最慢一次正常处理的耗时。
+	StaleAfter time.Duration
+	// Retention 是已投递消息与去重记录的保留期。
+	Retention time.Duration
 }
 
 // RabbitConfig 描述任务队列的连接与拓扑。
@@ -257,10 +268,12 @@ func Load() (*Config, error) {
 		},
 	}
 	cfg.Job = JobConfig{
-		Workers:         reader.integer("JOB_WORKERS", 2),
-		Lease:           reader.duration("JOB_LEASE", 30*time.Second),
-		PollInterval:    reader.duration("JOB_POLL_INTERVAL", 500*time.Millisecond),
-		RecoverInterval: reader.duration("JOB_RECOVER_INTERVAL", 30*time.Second),
+		Workers: reader.integer("JOB_WORKERS", 2),
+	}
+	cfg.Reaper = ReaperConfig{
+		Interval:   reader.duration("REAPER_INTERVAL", 30*time.Second),
+		StaleAfter: reader.duration("REAPER_STALE_AFTER", 2*time.Minute),
+		Retention:  reader.duration("REAPER_RETENTION", 7*24*time.Hour),
 	}
 	cfg.Rabbit = RabbitConfig{
 		Host:     reader.text("RABBITMQ_HOST", "localhost"),
@@ -355,16 +368,16 @@ func (c *Config) validate() error {
 	if c.Job.Workers < 1 || c.Job.Workers > 64 {
 		errs = append(errs, fmt.Errorf("JOB_WORKERS must be between 1 and 64, got %d", c.Job.Workers))
 	}
-	// 租约太短会让"网络抖一下"就丢租约，任务被反复接管又反复中断。
-	// worker 内部也会兜底到 3s，这里提前在启动时报错，避免配置写了却静默无效。
-	if c.Job.Lease < 3*time.Second {
-		errs = append(errs, fmt.Errorf("JOB_LEASE must be at least 3s, got %s", c.Job.Lease))
+	if c.Reaper.Interval <= 0 {
+		errs = append(errs, errors.New("REAPER_INTERVAL must be greater than 0"))
 	}
-	if c.Job.PollInterval <= 0 {
-		errs = append(errs, errors.New("JOB_POLL_INTERVAL must be greater than 0"))
+	// 卡住判定必须比一次正常处理更长，否则会把还在跑的任务判成僵死、重复投递。
+	// 至少 30s 是经验下限；正常情况下一次文档处理在秒级。
+	if c.Reaper.StaleAfter < 30*time.Second {
+		errs = append(errs, fmt.Errorf("REAPER_STALE_AFTER must be at least 30s, got %s", c.Reaper.StaleAfter))
 	}
-	if c.Job.RecoverInterval <= 0 {
-		errs = append(errs, errors.New("JOB_RECOVER_INTERVAL must be greater than 0"))
+	if c.Reaper.Retention < time.Hour {
+		errs = append(errs, fmt.Errorf("REAPER_RETENTION must be at least 1h, got %s", c.Reaper.Retention))
 	}
 	if strings.TrimSpace(c.Rabbit.Host) == "" {
 		errs = append(errs, errors.New("RABBITMQ_HOST is required"))

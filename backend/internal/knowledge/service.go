@@ -14,13 +14,13 @@ import (
 	"io/fs"
 	"path/filepath"
 	"strings"
-	"time"
+
 	"unicode/utf8"
 
 	"go.uber.org/zap"
 
-	"github.com/luo303/mindos/backend/internal/job"
 	"github.com/luo303/mindos/backend/internal/platform"
+	"github.com/luo303/mindos/backend/internal/task"
 )
 
 // 模块级哨兵错误。handler 用 errors.Is 判断，不要比较错误字符串。
@@ -76,12 +76,12 @@ type documentRepository interface {
 	Update(ctx context.Context, id int64, patch DocumentPatch) error
 	Delete(ctx context.Context, id int64) error
 	ReplaceChunks(ctx context.Context, documentID int64, chunks []Chunk) error
-	// CreateWithJob 在一个事务里写待处理文档与它的任务（Phase 6）。
-	CreateWithJob(ctx context.Context, doc *Document, j *job.Job) error
+	// CreateWithTask 在一个事务里写待处理文档、任务与消息，返回消息编号。
+	CreateWithTask(ctx context.Context, doc *Document, kind string) (string, error)
 	// FinishImport 在同一事务里替换分块并把文档置 ready（Phase 6）。
 	FinishImport(ctx context.Context, documentID int64, chunks []Chunk) error
-	// MarkIndexingWithJob 在同一事务里把文档置 indexing 并建重索引任务（Phase 6）。
-	MarkIndexingWithJob(ctx context.Context, documentID int64, j *job.Job) error
+	// MarkIndexingWithTask 在同一事务里把文档置 indexing 并排一条重索引任务。
+	MarkIndexingWithTask(ctx context.Context, documentID int64, kind string) (string, error)
 	// MarkFailed 记录处理最终失败与原因（Phase 6）。
 	MarkFailed(ctx context.Context, documentID int64, code, message string) error
 	// MarkCancelling 把文档置为"取消中"，等 worker 停下后写终态。
@@ -90,16 +90,18 @@ type documentRepository interface {
 	MarkReady(ctx context.Context, documentID int64) error
 }
 
-// jobBus 是本模块需要任务系统的全部能力：唤醒与取消。
+// taskStore 是本模块需要任务表的能力：读活跃任务与写取消终态。
 //
-// 定义在消费方（本包）而不是直接用 job.Repository + job.Notifier：
-// service 只用两个方法，依赖窄接口能让测试替身少写一堆空方法，
-// 也让"knowledge 到底用了任务系统的哪部分"一目了然。
-type jobBus interface {
-	// Notify 投递一条已落库的任务（投递失败由补投兜底，不影响业务结果）。
-	Notify(ctx context.Context, jobID int64) error
-	// RequestCancel 取消某个业务对象未完成的任务。
-	RequestCancel(ctx context.Context, documentID int64) (jobID int64, kind job.Kind, status job.Status, err error)
+// 定义在消费方（本包）而不是直接用 *task.Repository：service 只用两个方法，
+// 窄接口让测试替身少写一堆空方法，也让"knowledge 用了任务表的哪部分"一目了然。
+//
+// 注意这里没有"唤醒"：消息由 relay 每 200ms 扫 outbox 投递，
+// 业务侧落库即完成，不再需要主动叫醒任何人。
+type taskStore interface {
+	// Active 返回某文档当前未完成的任务。
+	Active(ctx context.Context, targetType string, targetID int64) (*task.Task, error)
+	// CancelPending 只在任务尚未被领走时取消，返回是否抢到了。
+	CancelPending(ctx context.Context, id int64) (bool, error)
 }
 
 // fileStore 是原始文件的存储能力。
@@ -115,10 +117,9 @@ type fileStore interface {
 // Service 编排导入流程：校验 → 解析 → 切分 → 落盘 → 落库。
 type Service struct {
 	repo documentRepository
-	// jobs 负责"落库之后叫醒 worker"与"取消进行中的处理"。
-	// 建任务仍然走 repository 的同事务方法：文档与任务必须一起写，
-	// 走 job.Repository 会变成两个事务。
-	jobs           jobBus
+	// tasks 只用于"取消进行中的处理"：判断任务是排着队还是在跑。
+	// 建任务走 repository 的同事务方法——文档、任务、消息必须一起写。
+	tasks          taskStore
 	store          fileStore
 	maxUploadBytes int64
 	log            *zap.Logger
@@ -130,7 +131,7 @@ type Service struct {
 // log 允许为 nil（测试里常见）：此时退化成不记录。业务逻辑本身不依赖日志，
 // 但"删库成功、删文件失败"这种只能记一笔的情况需要它，所以不做成可选参数
 // 之外的另一套 API。
-func NewService(repo documentRepository, store fileStore, jobs jobBus, maxUploadBytes int64, log *zap.Logger) *Service {
+func NewService(repo documentRepository, store fileStore, tasks taskStore, maxUploadBytes int64, log *zap.Logger) *Service {
 	if maxUploadBytes <= 0 {
 		maxUploadBytes = 10 << 20
 	}
@@ -140,7 +141,7 @@ func NewService(repo documentRepository, store fileStore, jobs jobBus, maxUpload
 	return &Service{
 		repo:           repo,
 		store:          store,
-		jobs:           jobs,
+		tasks:          tasks,
 		maxUploadBytes: maxUploadBytes,
 		log:            log,
 	}
@@ -173,27 +174,26 @@ type UpdateInput struct {
 	Tags       *[]string
 }
 
-// 任务类型。取值属于业务语义，所以定义在业务包而不是 job 包——
-// job 是基础设施，不该知道"文档"这种概念，否则 Phase 16 复用它会很别扭。
+// 任务类型，同时也是 outbox 的 topic（消费端按它路由）与 tasks.type。
+//
+// 定义在业务包而不是基础设施里：取值属于业务语义，
+// 分发器只需要知道"有这么个字符串"，不该认识"文档"这种概念。
 const (
-	KindDocumentImport  job.Kind = "document.import"
-	KindDocumentReindex job.Kind = "document.reindex"
+	KindDocumentImport  = "document.import"
+	KindDocumentReindex = "document.reindex"
 )
-
-// defaultMaxAttempts 是任务默认重试上限：一次原样重试 + 一次退避后重试。
-// 解析类错误（编码不对、类型不支持）重试也没用，那类错误会在 handler 里
-// 直接判失败，不会真的跑满三次。
-const defaultMaxAttempts = 3
 
 // ImportResult 是一次"导入受理"的结果。
 //
-// 与旧返回值（文档 + existed）的区别：多了一个 JobID。
-// 异步化以后，handler 能立刻告诉用户的只有"我收下了，任务号是多少"，
-// 真正的结果要等 worker 跑完才能查。
+// 异步化以后，handler 能立刻告诉用户的只有"我收下了，消息编号是多少"，
+// 真正的结果要等消费端跑完才能查。
 type ImportResult struct {
 	Document *Document
-	// JobID 是排队等待执行的任务 id；Existed 为 true 时没有新建任务，值为 0。
-	JobID int64
+	// MessageID 是本次受理写入 outbox 的消息编号；Existed 为 true 时为空。
+	//
+	// 返回 message_id 而不是内部自增 id：它是跨进程稳定、消费端用来去重的标识，
+	// 用户拿它去查日志能直接对上"这条消息经历过什么"。
+	MessageID string
 	// Existed 表示"同内容的文档已存在，本次没有写入任何新记录"。
 	Existed bool
 }
@@ -304,64 +304,20 @@ func (s *Service) ProcessImport(ctx context.Context, documentID int64) error {
 	return s.repo.FinishImport(ctx, documentID, chunks)
 }
 
-// ProcessImportTask 是 worker 调用的入口：执行导入，并在"最终失败"时写失败原因。
+// MarkProcessingFailed 写文档的失败终态与可读原因，由消费端在"确定不再重试"时调用。
 //
-// 为什么要这一层，而不是让 worker 直接调 ProcessImport：
-// 只有业务层知道哪些错误是"再试也没用"（文件类型不支持、编码不对、原文丢了），
-// 也只有业务层能把失败原因写回 documents。worker 只管调度，不该认识这些细节。
-//
-// attempts / maxAttempts 由 worker 传入，与它自己的重试判断共用同一个结论，
-// 避免出现"任务还在重试、文档已经标成失败"的矛盾状态。
-func (s *Service) ProcessImportTask(ctx context.Context, documentID int64, attempts, maxAttempts int) error {
-	return s.settle(ctx, documentID, s.ProcessImport(ctx, documentID), attempts, maxAttempts)
+// 拆成独立方法而不是塞进 ProcessImport：只有消费端知道"还剩几次机会"，
+// 业务层不该自己判断该不该收尾——那需要第二份重试配置，早晚两处不一致。
+func (s *Service) MarkProcessingFailed(ctx context.Context, documentID int64, cause error) error {
+	return s.repo.MarkFailed(ctx, documentID, ErrorCode(cause), cause.Error())
 }
 
-// ProcessReindexTask 是重索引任务的入口，职责同 ProcessImportTask。
-func (s *Service) ProcessReindexTask(ctx context.Context, documentID int64, attempts, maxAttempts int) error {
-	return s.settle(ctx, documentID, s.ProcessReindex(ctx, documentID), attempts, maxAttempts)
-}
-
-// codedError 给错误附加机器可读码，让任务表与文档表记同一个原因。
+// IsPermanent 判断一个错误是否"再试也没用"。
 //
-// job 包只认识"有没有码"，不认识具体有哪些码——那属于业务语义，
-// 放在基础设施里会让它必须知道文档、记忆、Agent 各自的错误分类。
-type codedError struct {
-	code string
-	err  error
-}
-
-func (e *codedError) Error() string        { return e.err.Error() }
-func (e *codedError) Unwrap() error        { return e.err }
-func (e *codedError) JobErrorCode() string { return e.code }
-
-// settle 负责"这次失败之后要不要给文档标红"。
-func (s *Service) settle(ctx context.Context, documentID int64, runErr error, attempts, maxAttempts int) error {
-	if runErr == nil {
-		return nil
-	}
-	err := s.classify(runErr)
-	// 无论重试还是最终失败，都把码附上：worker 会把它写进 jobs.last_error_code，
-	// 与 documents.error_code 保持一致，排查时两张表说的是同一件事。
-	coded := &codedError{code: errorCode(err), err: err}
-
-	probe := job.Job{Attempts: attempts, MaxAttempts: maxAttempts}
-	if job.ShouldRetry(&probe, err) {
-		// 还会重试：文档保持当前状态（pending / indexing），
-		// 万一这次失败被下一轮成功覆盖，用户根本不需要看到中间的失败。
-		return coded
-	}
-	if markErr := s.repo.MarkFailed(ctx, documentID, coded.code, err.Error()); markErr != nil {
-		s.log.Warn("mark document failed",
-			zap.Int64("document_id", documentID), zap.Error(markErr))
-	}
-	return coded
-}
-
-// classify 把"再试也没用"的错误标记成永久失败。
-//
-// 这些错误的共同点：同样的输入、同样的代码，重试三次得到的还是同一个结果。
-// 让它们跑满重试次数只会延迟用户看到错误的时间，并浪费三次任务名额。
-func (s *Service) classify(err error) error {
+// 共同点：同样的输入、同样的代码，重试几次得到的还是同一个结果。
+// 让它们跑满重试次数只会延迟用户看到错误，并占住处理名额。
+// 消费端据此提前收尾，不必等次数耗尽。
+func IsPermanent(err error) bool {
 	switch {
 	case errors.Is(err, ErrUnsupportedType),
 		errors.Is(err, ErrEmptyDocument),
@@ -369,15 +325,15 @@ func (s *Service) classify(err error) error {
 		errors.Is(err, ErrInvalidMetadata),
 		errors.Is(err, ErrSourceMissing),
 		errors.Is(err, ErrNotFound):
-		return job.Permanent(err)
+		return true
 	default:
-		return err
+		return false
 	}
 }
 
-// ErrorCode 是 errorCode 的导出版本，供消费端把失败原因写进 tasks.error_code。
+// ErrorCode 把错误翻译成稳定的机器可读代码。
 //
-// 两个地方要用同一个映射：文档表和任务表记的必须是同一个码，
+// 文档表与任务表共用它：两处记的必须是同一个码，
 // 否则排查时要在两份分类之间猜。
 func ErrorCode(err error) string { return errorCode(err) }
 
@@ -416,24 +372,12 @@ func errorCode(err error) string {
 //     删掉会让它变成"有记录没原文"，之后重索引就再也跑不起来；
 //  3. 其他失败 → 补偿清理，且只在文件是本次新写的时候删（Reused=false）。
 func (s *Service) startImport(ctx context.Context, doc *Document, saved *platform.SavedFile) (*ImportResult, error) {
-	// 去重用内容哈希而不是文档 id：id 要等插入之后才有，
-	// 而"同一份内容同一时刻只该有一个导入任务"在插入前就得成立。
-	dedupeKey := fmt.Sprintf("document:%s:import", doc.ContentHash)
-	queued := &job.Job{
-		Kind:        KindDocumentImport,
-		Status:      job.StatusQueued,
-		DedupeKey:   &dedupeKey,
-		Payload:     job.Payload{},
-		MaxAttempts: defaultMaxAttempts,
-		RunAfter:    time.Now().UTC(),
-	}
-
-	err := s.repo.CreateWithJob(ctx, doc, queued)
+	// 不需要在这里叫醒任何人：消息与文档在同一个事务里写进 outbox，
+	// relay 每 200ms 扫一次待发表就把它送出去了。
+	// 这正是把 jobs 表换成 outbox 后省掉的一步——业务层不再持有队列客户端。
+	messageID, err := s.repo.CreateWithTask(ctx, doc, KindDocumentImport)
 	if err == nil {
-		// 落库之后才叫醒：顺序反过来会让 worker 领到一个还不存在的任务。
-		// 投递失败不影响本次响应——任务已在表里，补投会重发。
-		s.notify(ctx, queued.ID)
-		return &ImportResult{Document: doc, JobID: queued.ID}, nil
+		return &ImportResult{Document: doc, MessageID: messageID}, nil
 	}
 	if errors.Is(err, ErrDuplicate) {
 		existing, getErr := s.repo.GetByContentHash(ctx, doc.ContentHash)
@@ -581,38 +525,15 @@ func (s *Service) StartReindex(ctx context.Context, id int64) (*ImportResult, er
 	if err != nil {
 		return nil, err
 	}
-	dedupeKey := fmt.Sprintf("document:%d:reindex", id)
-	queued := &job.Job{
-		Kind:        KindDocumentReindex,
-		Status:      job.StatusQueued,
-		DedupeKey:   &dedupeKey,
-		Payload:     job.Payload{},
-		MaxAttempts: defaultMaxAttempts,
-		RunAfter:    time.Now().UTC(),
-	}
-	if err := s.repo.MarkIndexingWithJob(ctx, id, queued); err != nil {
+	messageID, err := s.repo.MarkIndexingWithTask(ctx, id, KindDocumentReindex)
+	if err != nil {
 		if errors.Is(err, ErrDuplicate) {
 			return nil, ErrReindexRunning
 		}
 		return nil, err
 	}
-	s.notify(ctx, queued.ID)
 	doc.Status = StatusIndexing
-	return &ImportResult{Document: doc, JobID: queued.ID}, nil
-}
-
-// notify 尝试叫醒 worker，失败只记 warn。
-//
-// 不把错误返回给调用方是刻意的：任务已经落库，投递失败只意味着"晚一点执行"，
-// 不是"这次操作失败"。让 HTTP 接口因为 MQ 抖动返回 500，反而会误导用户重传。
-func (s *Service) notify(ctx context.Context, jobID int64) {
-	if jobID == 0 || s.jobs == nil {
-		return
-	}
-	if err := s.jobs.Notify(ctx, jobID); err != nil {
-		s.log.Warn("notify job queue failed",
-			zap.Int64("job_id", jobID), zap.Error(err))
-	}
+	return &ImportResult{Document: doc, MessageID: messageID}, nil
 }
 
 // ProcessReindex 是重索引任务的执行段：用当前的分块规则重新切分一份已有文档。
@@ -643,11 +564,11 @@ func (s *Service) ProcessReindex(ctx context.Context, id int64) error {
 
 // CancelProcessing 请求取消某文档进行中的处理。
 //
-// 取消是"请求"而不是"立即生效"：任务在跑时只能置成 cancelling，等 worker 心跳
-// 发现后自己中断——它可能正卡在一次解析里，只有它知道何时能安全停下。
+// 取消是"请求"而不是"立即生效"：任务在跑时只能置成 cancelling，等消费端
+// 在下一个检查点自己停下——它可能正卡在一次解析里，只有它知道何时能安全停。
 // 文档状态的收尾分两种情况，取决于任务当时在什么状态：
-//   - 排队中（直接 cancelled）→ 立刻写终态：没有任何东西还在跑；
-//   - 运行中（cancelling）→ 只标"取消中"，终态由 worker 停下后回调写。
+//   - 还没被领走（CancelPending 成功）→ 立刻写终态：没有任何东西还在跑；
+//   - 已经在跑 → 只标"取消中"，终态由消费端停下后写。
 //     这里抢先写 failed 会与"处理其实刚好完成"互相覆盖——实测出现过
 //     failed 但已有分块的半状态，所以收尾必须跟着任务状态的原子转移走。
 //
@@ -658,26 +579,33 @@ func (s *Service) CancelProcessing(ctx context.Context, id int64) (*Document, er
 	if _, err := s.repo.Get(ctx, id); err != nil {
 		return nil, err
 	}
-	_, kind, status, err := s.jobs.RequestCancel(ctx, id)
+	if s.tasks == nil {
+		return nil, ErrNoProcessing
+	}
+	t, err := s.tasks.Active(ctx, task.TargetDocument, id)
 	if err != nil {
-		if errors.Is(err, job.ErrNoJob) {
-			// 没有进行中的任务：可能是已经完成、已经被取消，或本来就没在处理。
+		if errors.Is(err, task.ErrNotFound) {
+			// 没有进行中的任务：可能已经完成、已经被取消，或本来就没在处理。
 			// 三种情况对调用方是同一件事——没得取消。
 			return nil, ErrNoProcessing
 		}
 		return nil, err
 	}
-	if status == job.StatusCancelled {
-		// 排队中的任务已被直接取消，没有任何东西还在跑，可以立刻收尾。
-		if err := s.SettleCancelled(ctx, id, kind == KindDocumentReindex); err != nil {
+
+	// 条件取消：只有仍然处于 pending 才抢得到。抢不到说明消费端刚领走，
+	// 这时不能再写终态，否则与正在执行的那一方互相覆盖。
+	cancelled, err := s.tasks.CancelPending(ctx, t.ID)
+	if err != nil {
+		return nil, err
+	}
+	if cancelled {
+		if err := s.SettleCancelled(ctx, id, t.Type == KindDocumentReindex); err != nil {
 			return nil, err
 		}
 		return s.repo.Get(ctx, id)
 	}
 
-	// 运行中的任务只能置 cancelling：worker 可能正卡在一次解析里，
-	// 它停下来之后会通过 OnCancelled 回调写终态。这里先如实标"取消中"，
-	// 而不是抢先写 failed —— 那会与"处理其实已经完成了"互相覆盖。
+	// 已经在跑：只能标记取消意图，消费端会在执行前与收尾时看到它。
 	if err := s.repo.MarkCancelling(ctx, id); err != nil {
 		return nil, err
 	}

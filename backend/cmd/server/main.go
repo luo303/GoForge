@@ -22,13 +22,13 @@ import (
 	"github.com/luo303/mindos/backend/internal/config"
 	"github.com/luo303/mindos/backend/internal/dispatch"
 	"github.com/luo303/mindos/backend/internal/handler"
-	"github.com/luo303/mindos/backend/internal/job"
 	"github.com/luo303/mindos/backend/internal/knowledge"
 	"github.com/luo303/mindos/backend/internal/logging"
 	"github.com/luo303/mindos/backend/internal/middleware"
 	"github.com/luo303/mindos/backend/internal/migrate"
 	"github.com/luo303/mindos/backend/internal/outbox"
 	"github.com/luo303/mindos/backend/internal/platform"
+	"github.com/luo303/mindos/backend/internal/reaper"
 	"github.com/luo303/mindos/backend/internal/router"
 	"github.com/luo303/mindos/backend/internal/task"
 	"github.com/luo303/mindos/backend/migrations"
@@ -200,22 +200,14 @@ func run() error {
 	)
 	settings := handler.NewSettingsHandler(cfg)
 
-	// 任务仓储在业务层之前创建：knowledge 需要它来取消进行中的处理，
-	// worker 需要它来领取任务，两者共用同一个对象。
-	jobRepo := job.NewRepository(db)
-
-	// broker 不可用时传 typed-nil 之外的"没有队列"：Notifier 会明确报错，
-	// 由补投扫描接管，而不是在 nil 指针上 panic。
-	var busQueue job.Queue
-	if rabbit != nil {
-		busQueue = rabbit
-	}
-	jobBus := job.NewBus(jobRepo, busQueue, log.Named("job"))
+	// 任务表在业务层之前创建：knowledge 需要它判断"取消时任务排着队还是在跑"，
+	// 消费端需要它写进度，两者共用同一个对象。
+	taskRepo := task.NewRepository(db)
 
 	knowledgeSvc := knowledge.NewService(
 		knowledge.NewRepository(db),
 		store,
-		jobBus,
+		taskRepo,
 		cfg.Storage.MaxUploadBytes,
 		log.Named("knowledge"),
 	)
@@ -225,9 +217,8 @@ func run() error {
 	// 三段各管一件事：relay 把表里的待发消息送出去，consumer 收到消息后干活
 	// 并更新 tasks，补扫负责收拾"消息丢了"的残局。
 	outboxRepo := outbox.NewRepository(db)
-	taskRepo := task.NewRepository(db)
 
-	consumer := dispatch.NewConsumer(dispatch.NewSQLStore(outboxRepo), log.Named("dispatch"), 3)
+	consumer := dispatch.NewConsumer(dispatch.NewSQLStore(outboxRepo), log.Named("dispatch"), dispatch.DefaultMaxAttempts)
 	handle := func(reindex bool) dispatch.Handler {
 		return func(ctx context.Context, env platform.Envelope) error {
 			var p struct {
@@ -264,12 +255,25 @@ func run() error {
 				runErr = knowledgeSvc.ProcessImport(ctx, p.DocumentID)
 			}
 			if runErr == nil {
+				// 收尾前再看一眼取消：执行途中用户可能刚点了取消。
+				// 内容确实做好了，就保留成果——"已经完成"是事实，
+				// 把一份可用文档标成失败才是骗人。
+				if doc, err := knowledgeSvc.Get(ctx, p.DocumentID); err == nil && doc.Status == knowledge.StatusCancelling {
+					_ = taskRepo.MarkCancelled(ctx, p.TaskID)
+					return nil
+				}
 				return taskRepo.MarkSucceeded(ctx, p.TaskID)
 			}
 
-			// 还有机会就放回 pending，让下一次投递能再次推进；次数用尽才写失败终态。
-			// 这里的 3 与 dispatch 的重试上限保持一致（同一个配置将来抽出来）。
-			if env.Attempt+1 >= 3 {
+			// 永久错误重试几次都是同一个结果，直接收尾；可恢复错误才跑满次数。
+			if knowledge.IsPermanent(runErr) || env.Attempt+1 >= dispatch.DefaultMaxAttempts {
+				// 两张表都写：task 留技术细节（第几次、原始错误），
+				// document 留用户看得见的原因。少写一处就会出现
+				// "消息放弃了但页面还在转圈"。
+				if err := knowledgeSvc.MarkProcessingFailed(ctx, p.DocumentID, runErr); err != nil {
+					log.Warn("mark document failed",
+						zap.Int64("document_id", p.DocumentID), zap.Error(err))
+				}
 				return taskRepo.MarkFailed(ctx, p.TaskID, knowledge.ErrorCode(runErr), runErr.Error())
 			}
 			if err := taskRepo.MarkPending(ctx, p.TaskID); err != nil {
@@ -283,10 +287,20 @@ func run() error {
 
 	relay := outbox.NewRelay(outboxRepo, relayPublisher{rabbit: rabbit}, log.Named("relay"), outbox.RelayOptions{})
 
+	// 兜底：broker 只管"送到"，管不了"消费端半路崩了"。
+	// 卡在 running 的任务队列里已经没有任何消息，只有对账能把它捞回来。
+	reaper := reaper.New(db, taskRepo, outboxRepo, log.Named("reaper"), reaper.Options{
+		Interval:   cfg.Reaper.Interval,
+		StaleAfter: cfg.Reaper.StaleAfter,
+		Retention:  cfg.Reaper.Retention,
+	})
+
 	asyncCtx, stopAsync := context.WithCancel(ctx)
 	var asyncWG sync.WaitGroup
 	asyncWG.Add(1)
 	go func() { defer asyncWG.Done(); relay.Run(asyncCtx) }()
+	asyncWG.Add(1)
+	go func() { defer asyncWG.Done(); reaper.Run(asyncCtx) }()
 	if rabbit != nil {
 		for i := 0; i < cfg.Job.Workers; i++ {
 			asyncWG.Add(1)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -33,9 +34,14 @@ func (r *Repository) AppendTx(ctx context.Context, tx *gorm.DB, m *Message) erro
 // AppendTx 是包级版本：业务仓储在自己的事务里直接写 outbox，
 // 不必为了一个方法去构造 outbox.Repository。
 func AppendTx(_ context.Context, tx *gorm.DB, m *Message) error {
-	// Omit 掉由数据库生成的列：message_id 有 DEFAULT gen_random_uuid()，
-	// 从 Go 侧传零值进去会写入空 UUID（类型能通过，但失去唯一性语义）。
-	if err := tx.Omit("message_id", "created_at", "published_at").Create(m).Error; err != nil {
+	// message_id 由 Go 侧生成而不是交给数据库 DEFAULT：
+	// 受理接口要把它返回给前端（"这条消息的编号"），
+	// 只有插入时就已知才拿得到，数据库生成的值得再查一次。
+	// 建表仍保留 DEFAULT gen_random_uuid()，供手工插入/迁移兜底。
+	if m.MessageID == "" {
+		m.MessageID = uuid.NewString()
+	}
+	if err := tx.Omit("created_at", "published_at").Create(m).Error; err != nil {
 		return fmt.Errorf("append outbox message: %w", err)
 	}
 	return nil
@@ -108,6 +114,53 @@ func (r *Repository) RescheduleByMessageID(ctx context.Context, messageID string
 		return fmt.Errorf("reschedule outbox message %s: %w", messageID, err)
 	}
 	return nil
+}
+
+// PurgeSent 分批删除已投递且超过保留期的消息，返回删除条数。
+//
+// 为什么必须分批：一次删几万行会长时间持锁，期间 relay 的 Pending 查询会被拖慢。
+// 每轮删一小批，删不完下一轮接着删，对线上几乎无感。
+//
+// 只删 status=1（已投递）：status=0 还在排队，status=2 是投递失败等人看的，
+// 两者都不能自动消失。
+func (r *Repository) PurgeSent(ctx context.Context, before time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	var ids []int64
+	if err := r.db.WithContext(ctx).Model(&Message{}).
+		Where("status = ? AND published_at IS NOT NULL AND published_at < ?", StatusSent, before).
+		Order("id").Limit(limit).Pluck("id", &ids).Error; err != nil {
+		return 0, fmt.Errorf("list expired outbox messages: %w", err)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	result := r.db.WithContext(ctx).Where("id IN ?", ids).Delete(&Message{})
+	if result.Error != nil {
+		return 0, fmt.Errorf("purge outbox messages: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
+// PurgeConsumed 分批删除过期的去重记录。
+//
+// 去重表只为"消息重投时不重复执行"存在，保留期比 outbox 更短即可：
+// 消息本身在 outbox 里留 7 天，重投不可能发生在它被删之后。
+func (r *Repository) PurgeConsumed(ctx context.Context, before time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	// 用子查询而不是 IN：这张表的主键是 uuid，先取出来再删要多一次往返。
+	result := r.db.WithContext(ctx).Exec(`
+DELETE FROM consumed_messages
+WHERE message_id IN (
+    SELECT message_id FROM consumed_messages WHERE consumed_at < ? LIMIT ?
+)`, before, limit)
+	if result.Error != nil {
+		return 0, fmt.Errorf("purge consumed messages: %w", result.Error)
+	}
+	return result.RowsAffected, nil
 }
 
 // GiveUp 把消息标成失败：重试次数用尽，需要人工看过。

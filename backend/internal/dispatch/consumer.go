@@ -44,13 +44,20 @@ type Consumer struct {
 	maxAttempts int
 }
 
-// NewConsumer 组装。maxAttempts <= 0 时按 3 次处理。
+// DefaultMaxAttempts 是一条消息的执行重试上限（含首次尝试）。
+//
+// 导出是因为装配层也要用同一个数判断"什么时候该把失败写进业务实体"：
+// 两处各写一个 3，改的时候必然漏掉一处，然后出现"消息还在重试、
+// 文档已经标失败"的矛盾状态。
+const DefaultMaxAttempts = 3
+
+// NewConsumer 组装。maxAttempts <= 0 时按 DefaultMaxAttempts 处理。
 func NewConsumer(store Store, log *zap.Logger, maxAttempts int) *Consumer {
 	if log == nil {
 		log = zap.NewNop()
 	}
 	if maxAttempts <= 0 {
-		maxAttempts = 3
+		maxAttempts = DefaultMaxAttempts
 	}
 	return &Consumer{store: store, log: log, registry: map[string]Handler{}, maxAttempts: maxAttempts}
 }

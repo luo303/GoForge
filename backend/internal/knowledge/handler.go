@@ -52,16 +52,20 @@ type documentView struct {
 // acceptedDocumentView 是"已受理、结果稍后产生"这类响应的公共形状。
 //
 // 导入与重索引都会返回它：两者都只是把活排进队列，响应里能给的只有
-// 当前文档快照与任务 id。抽象出来是为了让两个接口的响应形状不至于漂移。
+// 当前文档快照与消息编号。抽象出来是为了让两个接口的响应形状不至于漂移。
 type acceptedDocumentView struct {
 	documentView
-	JobID int64 `json:"job_id"`
+	// MessageID 是本次受理写入 outbox 的消息编号（uuid）。
+	//
+	// 不再返回自增的任务 id：任务 id 是内部实现，消息编号才是
+	// "这条事件"的稳定标识——跨进程唯一、消费端用它去重、日志里能直接对上。
+	MessageID string `json:"message_id"`
 }
 
 // importedDocumentView 是导入接口的响应：受理视图 + 本次是否命中既有记录。
 //
 // 分两层内嵌而不是继续往 documentView 加字段：existed 只对"导入"这一个动作
-// 有意义，job_id 只对"受理"有意义，挂在详情/列表上会让人误以为它们是文档属性。
+// 有意义，message_id 只对"受理"有意义，挂在详情/列表上会让人误以为它们是文档属性。
 // 内嵌结构体的字段在 JSON 里被提升到同一层，响应形状仍是扁平的。
 type importedDocumentView struct {
 	acceptedDocumentView
@@ -294,7 +298,7 @@ func (h *Handler) Reindex(c *gin.Context) {
 	}
 	httpx.Accepted(c, acceptedDocumentView{
 		documentView: newDocumentView(res.Document),
-		JobID:        res.JobID,
+		MessageID:    res.MessageID,
 	})
 }
 
@@ -329,7 +333,7 @@ func respondImported(c *gin.Context, res *ImportResult) {
 	view := importedDocumentView{
 		acceptedDocumentView: acceptedDocumentView{
 			documentView: newDocumentView(res.Document),
-			JobID:        res.JobID,
+			MessageID:    res.MessageID,
 		},
 		Existed: res.Existed,
 	}

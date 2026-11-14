@@ -57,6 +57,8 @@ func processPending(t *testing.T, svc *Service, repo *fakeRepo) {
 		if err != nil {
 			t.Fatalf("process document %d (%s): %v", doc.ID, doc.Status, err)
 		}
+		// 模拟消费端写终态：不收掉这条任务，同一文档就排不了下一条。
+		repo.tasks.completeFor(doc.ID)
 	}
 }
 
@@ -146,8 +148,8 @@ func TestCreateFileEndpoint(t *testing.T) {
 	if accepted.ChunkCount != 0 {
 		t.Errorf("chunk_count = %d, want 0 before the worker runs", accepted.ChunkCount)
 	}
-	if accepted.JobID == 0 {
-		t.Error("job_id must be returned so the caller can poll")
+	if accepted.MessageID == "" {
+		t.Error("message_id must be returned so the caller can trace it")
 	}
 	if len(repo.chunks[accepted.ID]) != 0 {
 		t.Fatal("chunks must not be written inside the HTTP request")
@@ -445,8 +447,8 @@ func TestReindexEndpoint(t *testing.T) {
 	if err := json.Unmarshal(env.Data, &accepted); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if accepted.JobID == 0 {
-		t.Error("reindex must return a job id")
+	if accepted.MessageID == "" {
+		t.Error("reindex must return a message id")
 	}
 	if accepted.Status != StatusIndexing {
 		t.Errorf("status = %s, want indexing while the job is queued", accepted.Status)
