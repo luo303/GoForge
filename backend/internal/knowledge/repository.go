@@ -10,12 +10,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"gorm.io/gorm"
 
 	"github.com/luo303/mindos/backend/internal/job"
+	"github.com/luo303/mindos/backend/internal/outbox"
+	"github.com/luo303/mindos/backend/internal/task"
 )
 
 // Repository 是 documents / document_chunks 的数据访问。
@@ -94,9 +97,32 @@ func (r *Repository) CreateWithJob(ctx context.Context, doc *Document, j *job.Jo
 		// document_id 依赖自增主键，只能在插入文档之后回填。
 		// 让调用方自己先猜 id 再写 payload 是行不通的。
 		j.Payload["document_id"] = doc.ID
-		return tx.Create(j).Error
+		if err := tx.Create(j).Error; err != nil {
+			return err
+		}
+		return appendTaskAndOutbox(ctx, tx, doc.ID, string(j.Kind))
 	})
 	return translateError("create document with job", err)
+}
+
+// appendTaskAndOutbox 是过渡期的双写：同一次受理写三条记录。
+//
+//	jobs    —— 旧 worker 消费用，第 3 步删除
+//	tasks   —— 进度真相（跨重启、要给页面查）
+//	outbox  —— 投递通道（发完即弃，定时清理）
+//
+// 放在仓储而不是业务层的原因：task_id 与 document_id 都依赖自增主键，
+// 必须插入之后才能回填进 outbox 的 payload，业务层拿不到这个中间态。
+func appendTaskAndOutbox(ctx context.Context, tx *gorm.DB, documentID int64, kind string) error {
+	t := task.New(kind, documentID)
+	if err := task.AppendTx(ctx, tx, t); err != nil {
+		return err
+	}
+	msg := outbox.New(kind, strconv.FormatInt(documentID, 10), map[string]any{
+		"document_id": documentID,
+		"task_id":     t.ID,
+	})
+	return outbox.AppendTx(ctx, tx, msg)
 }
 
 // MarkIndexingWithJob 在同一个事务里把文档置为 indexing 并建一条重索引任务。
@@ -120,7 +146,10 @@ func (r *Repository) MarkIndexingWithJob(ctx context.Context, documentID int64, 
 			return gorm.ErrRecordNotFound
 		}
 		j.Payload["document_id"] = documentID
-		return tx.Create(j).Error
+		if err := tx.Create(j).Error; err != nil {
+			return err
+		}
+		return appendTaskAndOutbox(ctx, tx, documentID, string(j.Kind))
 	})
 	return translateError("mark indexing with job", err)
 }

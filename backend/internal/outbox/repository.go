@@ -26,7 +26,13 @@ func (r *Repository) Append(ctx context.Context, m *Message) error {
 }
 
 // AppendTx 用调用方的事务写入，供业务层插入。
-func (r *Repository) AppendTx(_ context.Context, tx *gorm.DB, m *Message) error {
+func (r *Repository) AppendTx(ctx context.Context, tx *gorm.DB, m *Message) error {
+	return AppendTx(ctx, tx, m)
+}
+
+// AppendTx 是包级版本：业务仓储在自己的事务里直接写 outbox，
+// 不必为了一个方法去构造 outbox.Repository。
+func AppendTx(_ context.Context, tx *gorm.DB, m *Message) error {
 	// Omit 掉由数据库生成的列：message_id 有 DEFAULT gen_random_uuid()，
 	// 从 Go 侧传零值进去会写入空 UUID（类型能通过，但失去唯一性语义）。
 	if err := tx.Omit("message_id", "created_at", "published_at").Create(m).Error; err != nil {

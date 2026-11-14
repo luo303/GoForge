@@ -320,3 +320,56 @@ func TestReindexTaskIntegration(t *testing.T) {
 		t.Errorf("after finish: status = %s chunk_count = %d, want ready/3", got.Status, got.ChunkCount)
 	}
 }
+
+// 过渡期双写：一次受理要同时留下 jobs（旧 worker 消费）、tasks（进度真相）、
+// outbox（投递通道）三条记录，且 task_id 要出现在 outbox 的 payload 里，
+// 否则消费端没法回表更新进度。
+func TestDualWriteTaskAndOutboxIntegration(t *testing.T) {
+	db := setupKnowledgeDB(t)
+	repo := NewRepository(db)
+	ctx := context.Background()
+
+	doc := newIntegrationDocument("双写验证")
+	key := "document:dual:import"
+	j := &job.Job{
+		Kind:        KindDocumentImport,
+		Status:      job.StatusQueued,
+		DedupeKey:   &key,
+		Payload:     job.Payload{},
+		MaxAttempts: 3,
+		RunAfter:    time.Now().UTC(),
+	}
+	if err := repo.CreateWithJob(ctx, doc, j); err != nil {
+		t.Fatalf("create with job: %v", err)
+	}
+
+	var jobs int64
+	if err := db.Table("jobs").Where("dedupe_key = ?", key).Count(&jobs).Error; err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if jobs != 1 {
+		t.Errorf("jobs = %d, want 1", jobs)
+	}
+
+	var taskID int64
+	if err := db.Table("tasks").
+		Where("type = ? AND target_type = ? AND target_id = ?", string(KindDocumentImport), "document", doc.ID).
+		Pluck("id", &taskID).Error; err != nil {
+		t.Fatalf("load task: %v", err)
+	}
+	if taskID == 0 {
+		t.Fatal("task row should be created in the same transaction")
+	}
+
+	var payload string
+	if err := db.Raw("SELECT payload::text FROM outbox WHERE msg_key = ? ORDER BY id DESC LIMIT 1",
+		strconv.FormatInt(doc.ID, 10)).Scan(&payload).Error; err != nil {
+		t.Fatalf("load outbox: %v", err)
+	}
+	if !strings.Contains(payload, `"task_id"`) {
+		t.Errorf("outbox payload = %s, want task_id inside", payload)
+	}
+	if !strings.Contains(payload, strconv.FormatInt(taskID, 10)) {
+		t.Errorf("outbox payload = %s, want task id %d inside", payload, taskID)
+	}
+}
